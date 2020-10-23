@@ -1,13 +1,13 @@
 /*
  * Copyright (c) 2004, 2005, 2006, 2007 David Young.  All rights reserved.
  *
- * See COPYING at the top of the HDF5 distribution for license terms.
+ * See COPYING at the top of the hlog distribution for license terms.
  */
 /*
  * Copyright (c) 2004 Urbana-Champaign Independent Media Center.
  * All rights reserved.
  *
- * See COPYING at the top of the HDF5 distribution for license terms.
+ * See COPYING at the top of the hlog distribution for license terms.
  */
 #ifndef	_HLOG_H
 #define	_HLOG_H
