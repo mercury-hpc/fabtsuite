@@ -19,9 +19,6 @@
 #include <string.h>
 #include <time.h>
 
-#include <sys/param.h>
-#include <sys/cdefs.h>
-
 #include "hlog.h"
 #include "hlog_time.h"
 

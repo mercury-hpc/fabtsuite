@@ -14,7 +14,6 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
-#include <sys/cdefs.h>
 
 #include "hlog_queue.h"
 
