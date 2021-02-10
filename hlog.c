@@ -28,7 +28,7 @@ HLOG_OUTLET_TOP_DEFN(all);
 
 static struct timespec timestamp_zero;
 
-void hlog_init(void) _constructor;
+void hlog_init(void) hlog_constructor;
 static void hlog_init_timestamps(void);
 
 void
@@ -243,7 +243,7 @@ hlog_outlet_find_active(struct hlog_outlet *ls0)
 }
 
 void
-hlog_always(struct hlog_outlet *ls _unused, const char *fmt, ...)
+hlog_always(struct hlog_outlet *ls hlog_unused, const char *fmt, ...)
 {
 	va_list ap;
 
