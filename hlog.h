@@ -82,9 +82,9 @@ void hlog_undefined_##__sym(void) hlog_constructor
 	};								\
 	HLOG_CONSTRUCTOR(__sym)
 
-#define	HLOG_OUTLET_MEDIUM_DEFN(__name, __parent, __state)	        \
-    HLOG_OUTLET_DEFN(HLOG_PREFIX(__name), #__name, &HLOG_PREFIX(__parent),		\
-        __state)
+#define	HLOG_OUTLET_MEDIUM_DEFN(__name, __parent, __state)		\
+    HLOG_OUTLET_DEFN(HLOG_PREFIX(__name), #__name, 			\
+                     &HLOG_PREFIX(__parent), __state)
 
 #define	HLOG_OUTLET_SHORT_DEFN(__name, __parent)			\
     HLOG_OUTLET_MEDIUM_DEFN(__name, __parent, HLOG_OUTLET_S_PASS)
@@ -95,19 +95,19 @@ void hlog_undefined_##__sym(void) hlog_constructor
 HLOG_OUTLET_DECL(all);
 
 #define hlog(_name, _fmt, ...)    \
-    hlog_impl(&HLOG_PREFIX(_name), _fmt, __VA_ARGS__)
+	hlog_impl(&HLOG_PREFIX(_name), _fmt, __VA_ARGS__)
 
-#define	hlog_fast(_name, ...)						    \
-    do {								    \
-            hlog_outlet_t *_ls0 = &HLOG_PREFIX(_name);		            \
-                                                                            \
-            if (_ls0->ls_resolved == HLOG_OUTLET_S_OFF)                     \
-                break;                                                      \
-            else if (_ls0->ls_resolved == HLOG_OUTLET_S_ON)                 \
-                hlog_always(_ls0, __VA_ARGS__);                             \
-            else                                                            \
-                hlog_impl(_ls0, __VA_ARGS__);                               \
-    } while (/*CONSTCOND*/0)
+#define	hlog_fast(_name, ...)						\
+	do {								\
+		hlog_outlet_t *_ls0 = &HLOG_PREFIX(_name);		\
+									\
+		if (_ls0->ls_resolved == HLOG_OUTLET_S_OFF)		\
+			break;						\
+		else if (_ls0->ls_resolved == HLOG_OUTLET_S_ON)		\
+			hlog_always(_ls0, __VA_ARGS__);			\
+		else							\
+			hlog_impl(_ls0, __VA_ARGS__);			\
+	} while (/*CONSTCOND*/0)
 
 struct hlog_outlet *hlog_outlet_find_active(struct hlog_outlet *);
 void hlog_outlet_register(struct hlog_outlet *);
@@ -127,10 +127,8 @@ void hlog_warn(const char *, ...) hlog_printflike(1,2);
 void hlog_err(int, const char *, ...) hlog_printflike(2,3) hlog_noreturn;
 void hlog_errx(int, const char *, ...) hlog_printflike(2,3) hlog_noreturn;
 
-void hlog_always(struct hlog_outlet *, const char *, ...)
-    hlog_printflike(2,3);
+void hlog_always(struct hlog_outlet *, const char *, ...) hlog_printflike(2,3);
 
-void hlog_impl(struct hlog_outlet *, const char *, ...)
-    hlog_printflike(2,3);
+void hlog_impl(struct hlog_outlet *, const char *, ...) hlog_printflike(2,3);
 
 #endif	/* _HLOG_H */

@@ -34,85 +34,86 @@ static void hlog_init_timestamps(void);
 void
 hlog_init(void)
 {
-    const char *settings0;
-    char *item, *settings;
+	const char *settings0;
+	char *item, *settings;
 
-    if ((settings0 = getenv("HLOG")) == NULL)
-        return;
+	if ((settings0 = getenv("HLOG")) == NULL)
+		return;
 
-    if ((settings = strdup(settings0)) == NULL) {
-        warn("%s: cannot duplicate settings string", __func__);
-        return;
-    }
+	if ((settings = strdup(settings0)) == NULL) {
+		warn("%s: cannot duplicate settings string", __func__);
+		return;
+	}
 
-    while ((item = strsep(&settings, " ,")) != NULL) {
-        hlog_outlet_state_t state;
-        char key[64 + 1], val[4 + 1];   // + 1 for the terminating NUL
-        int nconverted;
+	while ((item = strsep(&settings, " ,")) != NULL) {
+		hlog_outlet_state_t state;
+		char key[64 + 1], val[4 + 1];	// + 1 for the terminating NUL
+		int nconverted;
 
-        nconverted = sscanf(item, " %64[0-9a-z_] = %4s ", key, val);
-        if (nconverted != 2) {
-            warnx("%s: malformed HLOG item \"%s\"", __func__, item);
-            continue;
-        }
+		nconverted = sscanf(item, " %64[0-9a-z_] = %4s ", key, val);
+		if (nconverted != 2) {
+			warnx("%s: malformed HLOG item \"%s\"", __func__, item);
+			continue;
+		}
 
-        if (strcmp(val, "on") == 0 || strcmp(val, "yes") == 0)
-            state = HLOG_OUTLET_S_ON;
-        else if (strcmp(val, "off") == 0 || strcmp(val, "no") == 0)
-            state = HLOG_OUTLET_S_OFF;
-        else if (strcmp(val, "pass") == 0)
-            state = HLOG_OUTLET_S_PASS;
-        else {
-            warnx("%s: bad HLOG value \"%s\" in item \"%s\"", __func__,
-                val, item);
-            continue;
-        }
+		if (strcmp(val, "on") == 0 || strcmp(val, "yes") == 0)
+			state = HLOG_OUTLET_S_ON;
+		else if (strcmp(val, "off") == 0 || strcmp(val, "no") == 0)
+			state = HLOG_OUTLET_S_OFF;
+		else if (strcmp(val, "pass") == 0)
+			state = HLOG_OUTLET_S_PASS;
+		else {
+			warnx("%s: bad HLOG value \"%s\" in item \"%s\"",
+			    __func__, val, item);
+			continue;
+		}
 
-        if (hlog_set_state(key, state, true) == -1) {
-            warn("%s: could not set state for HLOG item \"%s\"", __func__,
-                item);
-        }
-    }
+		if (hlog_set_state(key, state, true) == -1) {
+			warn("%s: could not set state for HLOG item \"%s\"",
+			    __func__, item);
+		}
+	}
 
-    free(settings);
+	free(settings);
 }
 
 
 static void
 hlog_init_timestamps(void)
 {
-    static bool initialized = false;
+	static bool initialized = false;
 
-    if (initialized)
-        return;
+	if (initialized)
+		return;
 
-    if (clock_gettime(CLOCK_MONOTONIC, &timestamp_zero) == -1)
-        err(EXIT_FAILURE, "%s: clock_gettime", __func__);
+	if (clock_gettime(CLOCK_MONOTONIC, &timestamp_zero) == -1)
+		err(EXIT_FAILURE, "%s: clock_gettime", __func__);
 
-    initialized = true;
+	initialized = true;
 }
 
 static void
 hlog_print_time(void)
 {
-    struct timespec elapsed, now;
+	struct timespec elapsed, now;
 
-    hlog_init_timestamps();
+	hlog_init_timestamps();
 
-    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
-        err(EXIT_FAILURE, "%s: clock_gettime", __func__);
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+		err(EXIT_FAILURE, "%s: clock_gettime", __func__);
 
-    timespecsub(&now, &timestamp_zero, &elapsed);
+	timespecsub(&now, &timestamp_zero, &elapsed);
 
-    fprintf(stderr, "%ju.%.9ld ", (uintmax_t)elapsed.tv_sec, elapsed.tv_nsec);
+	fprintf(stderr, "%ju.%.9ld ", (uintmax_t)elapsed.tv_sec,
+	    elapsed.tv_nsec);
 }
 
 void
 vhlog(const char *fmt, va_list ap)
 {
-        hlog_print_time();
-        (void)vfprintf(stderr, fmt, ap);
-        (void)fputc('\n', stderr);
+	hlog_print_time();
+	(void)vfprintf(stderr, fmt, ap);
+	(void)fputc('\n', stderr);
 }
 
 static char *
@@ -143,7 +144,7 @@ message_extend_stderr(const char *fmt0)
 static char *
 message_extend(const char *fmt0)
 {
-        return message_extend_stderr(fmt0);
+	return message_extend_stderr(fmt0);
 }
 
 void
@@ -259,11 +260,11 @@ hlog_impl(struct hlog_outlet *ls0, const char *fmt, ...)
 	va_list ap;
 
 	if ((ls = hlog_outlet_find_active(ls0)) == NULL) {
-            ls0->ls_resolved = HLOG_OUTLET_S_OFF;
-            return;
-        }
+		ls0->ls_resolved = HLOG_OUTLET_S_OFF;
+		return;
+	}
 
-        ls0->ls_resolved = HLOG_OUTLET_S_ON;
+	ls0->ls_resolved = HLOG_OUTLET_S_ON;
 
 	va_start(ap, fmt);
 	vhlog(fmt, ap);
@@ -340,7 +341,7 @@ hlog_set_state(const char *name, hlog_outlet_state_t state, bool rendezvous)
 		TAILQ_INSERT_TAIL(&hlog_outlets, ls, ls_next);
 	}
 	ls->ls_state = state;
-        hlog_outlet_reset_all();
+	hlog_outlet_reset_all();
 	return 0;
 }
 
