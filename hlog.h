@@ -34,6 +34,15 @@
     __attribute__((__format__(__printf__,_fmt,_args)))
 #endif
 
+enum hlog_output {
+	  HLOG_OUTPUT_STDERR = 0
+	, HLOG_OUTPUT_STDOUT
+	, HLOG_OUTPUT_RING
+	, HLOG_OUTPUT_NULL
+};
+
+typedef enum hlog_output hlog_output_t;
+
 enum hlog_outlet_state {
 	  HLOG_OUTLET_S_PASS = 0
 	, HLOG_OUTLET_S_OFF = 1
@@ -109,10 +118,17 @@ HLOG_OUTLET_DECL(all);
 			hlog_impl(_ls0, __VA_ARGS__);			\
 	} while (/*CONSTCOND*/0)
 
+#define hlog_assert(_cond)						\
+	do {								\
+		if (!(_cond))						\
+			hlog_abort(#_cond);				\
+	} while (/*CONSTCOND*/0)
+			
 struct hlog_outlet *hlog_outlet_find_active(struct hlog_outlet *);
 void hlog_outlet_register(struct hlog_outlet *);
 struct hlog_outlet *hlog_outlet_lookup(const char *);
 int hlog_set_state(const char *, hlog_outlet_state_t, bool);
+int hlog_set_output(hlog_output_t);
 
 void vhlog(const char *, va_list) hlog_printflike(1,0);
 
@@ -130,5 +146,6 @@ void hlog_errx(int, const char *, ...) hlog_printflike(2,3) hlog_noreturn;
 void hlog_always(struct hlog_outlet *, const char *, ...) hlog_printflike(2,3);
 
 void hlog_impl(struct hlog_outlet *, const char *, ...) hlog_printflike(2,3);
+void hlog_abort(const char *);
 
 #endif	/* _HLOG_H */
