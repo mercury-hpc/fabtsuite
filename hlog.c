@@ -331,8 +331,8 @@ hlog_msg_ring_vprintf(hlog_msg_t msg, const char *fmt, va_list ap)
 static void
 hlog_outlet_state_init(void)
 {
-	const char *settings0;
-	char *item, *settings;
+	const char *item, *settings0;
+	char *iter, *settings;
 
 	if ((settings0 = getenv("HLOG")) == NULL)
 		return;
@@ -342,7 +342,8 @@ hlog_outlet_state_init(void)
 		return;
 	}
 
-	while ((item = strsep(&settings, " ,")) != NULL) {
+	iter = settings;
+	while ((item = strsep(&iter, " ,")) != NULL) {
 		hlog_outlet_state_t state;
 		char key[64 + 1], val[4 + 1];	// + 1 for the terminating NUL
 		int nconverted;
