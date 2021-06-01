@@ -34,6 +34,10 @@
     __attribute__((__format__(__printf__,_fmt,_args)))
 #endif
 
+#ifndef hlog_predict_true
+#define hlog_predict_true(x)  __builtin_expect(!!(x), 1)
+#endif
+
 enum hlog_output {
 	  HLOG_OUTPUT_STDERR = 0
 	, HLOG_OUTPUT_STDOUT
@@ -110,7 +114,7 @@ HLOG_OUTLET_DECL(all);
 	do {								\
 		hlog_outlet_t *_ls0 = &HLOG_PREFIX(_name);		\
 									\
-		if (_ls0->ls_resolved == HLOG_OUTLET_S_OFF)		\
+		if (hlog_predict_true(_ls0->ls_resolved == HLOG_OUTLET_S_OFF))\
 			break;						\
 		else if (_ls0->ls_resolved == HLOG_OUTLET_S_ON)		\
 			hlog_always(_ls0, __VA_ARGS__);			\
