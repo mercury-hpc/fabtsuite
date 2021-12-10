@@ -85,7 +85,10 @@ get(state_t *st)
     , .wait_set = NULL          /* don't care */
     };
     struct fi_eq_cm_entry cm_entry;
+    struct fi_msg msg;
+    struct iovec iov;
     char rxbuf[128];
+    void *desc;
     get_state_t *gst = &st->u.get;
     ssize_t ncompleted;
     uint32_t event;
@@ -157,7 +160,7 @@ get(state_t *st)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
     rc = fi_ep_bind(gst->aep, &gst->cq->fid,
-        /* FI_SELECTIVE_COMPLETION | */ FI_RECV | FI_TRANSMIT);
+        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
@@ -167,11 +170,22 @@ get(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
 
-    rc = fi_recv(gst->aep, rxbuf, sizeof(rxbuf), fi_mr_desc(gst->mr),
-        0, NULL);
+    iov = (struct iovec){.iov_base = rxbuf, .iov_len = sizeof(rxbuf)};
+    desc = fi_mr_desc(gst->mr);
+
+    msg = (struct fi_msg){
+      .msg_iov = &iov
+    , .desc = &desc
+    , .iov_count = 1
+    , .addr = 0
+    , .context = NULL
+    , .data = 0
+    };
+
+    rc = fi_recvmsg(gst->aep, &msg, FI_COMPLETION);
 
     if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_recv");
+        bailout_for_ofi_ret(rc, "fi_recvmsg");
 
     rc = fi_accept(gst->aep, NULL, 0);
 
@@ -247,15 +261,19 @@ put(state_t *st)
     , .wait_set = NULL          /* don't care */
     };
     struct fi_eq_cm_entry cm_entry;
-    const char msg[] =
+    struct fi_msg msg;
+    struct iovec iov;
+    char txbuf[] =
         "If this message was received in error then please "
         "print it out and shred it.";
     put_state_t *pst = &st->u.put;
+    void *desc;
+    const uint64_t desired_flags = FI_SEND | FI_MSG;
     ssize_t ncompleted;
     uint32_t event;
     int rc;
 
-    rc = fi_mr_reg(st->domain, msg, strlen(msg), FI_SEND, 0, 0, 0, &pst->mr,
+    rc = fi_mr_reg(st->domain, txbuf, strlen(txbuf), FI_SEND, 0, 0, 0, &pst->mr,
         NULL);
 
     if (rc != 0)
@@ -282,7 +300,7 @@ put(state_t *st)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
     rc = fi_ep_bind(pst->ep, &pst->cq->fid,
-        /* FI_SELECTIVE_COMPLETION | */ FI_RECV | FI_TRANSMIT);
+        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
@@ -311,11 +329,22 @@ put(state_t *st)
             __func__, FI_CONNECTED, event);
     }
 
-    rc = fi_send(pst->ep, msg, strlen(msg), fi_mr_desc(pst->mr),
-        0, NULL);
+    iov = (struct iovec){.iov_base = txbuf, .iov_len = strlen(txbuf)};
+    desc = fi_mr_desc(pst->mr);
+
+    msg = (struct fi_msg){
+      .msg_iov = &iov
+    , .desc = &desc
+    , .iov_count = 1
+    , .addr = 0
+    , .context = NULL
+    , .data = 0
+    };
+
+    rc = fi_sendmsg(pst->ep, &msg, FI_COMPLETION);
 
     if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_send");
+        bailout_for_ofi_ret(rc, "fi_sendmsg");
 
     do {
         ncompleted = fi_cq_sread(pst->cq, &completion, 1, NULL, -1);
@@ -329,7 +358,6 @@ put(state_t *st)
             "%s: expected 1 completion, read %zd", __func__, ncompleted);
     }
 
-    const uint64_t desired_flags = FI_SEND | FI_MSG;
     if ((completion.flags & desired_flags) != desired_flags) {
         errx(EXIT_FAILURE,
             "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
