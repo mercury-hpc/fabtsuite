@@ -6,11 +6,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h> /* strcmp(3), strdup(3) */
+#include <unistd.h> /* sysconf(3) */
 
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>     /* fi_listen, fi_getname */
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
+
+#define arraycount(a)   (sizeof(a) / sizeof(a[0]))
 
 typedef struct {
     struct fid_ep *aep;
@@ -18,14 +21,12 @@ typedef struct {
     struct fid_eq *active_eq;
     struct fid_pep *pep;
     struct fid_cq *cq;
-    struct fid_mr *mr;
 } get_state_t;
 
 typedef struct {
     struct fid_ep *ep;
     struct fid_eq *connect_eq;
     struct fid_cq *cq;
-    struct fid_mr *mr;
 } put_state_t;
 
 typedef struct {
@@ -36,11 +37,19 @@ typedef struct {
         get_state_t get;
         put_state_t put;
     } u;
+    size_t mr_maxsegs;
+    size_t rx_maxsegs;
+    size_t tx_maxsegs;
+    size_t rma_maxsegs;
 } state_t;
 
 typedef int (*personality_t)(state_t *);
 
 static const char fget_fput_service_name[] = "4242";
+
+static char txbuf[] =
+    "If this message was received in error then please "
+    "print it out and shred it.";
 
 #define bailout_for_ofi_ret(ret, ...)                          \
         bailout_for_ofi_ret_impl(ret, __func__, __VA_ARGS__)
@@ -56,6 +65,94 @@ bailout_for_ofi_ret_impl(int ret, const char *fn, const char *fmt, ...)
     va_end(ap);
     fprintf(stderr, ": %s\n", fi_strerror(-ret));
     exit(EXIT_FAILURE);
+}
+
+static size_t
+fibonacci_iov_setup(char *buf, size_t len, struct iovec *iov, size_t niovs)
+{
+    ssize_t i;
+    struct fibo {
+        size_t prev, curr;
+    } state = {.prev = 0, .curr = 1}; // Fibonacci sequence state
+
+    if (niovs < 1 && len > 0)
+        return -1;
+
+    if (niovs > SSIZE_MAX)
+        niovs = SSIZE_MAX;
+
+    for (i = 0; len > 0 && i < niovs - 1; i++) {
+        iov[i].iov_len = (state.curr < len) ? state.curr : len;
+        iov[i].iov_base = buf;
+        len -= iov[i].iov_len;
+        buf += iov[i].iov_len;
+        state = (struct fibo){.prev = state.curr,
+                              .curr = state.prev + state.curr};
+    }
+    if (len > 0) {
+        iov[i].iov_len = len;
+        iov[i].iov_base = buf;
+        i++;
+    }
+    return i;
+}
+
+#if 0
+static int
+maxsize(size_t l, size_t r)
+{
+    return (l > r) ? l : r;
+}
+#endif
+
+static int
+minsize(size_t l, size_t r)
+{
+    return (l < r) ? l : r;
+}
+
+/* Register the `niovs`-segment I/O vector `iov` using up to
+ * `niovs` individual registrations and descriptors at `mrp` and 
+ * `descp`, respectively.  Register no more than `maxsegs` segments
+ * per registration/descriptor pair.
+ */
+static int
+mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
+    size_t niovs, size_t maxsegs, uint64_t access, uint64_t offset,
+    uint64_t requested_key, uint64_t flags, struct fid_mr **mrp,
+    void **descp, void *context)
+{
+    int rc;
+    size_t i, j, nregs = (niovs + maxsegs - 1) / maxsegs;
+    size_t nleftover;
+
+    for (nleftover = niovs, i = 0;
+         i < nregs;
+         iov += maxsegs, nleftover -= maxsegs, i++) {
+
+        size_t nsegs = minsize(nleftover, maxsegs);
+
+        printf("%zu remaining I/O vectors\n", nleftover);
+
+        rc = fi_mr_regv(domain, iov, nsegs,
+            access, offset, i, flags, &mrp[i], context);
+
+        if (rc != 0)
+            goto err;
+
+        for (j = 0; j < nsegs; j++) {
+            printf("filling descriptor %zu\n", i * maxsegs + j);
+            descp[i * maxsegs + j] = fi_mr_desc(mrp[i]);
+        }
+    }
+
+    return 0;
+
+err:
+    for (j = 0; j < i; j++)
+        (void)fi_close(&mrp[j]->fid);
+
+    return rc;
 }
 
 static int
@@ -86,19 +183,31 @@ get(state_t *st)
     };
     struct fi_eq_cm_entry cm_entry;
     struct fi_msg msg;
-    struct iovec iov;
+    struct iovec iov[12];
+    void *desc[12];
+    struct fid_mr *mr[12];
     char rxbuf[128];
-    void *desc;
     get_state_t *gst = &st->u.get;
-    ssize_t ncompleted;
+    ssize_t i, ncompleted, niovs;
     uint32_t event;
     int rc;
 
-    rc = fi_mr_reg(st->domain, rxbuf, sizeof(rxbuf), FI_RECV, 0, 0, 0, &gst->mr,
-        NULL);
+    niovs = fibonacci_iov_setup(rxbuf, sizeof(rxbuf), iov, st->rx_maxsegs);
+
+    if (niovs < 1) {
+        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
+            __func__, niovs);
+    }
+
+    rc = mr_regv_all(st->domain, iov, niovs, minsize(2, st->mr_maxsegs),
+        FI_RECV, 0, 0, 0, mr, desc, NULL);
 
     if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_mr_reg");
+        bailout_for_ofi_ret(rc, "mr_regv");
+
+    for (i = 0; i < niovs; i++) {
+        printf("iov[%zd].iov_len = %zu\n", i, iov[i].iov_len);
+    }
 
     rc = fi_passive_ep(st->fabric, st->info, &gst->pep, NULL);
 
@@ -170,13 +279,10 @@ get(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
 
-    iov = (struct iovec){.iov_base = rxbuf, .iov_len = sizeof(rxbuf)};
-    desc = fi_mr_desc(gst->mr);
-
     msg = (struct fi_msg){
-      .msg_iov = &iov
-    , .desc = &desc
-    , .iov_count = 1
+      .msg_iov = iov
+    , .desc = desc
+    , .iov_count = niovs
     , .addr = 0
     , .context = NULL
     , .data = 0
@@ -228,8 +334,14 @@ get(state_t *st)
     }
 
     int truncated_len = (completion.len > INT_MAX) ? INT_MAX : completion.len;
-    printf("received %zu bytes, '%.*s'\n",
-        completion.len, truncated_len, rxbuf);
+    printf("received %zu bytes, '%.*s'\n", completion.len, truncated_len,
+        rxbuf);
+
+    if (strlen(txbuf) != completion.len)
+        errx(EXIT_FAILURE, "unexpected received message length");
+
+    if (strncmp(txbuf, rxbuf, completion.len) != 0)
+        errx(EXIT_FAILURE, "unexpected received message content");
 
     return EXIT_SUCCESS;
 }
@@ -263,17 +375,15 @@ put(state_t *st)
     struct fi_eq_cm_entry cm_entry;
     struct fi_msg msg;
     struct iovec iov;
-    char txbuf[] =
-        "If this message was received in error then please "
-        "print it out and shred it.";
     put_state_t *pst = &st->u.put;
+    struct fid_mr *mr[12];
     void *desc;
     const uint64_t desired_flags = FI_SEND | FI_MSG;
     ssize_t ncompleted;
     uint32_t event;
     int rc;
 
-    rc = fi_mr_reg(st->domain, txbuf, strlen(txbuf), FI_SEND, 0, 0, 0, &pst->mr,
+    rc = fi_mr_reg(st->domain, txbuf, strlen(txbuf), FI_SEND, 0, 0, 0, &mr[0],
         NULL);
 
     if (rc != 0)
@@ -330,7 +440,7 @@ put(state_t *st)
     }
 
     iov = (struct iovec){.iov_base = txbuf, .iov_len = strlen(txbuf)};
-    desc = fi_mr_desc(pst->mr);
+    desc = fi_mr_desc(mr[0]);
 
     msg = (struct fi_msg){
       .msg_iov = &iov
@@ -363,6 +473,9 @@ put(state_t *st)
             "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
             __func__, desired_flags, completion.flags & desired_flags);
     }
+
+    printf("sent %zu bytes\n", completion.len);
+
     return EXIT_SUCCESS;
 }
 
@@ -410,6 +523,8 @@ main(int argc, char **argv)
     else
         errx(EXIT_FAILURE, "program personality '%s' is not implemented", prog);
 
+    printf("%ld POSIX I/O vector items maximum\n", sysconf(_SC_IOV_MAX));
+
     if ((hints = fi_allocinfo()) == NULL)
         errx(EXIT_FAILURE, "%s: fi_allocinfo", __func__);
 
@@ -445,6 +560,20 @@ main(int argc, char **argv)
         bailout_for_ofi_ret(rc, "fi_fabric");
 
     rc = fi_domain(st.fabric, st.info, &st.domain, NULL);
+
+    printf("provider %s, memory-registration I/O vector limit %zu\n",
+        st.info->fabric_attr->prov_name,
+        st.info->domain_attr->mr_iov_limit);
+
+    printf("Rx/Tx I/O vector limits %zu/%zu\n",
+        st.info->rx_attr->iov_limit, st.info->tx_attr->iov_limit);
+
+    printf("RMA I/O vector limit %zu\n", st.info->tx_attr->rma_iov_limit);
+
+    st.mr_maxsegs = st.info->domain_attr->mr_iov_limit;
+    st.rx_maxsegs = st.info->rx_attr->iov_limit;
+    st.tx_maxsegs = st.info->tx_attr->iov_limit;
+    st.rma_maxsegs = st.info->tx_attr->rma_iov_limit;
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_domain");
