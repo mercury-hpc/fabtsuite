@@ -203,7 +203,7 @@ get(state_t *st)
         FI_RECV, 0, 0, 0, mr, desc, NULL);
 
     if (rc != 0)
-        bailout_for_ofi_ret(rc, "mr_regv");
+        bailout_for_ofi_ret(rc, "mr_regv_all");
 
     for (i = 0; i < niovs; i++) {
         printf("iov[%zd].iov_len = %zu\n", i, iov[i].iov_len);
