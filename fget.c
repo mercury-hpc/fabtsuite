@@ -858,10 +858,6 @@ put(state_t *st)
             bailout_for_ofi_ret(rc, "fi_write");
         nwritten += minsize(riov[i].len, txbuflen - nwritten);
     }
-#if 0
-ssize_t fi_write(struct fid_ep *ep, const void *buf, size_t len,
-void *desc, fi_addr_t dest_addr, uint64_t addr, uint64_t key, void *context);
-#endif
 
 #endif
 
