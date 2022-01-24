@@ -851,9 +851,22 @@ put(state_t *st)
     const size_t txbuflen = strlen(txbuf);
     size_t nwritten = 0;
     for (i = 0; i < vector.msg.niovs && nwritten < txbuflen; i++) {
-        rc = fi_write(pst->ep, txbuf + nwritten,
-            minsize(riov[i].len, txbuflen - nwritten),
-            fi_mr_desc(payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
+        const size_t split = 0;
+        if (split > 0 && minsize(riov[i].len, txbuflen - nwritten) > split) {
+            rc = fi_write(pst->ep, txbuf + nwritten,
+                split,
+                fi_mr_desc(payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
+            if (rc != 0)
+                bailout_for_ofi_ret(rc, "fi_write");
+            rc = fi_write(pst->ep, txbuf + nwritten + split,
+                minsize(riov[i].len, txbuflen - nwritten) - split,
+                fi_mr_desc(payload.mr[0]), 0, riov[i].addr + split,
+                riov[i].key, NULL);
+        } else {
+            rc = fi_write(pst->ep, txbuf + nwritten,
+                minsize(riov[i].len, txbuflen - nwritten),
+                fi_mr_desc(payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
+        }
         if (rc != 0)
             bailout_for_ofi_ret(rc, "fi_write");
         nwritten += minsize(riov[i].len, txbuflen - nwritten);
