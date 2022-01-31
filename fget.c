@@ -1,8 +1,11 @@
+#include <assert.h>
 #include <err.h>
 #include <libgen.h> /* basename(3) */
 #include <limits.h> /* INT_MAX */
 #include <inttypes.h>   /* PRIu32 */
 #include <stdarg.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h> /* strcmp(3), strdup(3) */
@@ -14,15 +17,79 @@
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>    /* struct fi_msg_rma */
 
-
 #define arraycount(a)   (sizeof(a) / sizeof(a[0]))
 
+/*
+ * Message definitions
+ */
+typedef struct {
+    uint64_t bits[2];
+} nonce_t;
+
+typedef struct initial_msg {
+    nonce_t nonce;
+    uint32_t nsources;
+    uint32_t id;
+} initial_msg_t;
+
+typedef struct vector_msg {
+    uint32_t niovs;
+    struct {
+        uint64_t addr, len, key;
+    } iov[12];
+} vector_msg_t;
+
+typedef struct progress_msg {
+    uint64_t nfilled;
+    uint64_t nleftover;
+} progress_msg_t;
+
+/*
+ * Communications state definitions
+ */
 typedef struct {
     struct fid_ep *aep;
-    struct fid_eq *listen_eq;
     struct fid_eq *active_eq;
-    struct fid_pep *pep;
     struct fid_cq *cq;
+} rcvr_t;
+
+/* On each loop, a worker checks its poll set for any completions.
+ * If `loops_since_mark < UINT16_MAX`, a worker increases it by
+ * one, and increases `ctxs_serviced_since_mark` by the number
+ * of queues that actually held one or more completions.  If
+ * `loops_since_mark == UINT16_MAX`, then a worker updates
+ * `average`, `average = (average + 256 * ctxs_serviced_since_mark /
+ * (UINT16_MAX + 1)) / 2`, and resets `loops_since_mark` and
+ * `ctxs_serviced_since_mark` to 0.
+ */
+typedef struct {
+    /* A fixed-point number with 8 bits right of the decimal point: */
+    volatile atomic_uint_fast16_t average;
+    uint_fast16_t loops_since_mark;
+    uint32_t ctxs_serviced_since_mark;
+} loadavg_t;
+
+#define WORKER_RCVRS_MAX 64 
+#define WORKERS_MAX 128 
+#define RCVRS_MAX (WORKER_RCVRS_MAX * WORKERS_MAX)
+
+typedef struct worker {
+    pthread_t thd;
+    loadavg_t avg;
+    rcvr_t *rcvr[WORKER_RCVRS_MAX];
+    struct fid_poll *pollset[2];
+    pthread_mutex_t mtx[2]; /* mtx[0] protects pollset[0] and the first half
+                             * of rcvr[]; mtx[1], pollset[1] and the second
+                             * half
+                             */
+    pthread_cond_t sleep;   /* Used in conjunction with workers_mtx. */
+    bool cancelled;
+} worker_t;
+
+typedef struct {
+    struct fid_eq *listen_eq;
+    struct fid_pep *pep;
+    rcvr_t rcvr;
 } get_state_t;
 
 typedef struct {
@@ -49,6 +116,11 @@ typedef int (*personality_t)(state_t *);
 
 static const char fget_fput_service_name[] = "4242";
 
+static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
+static worker_t workers[WORKERS_MAX];
+static size_t nworkers_running;
+static size_t nworkers_allocated;
+
 static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
 static const uint64_t desired_tx_flags = FI_SEND | FI_MSG;
 
@@ -71,6 +143,188 @@ bailout_for_ofi_ret_impl(int ret, const char *fn, int lineno,
     va_end(ap);
     fprintf(stderr, ": %s\n", fi_strerror(-ret));
     exit(EXIT_FAILURE);
+}
+
+static void *
+worker_loop(void *_arg)
+{
+    // wait for a ready rcvr: 
+    return NULL;
+}
+
+static void
+worker_init(struct fid_domain *dom, worker_t *w)
+{
+    struct fi_poll_attr attr = {.flags = 0};
+    int rc;
+    size_t i;
+
+    w->cancelled = false;
+
+    if ((rc = pthread_cond_init(&w->sleep, NULL)) != 0) {
+        errx(EXIT_FAILURE, "%s.%d: pthread_cond_init: %s", __func__, __LINE__,
+            strerror(rc));
+    }
+
+    for (i = 0; i < arraycount(w->mtx); i++) {
+        if ((rc = pthread_mutex_init(&w->mtx[i], NULL)) != 0) {
+            errx(EXIT_FAILURE, "%s.%d: pthread_mutex_init: %s",
+                __func__, __LINE__, strerror(rc));
+        }
+        if ((rc = fi_poll_open(dom, &attr, &w->pollset[i])) != 0)
+            bailout_for_ofi_ret(rc, "fi_poll_open");
+    }
+    for (i = 0; i < arraycount(w->rcvr); i++)
+        w->rcvr[i] = NULL;
+    if ((rc = pthread_create(&w->thd, NULL, worker_loop, w)) != 0) {
+            errx(EXIT_FAILURE, "%s.%d: pthread_create: %s",
+                __func__, __LINE__, strerror(rc));
+    }
+}
+
+static void
+worker_teardown(worker_t *w)
+{
+    int rc;
+    size_t i;
+
+    w->cancelled = true;
+
+    /* TBD wake thread */
+
+    if ((rc = pthread_join(w->thd, NULL)) != 0) {
+            errx(EXIT_FAILURE, "%s.%d: pthread_join: %s",
+                __func__, __LINE__, strerror(rc));
+    }
+    for (i = 0; i < arraycount(w->mtx); i++) {
+        if ((rc = pthread_mutex_destroy(&w->mtx[i])) != 0) {
+            errx(EXIT_FAILURE, "%s.%d: pthread_mutex_destroy: %s",
+                __func__, __LINE__, strerror(rc));
+        }
+        if ((rc = fi_close(&w->pollset[i]->fid)) != 0)
+            bailout_for_ofi_ret(rc, "fi_close");
+    }
+    for (i = 0; i < arraycount(w->rcvr); i++)
+        assert(w->rcvr[i] == NULL);
+
+    if ((rc = pthread_cond_destroy(&w->sleep)) != 0) {
+        errx(EXIT_FAILURE, "%s.%d: pthread_cond_destroy: %s",
+            __func__, __LINE__, strerror(rc));
+    }
+}
+
+static worker_t *
+worker_create(struct fid_domain *dom)
+{
+    worker_t proto_worker, *w;
+
+    worker_init(dom, &proto_worker);
+
+    (void)pthread_mutex_lock(&workers_mtx);
+    w = (nworkers_allocated < arraycount(workers))
+        ? &workers[nworkers_allocated++]
+        : NULL;
+    if (w != NULL)
+        *w = proto_worker;
+    (void)pthread_mutex_unlock(&workers_mtx);
+
+    if (w == NULL)
+        worker_teardown(&proto_worker);
+
+    return w;
+}
+
+static void
+initialize(void)
+{
+}
+
+static bool
+worker_assign_rcvr(worker_t *w, rcvr_t *r, struct fid_domain *dom)
+{
+    size_t half, i;
+    pthread_mutex_t *mtx = NULL;
+    rcvr_t **rp = NULL;
+
+    for (half = 0; half < 2; half++) {
+        mtx = &w->mtx[half];
+        if (pthread_mutex_trylock(mtx) == EBUSY)
+            continue;
+
+        for (i = 0; i < arraycount(w->rcvr) / 2; i++) {
+            rp = &w->rcvr[half * arraycount(w->rcvr) / 2 + i];
+            if (*rp != NULL) {
+                (void)pthread_mutex_unlock(mtx);
+                goto found;
+            }
+        }
+        (void)pthread_mutex_unlock(mtx);
+    }
+found:
+    if (rp != NULL)
+        *rp = r;
+    return rp != NULL;
+}
+
+/* Try to allocate to an active worker, least active, first.
+ * Caller must hold `workers_mtx`.
+ */
+static worker_t *
+workers_assign_rcvr_to_running(rcvr_t *r, struct fid_domain *dom)
+{
+    size_t iplus1;
+
+    for (iplus1 = nworkers_running; 0 < iplus1; iplus1--) {
+        size_t i = iplus1 - 1;
+        worker_t *w = &workers[i];
+        if (worker_assign_rcvr(w, r, dom))
+            return w;
+    }
+    return NULL;
+}
+
+/* Try next to allocate to the next idle worker.
+ * Caller must hold `workers_mtx`.
+ */
+static worker_t *
+workers_assign_rcvr_to_idle(rcvr_t *r, struct fid_domain *dom)
+{
+    size_t i;
+
+    if ((i = nworkers_running) < nworkers_allocated) {
+        worker_t *w = &workers[i];
+        if (worker_assign_rcvr(w, r, dom))
+            return w;
+    }
+    return NULL;
+}
+
+/* Try to wake the first idle worker.
+ *
+ * Caller must hold `workers_mtx`.
+ */
+static void
+workers_wake(worker_t *w)
+{
+    assert(&workers[nworkers_running] == w);
+    nworkers_running++;
+    pthread_cond_signal(&w->sleep);
+}
+
+static worker_t *
+workers_assign_rcvr(rcvr_t *r, struct fid_domain *dom)
+{
+    worker_t *w;
+
+    do {
+        (void)pthread_mutex_lock(&workers_mtx);
+        if ((w = workers_assign_rcvr_to_running(r, dom)) != NULL)
+            ;
+        else if ((w = workers_assign_rcvr_to_idle(r, dom)) != NULL)
+            workers_wake(w);
+        (void)pthread_mutex_unlock(&workers_mtx);
+    } while (w == NULL && (w = worker_create(dom)) != NULL);
+    return w;
 }
 
 static size_t
@@ -170,28 +424,6 @@ err:
     return rc;
 }
 
-typedef struct {
-    uint64_t bits[2];
-} nonce_t;
-
-typedef struct initial_msg {
-    nonce_t nonce;
-    uint32_t nsources;
-    uint32_t id;
-} initial_msg_t;
-
-typedef struct vector_msg {
-    uint32_t niovs;
-    struct {
-        uint64_t addr, len, key;
-    } iov[12];
-} vector_msg_t;
-
-typedef struct progress_msg {
-    uint64_t nfilled;
-    uint64_t nleftover;
-} progress_msg_t;
-
 static int
 get(state_t *st)
 {
@@ -253,6 +485,7 @@ get(state_t *st)
         char rxbuf[128];
     } payload;
     get_state_t *gst = &st->u.get;
+    worker_t *w;
     uint64_t next_key = 0;
     ssize_t i, ncompleted;
     uint32_t event;
@@ -337,7 +570,9 @@ get(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open (listen)");
 
-    rc = fi_eq_open(st->fabric, &eq_attr, &gst->active_eq, NULL);
+    rcvr_t *rcvr = &gst->rcvr;
+
+    rc = fi_eq_open(st->fabric, &eq_attr, &rcvr->active_eq, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open (active)");
@@ -371,28 +606,28 @@ get(state_t *st)
             __func__, FI_CONNREQ, event);
     }
 
-    rc = fi_endpoint(st->domain, cm_entry.info, &gst->aep, NULL);
+    rc = fi_endpoint(st->domain, cm_entry.info, &rcvr->aep, NULL);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
-    rc = fi_ep_bind(gst->aep, &gst->active_eq->fid, 0);
+    rc = fi_ep_bind(rcvr->aep, &rcvr->active_eq->fid, 0);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    rc = fi_cq_open(st->domain, &cq_attr, &gst->cq, NULL);
+    rc = fi_cq_open(st->domain, &cq_attr, &rcvr->cq, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
-    rc = fi_ep_bind(gst->aep, &gst->cq->fid,
+    rc = fi_ep_bind(rcvr->aep, &rcvr->cq->fid,
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    rc = fi_enable(gst->aep);
+    rc = fi_enable(rcvr->aep);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
@@ -406,7 +641,7 @@ get(state_t *st)
     , .data = 0
     };
 
-    rc = fi_recvmsg(gst->aep, &msg, FI_COMPLETION);
+    rc = fi_recvmsg(rcvr->aep, &msg, FI_COMPLETION);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
@@ -420,12 +655,12 @@ get(state_t *st)
     , .data = 0
     };
 
-    rc = fi_recvmsg(gst->aep, &msg, FI_COMPLETION);
+    rc = fi_recvmsg(rcvr->aep, &msg, FI_COMPLETION);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
 
-    rc = fi_accept(gst->aep, NULL, 0);
+    rc = fi_accept(rcvr->aep, NULL, 0);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_accept");
@@ -433,7 +668,7 @@ get(state_t *st)
     fi_freeinfo(cm_entry.info);
 
     do {
-        rc = fi_eq_sread(gst->active_eq, &event, &cm_entry, sizeof(cm_entry),
+        rc = fi_eq_sread(rcvr->active_eq, &event, &cm_entry, sizeof(cm_entry),
             -1 /* wait forever */, 0 /* flags */ );
     } while (rc == -FI_EAGAIN);
 
@@ -446,9 +681,14 @@ get(state_t *st)
             __func__, FI_CONNECTED, event);
     }
 
+    if (false && (w = workers_assign_rcvr(rcvr, st->domain)) == NULL) {
+        errx(EXIT_FAILURE, "%s: could not assign a worker to a new receiver",
+            __func__);
+    }
+
     /* Await initial message. */
     do {
-        ncompleted = fi_cq_sread(gst->cq, &completion, 1, NULL, -1);
+        ncompleted = fi_cq_sread(rcvr->cq, &completion, 1, NULL, -1);
     } while (rc == -FI_EAGAIN);
 
     if (ncompleted < 0)
@@ -489,7 +729,7 @@ get(state_t *st)
     , .data = 0
     };
 
-    rc = fi_sendmsg(gst->aep, &msg, 0);
+    rc = fi_sendmsg(rcvr->aep, &msg, 0);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_sendmsg");
@@ -497,27 +737,11 @@ get(state_t *st)
     /* Await progress message. */
     do {
         printf("%s: awaiting progress message\n", __func__);
-        ncompleted = fi_cq_sread(gst->cq, &completion, 1, NULL, -1);
+        ncompleted = fi_cq_sread(rcvr->cq, &completion, 1, NULL, -1);
 
         if (ncompleted == -FI_EAVAIL) {
             struct fi_cq_err_entry e;
-            ssize_t nfailed = fi_cq_readerr(gst->cq, &e, 0);
-#if 0
-                  void     *op_context; /* operation context */
-                  uint64_t flags;       /* completion flags */
-                  size_t   len;         /* size of received data */
-                  void     *buf;        /* receive data buffer */
-                  uint64_t data;        /* completion data */
-                  uint64_t tag;         /* message tag */
-                  size_t   olen;        /* overflow length */
-                  int      err;         /* positive error code */
-                  int      prov_errno;  /* provider error code */
-                  void    *err_data;    /*  error data */
-                  size_t   err_data_size; /* size of err_data */
-$1 = {op_context = 0x0, flags = 16778242, len = 296, buf = 0x0, data = 0, 
-  tag = 0, olen = 280, err = 265, prov_errno = -265, err_data = 0x0, 
-  err_data_size = 140215255555464}
-#endif
+            ssize_t nfailed = fi_cq_readerr(rcvr->cq, &e, 0);
 
             warnx("%s: read %zd errors, %s", __func__, nfailed,
                 fi_strerror(e.err));
@@ -961,6 +1185,8 @@ main(int argc, char **argv)
         personality = put;
     else
         errx(EXIT_FAILURE, "program personality '%s' is not implemented", prog);
+
+    initialize();
 
     printf("%ld POSIX I/O vector items maximum\n", sysconf(_SC_IOV_MAX));
 
