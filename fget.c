@@ -307,7 +307,7 @@ worker_assign_rcvr(worker_t *w, rcvr_t *r, struct fid_domain *dom)
     return false;
 }
 
-/* Try to allocate to an active worker, least active, first.
+/* Try to allocate `r` to an active worker, least active, first.
  * Caller must hold `workers_mtx`.
  */
 static worker_t *
