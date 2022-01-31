@@ -278,28 +278,33 @@ initialize(void)
 static bool
 worker_assign_rcvr(worker_t *w, rcvr_t *r, struct fid_domain *dom)
 {
-    size_t half, i;
-    pthread_mutex_t *mtx = NULL;
     rcvr_t **rp = NULL;
+    size_t half, i;
+    int rc;
 
     for (half = 0; half < 2; half++) {
-        mtx = &w->mtx[half];
+        pthread_mutex_t *mtx = &w->mtx[half];
         if (pthread_mutex_trylock(mtx) == EBUSY)
             continue;
 
+        // find an empty receiver slot
         for (i = 0; i < arraycount(w->rcvr) / 2; i++) {
             rp = &w->rcvr[half * arraycount(w->rcvr) / 2 + i];
-            if (*rp != NULL) {
-                (void)pthread_mutex_unlock(mtx);
-                goto found;
+            if (*rp != NULL)
+                continue;
+
+            rc = fi_poll_add(w->pollset[half], &r->cq->fid, 0);
+            if (rc == 0) {
+                warn_about_ofi_ret(rc, "fi_poll_add");
+                continue;
             }
+            *rp = r;
+            (void)pthread_mutex_unlock(mtx);
+            return true;
         }
         (void)pthread_mutex_unlock(mtx);
     }
-found:
-    if (rp != NULL)
-        *rp = r;
-    return rp != NULL;
+    return false;
 }
 
 /* Try to allocate to an active worker, least active, first.
