@@ -69,8 +69,8 @@ typedef struct {
     uint32_t ctxs_serviced_since_mark;
 } loadavg_t;
 
-#define WORKER_RCVRS_MAX 64 
-#define WORKERS_MAX 128 
+#define WORKER_RCVRS_MAX 64
+#define WORKERS_MAX 128
 #define RCVRS_MAX (WORKER_RCVRS_MAX * WORKERS_MAX)
 
 typedef struct worker {
@@ -1303,7 +1303,7 @@ main(int argc, char **argv)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_domain");
 
-    printf("starting personality '%s'\n", personality_to_name(personality)); 
+    printf("starting personality '%s'\n", personality_to_name(personality));
 
     return (*personality)(&st);
 }
