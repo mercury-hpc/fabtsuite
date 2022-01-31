@@ -271,7 +271,7 @@ worker_create(struct fid_domain *dom)
 }
 
 static void
-initialize(void)
+workers_initialize(void)
 {
 }
 
@@ -1227,7 +1227,7 @@ main(int argc, char **argv)
     else
         errx(EXIT_FAILURE, "program personality '%s' is not implemented", prog);
 
-    initialize();
+    workers_initialize();
 
     printf("%ld POSIX I/O vector items maximum\n", sysconf(_SC_IOV_MAX));
 
