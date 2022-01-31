@@ -167,10 +167,24 @@ bailout_for_ofi_ret_impl(int ret, const char *fn, int lineno,
     exit(EXIT_FAILURE);
 }
 
-static void *
-worker_loop(void *_arg)
+static void
+worker_inner_loop(worker_t *self)
 {
-    // wait for a ready rcvr: 
+}
+
+static void *
+worker_outer_loop(void *arg)
+{
+    worker_t *self = arg;
+    const ptrdiff_t self_idx = self - &workers[0];
+
+    while (!self->cancelled) {
+        (void)pthread_mutex_lock(&workers_mtx);
+        while (nworkers_running <= self_idx && !self->cancelled)
+            pthread_cond_wait(&self->sleep, &workers_mtx);
+        (void)pthread_mutex_unlock(&workers_mtx);
+        worker_inner_loop(self);
+    }
     return NULL;
 }
 
@@ -198,7 +212,7 @@ worker_init(struct fid_domain *dom, worker_t *w)
     }
     for (i = 0; i < arraycount(w->rcvr); i++)
         w->rcvr[i] = NULL;
-    if ((rc = pthread_create(&w->thd, NULL, worker_loop, w)) != 0) {
+    if ((rc = pthread_create(&w->thd, NULL, worker_outer_loop, w)) != 0) {
             errx(EXIT_FAILURE, "%s.%d: pthread_create: %s",
                 __func__, __LINE__, strerror(rc));
     }
