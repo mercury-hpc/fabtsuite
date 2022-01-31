@@ -131,17 +131,39 @@ static char txbuf[] =
 #define bailout_for_ofi_ret(ret, ...)                          \
         bailout_for_ofi_ret_impl(ret, __func__, __LINE__, __VA_ARGS__)
 
+#define warn_about_ofi_ret(ret, ...)                          \
+        warn_about_ofi_ret_impl(ret, __func__, __LINE__, __VA_ARGS__)
+
+static void
+warnv_about_ofi_ret_impl(int ret, const char *fn, int lineno,
+    const char *fmt, va_list ap)
+{
+    fprintf(stderr, "%s.%d: ", fn, lineno);
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, ": %s\n", fi_strerror(-ret));
+}
+
+static void
+warn_about_ofi_ret_impl(int ret, const char *fn, int lineno,
+    const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    warnv_about_ofi_ret_impl(ret, fn, lineno, fmt, ap);
+    va_end(ap);
+}
+
 static void
 bailout_for_ofi_ret_impl(int ret, const char *fn, int lineno,
     const char *fmt, ...)
 {
     va_list ap;
 
-    fprintf(stderr, "%s.%d: ", fn, lineno);
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    warnv_about_ofi_ret_impl(ret, fn, lineno, fmt, ap);
     va_end(ap);
-    fprintf(stderr, ": %s\n", fi_strerror(-ret));
+
     exit(EXIT_FAILURE);
 }
 
