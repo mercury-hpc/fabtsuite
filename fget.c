@@ -109,13 +109,15 @@ typedef struct worker {
     pthread_t thd;
     loadavg_t avg;
     rcvr_t *rcvr[WORKER_RCVRS_MAX];
+    volatile _Atomic size_t nrcvrs[2];  // number of receivers in each half
+                                        // of rcvrs[]
     struct fid_poll *pollset[2];
     pthread_mutex_t mtx[2]; /* mtx[0] protects pollset[0] and the first half
                              * of rcvr[]; mtx[1], pollset[1] and the second
                              * half
                              */
     pthread_cond_t sleep;   /* Used in conjunction with workers_mtx. */
-    bool cancelled;
+    volatile atomic_bool cancelled;
 } worker_t;
 
 typedef struct {
@@ -152,6 +154,9 @@ static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
 static size_t nworkers_running;
 static size_t nworkers_allocated;
+static pthread_cond_t nworkers_cond = PTHREAD_COND_INITIALIZER;
+
+static bool workers_assignment_suspended = false;
 
 static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
 static const uint64_t desired_tx_flags = FI_SEND | FI_MSG;
@@ -199,23 +204,227 @@ bailout_for_ofi_ret_impl(int ret, const char *fn, int lineno,
     exit(EXIT_FAILURE);
 }
 
-static void
-worker_inner_loop(worker_t *self)
+static rcvr_t *
+rcvr_loop(rcvr_t *r)
 {
+    /* completion fields:
+     *
+     * void     *op_context;
+     * uint64_t flags;
+     * size_t   len;
+     */
+    struct fi_cq_msg_entry completion;
+    struct fi_msg msg;
+    ssize_t ncompleted;
+    int rc;
+
+    /* Await initial message. */
+    do {
+        ncompleted = fi_cq_sread(r->cq, &completion, 1, NULL, -1);
+    } while (ncompleted == -FI_EAGAIN);
+
+    if (ncompleted < 0)
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+
+    if (ncompleted != 1) {
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
+    }
+
+    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+    }
+
+    if (completion.len != sizeof(r->initial.msg)) {
+        errx(EXIT_FAILURE,
+            "initially received %zu bytes, expected %zu\n", completion.len,
+            sizeof(r->initial.msg));
+    }
+
+    if (r->initial.msg.nsources != 1 || r->initial.msg.id != 0) {
+        errx(EXIT_FAILURE,
+            "received nsources %" PRIu32 ", id %" PRIu32 ", expected 1, 0\n",
+            r->initial.msg.nsources, r->initial.msg.id);
+    }
+
+    /* Transmit vector. */
+
+    msg = (struct fi_msg){
+      .msg_iov = r->vector.iov
+    , .desc = r->vector.desc
+    , .iov_count = r->vector.niovs
+    , .addr = 0
+    , .context = NULL
+    , .data = 0
+    };
+
+    rc = fi_sendmsg(r->aep, &msg, 0);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_sendmsg");
+
+    /* Await progress message. */
+    do {
+        printf("%s: awaiting progress message\n", __func__);
+        ncompleted = fi_cq_sread(r->cq, &completion, 1, NULL, -1);
+
+        if (ncompleted == -FI_EAVAIL) {
+            struct fi_cq_err_entry e;
+            ssize_t nfailed = fi_cq_readerr(r->cq, &e, 0);
+
+            warnx("%s: read %zd errors, %s", __func__, nfailed,
+                fi_strerror(e.err));
+            warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
+                __func__, e.flags, desired_rx_flags);
+            abort();
+        }
+    } while (ncompleted == -FI_EAGAIN);
+
+    if (ncompleted < 0)
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+
+    if (ncompleted != 1) {
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
+    }
+
+    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+    }
+
+    if (completion.len != sizeof(r->progress.msg)) {
+        errx(EXIT_FAILURE,
+            "received %zu bytes, expected %zu-byte progress\n", completion.len,
+            sizeof(r->progress.msg));
+    }
+
+    if (r->progress.msg.nfilled != strlen(txbuf)) {
+        errx(EXIT_FAILURE,
+            "progress: %" PRIu64 " bytes filled, expected %" PRIu64 "\n",
+            r->progress.msg.nfilled,
+            strlen(txbuf));
+    }
+
+    if (r->progress.msg.nleftover != 0) {
+        errx(EXIT_FAILURE,
+            "progress: %" PRIu64 " bytes leftover, expected 0\n",
+            r->progress.msg.nleftover);
+    }
+
+    /* Verify received payload. */
+    printf("%zu bytes filled\n", r->progress.msg.nfilled);
+
+    if (strlen(txbuf) != r->progress.msg.nfilled)
+        errx(EXIT_FAILURE, "unexpected received message length");
+
+    if (strncmp(txbuf, r->payload.rxbuf, r->progress.msg.nfilled) != 0)
+        errx(EXIT_FAILURE, "unexpected received message content");
+
+    return NULL;
+}
+
+static void
+worker_run_loop(worker_t *self)
+{
+    size_t half, i;
+
+    for (half = 0; half < 2; half++) {
+        pthread_mutex_t *mtx = &self->mtx[half];
+
+        if (pthread_mutex_trylock(mtx) == EBUSY)
+            continue;
+
+        // find a non-empty receiver slot
+        for (i = 0; i < arraycount(self->rcvr) / 2; i++) {
+            int rc;
+            rcvr_t *r, **rp;
+
+            rp = &self->rcvr[half * arraycount(self->rcvr) / 2 + i];
+
+            // skip empty slots
+            if ((r = *rp) == NULL)
+                continue;
+
+            // continue at next rcvr_t if `r` did not exit
+            if (rcvr_loop(r) != NULL)
+                continue;
+
+            *rp = NULL;
+
+            if ((rc = fi_poll_del(self->pollset[half], &r->cq->fid, 0)) != 0) {
+                warn_about_ofi_ret(rc, "fi_poll_del");
+                continue;
+            }
+            atomic_fetch_add_explicit(&self->nrcvrs[half], -1,
+                memory_order_relaxed);
+        }
+
+        (void)pthread_mutex_unlock(mtx);
+    }
+}
+
+static bool
+worker_is_idle(worker_t *self)
+{
+    const ptrdiff_t self_idx = self - &workers[0];
+    size_t half, nlocked;
+
+    if (self->nrcvrs[0] != 0 || self->nrcvrs[1] != 0)
+        return false;
+
+    if (self_idx + 1 !=
+            atomic_load_explicit(&nworkers_running, memory_order_relaxed))
+        return false;
+
+    if (pthread_mutex_trylock(&workers_mtx) == EBUSY)
+        return false;
+
+    for (nlocked = 0; nlocked < 2; nlocked++) {
+        if (pthread_mutex_trylock(&self->mtx[nlocked]) == EBUSY)
+            break;
+    }
+
+    bool idle = (nlocked == 2 && self->nrcvrs[0] == 0 && self->nrcvrs[1] == 0 &&
+        self_idx + 1 == nworkers_running);
+
+    if (idle) {
+        nworkers_running--;
+        pthread_cond_signal(&nworkers_cond);
+    }
+
+    for (half = 0; half < nlocked; half++)
+        (void)pthread_mutex_unlock(&self->mtx[half]);
+
+    (void)pthread_mutex_unlock(&workers_mtx);
+
+    return idle;
+}
+
+static void
+worker_idle_loop(worker_t *self)
+{
+    const ptrdiff_t self_idx = self - &workers[0];
+
+    (void)pthread_mutex_lock(&workers_mtx);
+    while (nworkers_running <= self_idx && !self->cancelled)
+        pthread_cond_wait(&self->sleep, &workers_mtx);
+    (void)pthread_mutex_unlock(&workers_mtx);
 }
 
 static void *
 worker_outer_loop(void *arg)
 {
     worker_t *self = arg;
-    const ptrdiff_t self_idx = self - &workers[0];
 
     while (!self->cancelled) {
-        (void)pthread_mutex_lock(&workers_mtx);
-        while (nworkers_running <= self_idx && !self->cancelled)
-            pthread_cond_wait(&self->sleep, &workers_mtx);
-        (void)pthread_mutex_unlock(&workers_mtx);
-        worker_inner_loop(self);
+        worker_idle_loop(self);
+        do {
+            worker_run_loop(self);
+        } while (!worker_is_idle(self) && !self->cancelled);
     }
     return NULL;
 }
@@ -244,26 +453,26 @@ worker_init(struct fid_domain *dom, worker_t *w)
     }
     for (i = 0; i < arraycount(w->rcvr); i++)
         w->rcvr[i] = NULL;
+}
+
+static void
+worker_launch(worker_t *w)
+{
+    int rc;
+
     if ((rc = pthread_create(&w->thd, NULL, worker_outer_loop, w)) != 0) {
             errx(EXIT_FAILURE, "%s.%d: pthread_create: %s",
                 __func__, __LINE__, strerror(rc));
     }
 }
 
+#if 0
 static void
 worker_teardown(worker_t *w)
 {
     int rc;
     size_t i;
 
-    w->cancelled = true;
-
-    /* TBD wake thread */
-
-    if ((rc = pthread_join(w->thd, NULL)) != 0) {
-            errx(EXIT_FAILURE, "%s.%d: pthread_join: %s",
-                __func__, __LINE__, strerror(rc));
-    }
     for (i = 0; i < arraycount(w->mtx); i++) {
         if ((rc = pthread_mutex_destroy(&w->mtx[i])) != 0) {
             errx(EXIT_FAILURE, "%s.%d: pthread_mutex_destroy: %s",
@@ -280,24 +489,23 @@ worker_teardown(worker_t *w)
             __func__, __LINE__, strerror(rc));
     }
 }
+#endif
 
 static worker_t *
 worker_create(struct fid_domain *dom)
 {
-    worker_t proto_worker, *w;
-
-    worker_init(dom, &proto_worker);
+    worker_t *w;
 
     (void)pthread_mutex_lock(&workers_mtx);
     w = (nworkers_allocated < arraycount(workers))
         ? &workers[nworkers_allocated++]
         : NULL;
     if (w != NULL)
-        *w = proto_worker;
+        worker_init(dom, w);
     (void)pthread_mutex_unlock(&workers_mtx);
 
-    if (w == NULL)
-        worker_teardown(&proto_worker);
+    if (w != NULL)
+        worker_launch(w);
 
     return w;
 }
@@ -310,12 +518,13 @@ workers_initialize(void)
 static bool
 worker_assign_rcvr(worker_t *w, rcvr_t *r, struct fid_domain *dom)
 {
-    rcvr_t **rp = NULL;
+    rcvr_t **rp;
     size_t half, i;
     int rc;
 
     for (half = 0; half < 2; half++) {
         pthread_mutex_t *mtx = &w->mtx[half];
+
         if (pthread_mutex_trylock(mtx) == EBUSY)
             continue;
 
@@ -326,10 +535,12 @@ worker_assign_rcvr(worker_t *w, rcvr_t *r, struct fid_domain *dom)
                 continue;
 
             rc = fi_poll_add(w->pollset[half], &r->cq->fid, 0);
-            if (rc == 0) {
+            if (rc != 0) {
                 warn_about_ofi_ret(rc, "fi_poll_add");
                 continue;
             }
+            atomic_fetch_add_explicit(&w->nrcvrs[half], 1,
+                memory_order_relaxed);
             *rp = r;
             (void)pthread_mutex_unlock(mtx);
             return true;
@@ -356,7 +567,7 @@ workers_assign_rcvr_to_running(rcvr_t *r, struct fid_domain *dom)
     return NULL;
 }
 
-/* Try next to allocate to the next idle worker.
+/* Try to assign `r` to the next idle worker servicing `dom`.
  * Caller must hold `workers_mtx`.
  */
 static worker_t *
@@ -391,13 +602,52 @@ workers_assign_rcvr(rcvr_t *r, struct fid_domain *dom)
 
     do {
         (void)pthread_mutex_lock(&workers_mtx);
+
+        if (workers_assignment_suspended) {
+            (void)pthread_mutex_unlock(&workers_mtx);
+            return NULL;
+        }
+
         if ((w = workers_assign_rcvr_to_running(r, dom)) != NULL)
             ;
         else if ((w = workers_assign_rcvr_to_idle(r, dom)) != NULL)
             workers_wake(w);
         (void)pthread_mutex_unlock(&workers_mtx);
     } while (w == NULL && (w = worker_create(dom)) != NULL);
+
     return w;
+}
+
+static void
+workers_join_all(void)
+{
+    size_t i;
+
+    (void)pthread_mutex_lock(&workers_mtx);
+
+    workers_assignment_suspended = true;
+
+    while (nworkers_running > 0) {
+        pthread_cond_wait(&nworkers_cond, &workers_mtx);
+    }
+
+    for (i = 0; i < nworkers_allocated; i++) {
+        worker_t *w = &workers[i];
+        w->cancelled = true;
+        pthread_cond_signal(&w->sleep);
+    }
+
+    (void)pthread_mutex_unlock(&workers_mtx);
+
+    for (i = 0; i < nworkers_allocated; i++) {
+        worker_t *w = &workers[i];
+        int rc;
+
+        if ((rc = pthread_join(w->thd, NULL)) != 0) {
+                errx(EXIT_FAILURE, "%s.%d: pthread_join: %s",
+                    __func__, __LINE__, strerror(rc));
+        }
+    }
 }
 
 static size_t
@@ -500,13 +750,6 @@ err:
 static int
 get(state_t *st)
 {
-    /* completion fields:
-     *
-     * void     *op_context;
-     * uint64_t flags;
-     * size_t   len;
-     */
-    struct fi_cq_msg_entry completion;
     struct fi_cq_attr cq_attr = {
       .size = 128
     , .flags = 0
@@ -529,7 +772,7 @@ get(state_t *st)
     rcvr_t *r = &gst->rcvr;
     worker_t *w;
     uint64_t next_key = 0;
-    ssize_t i, ncompleted;
+    ssize_t i;
     uint32_t event;
     int rc;
 
@@ -723,116 +966,12 @@ get(state_t *st)
             __func__, FI_CONNECTED, event);
     }
 
-    if (false && (w = workers_assign_rcvr(r, st->domain)) == NULL) {
+    if ((w = workers_assign_rcvr(r, st->domain)) == NULL) {
         errx(EXIT_FAILURE, "%s: could not assign a worker to a new receiver",
             __func__);
     }
 
-    /* Await initial message. */
-    do {
-        ncompleted = fi_cq_sread(r->cq, &completion, 1, NULL, -1);
-    } while (rc == -FI_EAGAIN);
-
-    if (ncompleted < 0)
-        bailout_for_ofi_ret(rc, "fi_cq_sread");
-
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
-    }
-
-    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
-    }
-
-    if (completion.len != sizeof(r->initial.msg)) {
-        errx(EXIT_FAILURE,
-            "initially received %zu bytes, expected %zu\n", completion.len,
-            sizeof(r->initial.msg));
-    }
-
-    if (r->initial.msg.nsources != 1 || r->initial.msg.id != 0) {
-        errx(EXIT_FAILURE,
-            "received nsources %" PRIu32 ", id %" PRIu32 ", expected 1, 0\n",
-            r->initial.msg.nsources, r->initial.msg.id);
-    }
-
-    /* Transmit vector. */
-
-    msg = (struct fi_msg){
-      .msg_iov = r->vector.iov
-    , .desc = r->vector.desc
-    , .iov_count = r->vector.niovs
-    , .addr = 0
-    , .context = NULL
-    , .data = 0
-    };
-
-    rc = fi_sendmsg(r->aep, &msg, 0);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_sendmsg");
-
-    /* Await progress message. */
-    do {
-        printf("%s: awaiting progress message\n", __func__);
-        ncompleted = fi_cq_sread(r->cq, &completion, 1, NULL, -1);
-
-        if (ncompleted == -FI_EAVAIL) {
-            struct fi_cq_err_entry e;
-            ssize_t nfailed = fi_cq_readerr(r->cq, &e, 0);
-
-            warnx("%s: read %zd errors, %s", __func__, nfailed,
-                fi_strerror(e.err));
-            warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
-                __func__, e.flags, desired_rx_flags);
-            abort();
-        }
-    } while (rc == -FI_EAGAIN);
-
-    if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
-
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
-    }
-
-    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
-    }
-
-    if (completion.len != sizeof(r->progress.msg)) {
-        errx(EXIT_FAILURE,
-            "received %zu bytes, expected %zu-byte progress\n", completion.len,
-            sizeof(r->progress.msg));
-    }
-
-    if (r->progress.msg.nfilled != strlen(txbuf)) {
-        errx(EXIT_FAILURE,
-            "progress: %" PRIu64 " bytes filled, expected %" PRIu64 "\n",
-            r->progress.msg.nfilled,
-            strlen(txbuf));
-    }
-
-    if (r->progress.msg.nleftover != 0) {
-        errx(EXIT_FAILURE,
-            "progress: %" PRIu64 " bytes leftover, expected 0\n",
-            r->progress.msg.nleftover);
-    }
-
-    /* Verify received payload. */
-    printf("%zu bytes filled\n", r->progress.msg.nfilled);
-
-    if (strlen(txbuf) != r->progress.msg.nfilled)
-        errx(EXIT_FAILURE, "unexpected received message length");
-
-    if (strncmp(txbuf, r->payload.rxbuf, r->progress.msg.nfilled) != 0)
-        errx(EXIT_FAILURE, "unexpected received message content");
+    workers_join_all();
 
     return EXIT_SUCCESS;
 }
