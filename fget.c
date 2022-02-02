@@ -1019,10 +1019,10 @@ put(state_t *st)
     /* Await reply to initial message: first vector message. */
     do {
         ncompleted = fi_cq_sread(pst->cq, &completion, 1, NULL, -1);
-    } while (rc == -FI_EAGAIN);
+    } while (ncompleted == -FI_EAGAIN);
 
     if (ncompleted < 0)
-        bailout_for_ofi_ret(rc, "fi_cq_sread");
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
 
     if (ncompleted != 1) {
         errx(EXIT_FAILURE,
@@ -1102,10 +1102,10 @@ put(state_t *st)
     do {
         printf("%s: awaiting RMA completion.\n", __func__);
         ncompleted = fi_cq_sread(pst->cq, &completion, 1, NULL, -1);
-    } while (rc == -FI_EAGAIN);
+    } while (ncompleted == -FI_EAGAIN);
 
     if (ncompleted < 0)
-        bailout_for_ofi_ret(rc, "fi_cq_sread");
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
 
     if (ncompleted != 1) {
         errx(EXIT_FAILURE,
@@ -1161,10 +1161,10 @@ put(state_t *st)
     do {
         printf("%s: awaiting progress message transmission.\n", __func__);
         ncompleted = fi_cq_sread(pst->cq, &completion, 1, NULL, -1);
-    } while (rc == -FI_EAGAIN);
+    } while (ncompleted == -FI_EAGAIN);
 
     if (ncompleted < 0)
-        bailout_for_ofi_ret(rc, "fi_cq_sread");
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
 
     if (ncompleted != 1) {
         errx(EXIT_FAILURE,
