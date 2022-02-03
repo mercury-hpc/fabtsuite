@@ -1211,17 +1211,30 @@ put(state_t *st)
     payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
     payload.desc[0] = fi_mr_desc(payload.mr[0]);
 
-    for (i = 0; i < vector.msg.niovs; i++) {
+    size_t nremaining = txbuflen;
+
+    /* TBD only fill riov[] to the number of vectors we need.  Track the
+     * need in a new variable, `nriovs`.  Set the length of the last
+     * vector to the bytes remaining in `txbuf` after assigning bytes to
+     * the preceding vectors.
+     */
+    for (i = 0; 0 < nremaining && i < vector.msg.niovs; i++) {
         printf("%s: received vector %zd "
             "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64 "\n",
             __func__, i, vector.msg.iov[i].addr, vector.msg.iov[i].len,
             vector.msg.iov[i].key);
-        riov[i].len = vector.msg.iov[i].len;
+        riov[i].len = minsize(nremaining, vector.msg.iov[i].len);
+        nremaining -= riov[i].len;
         riov[i].addr = vector.msg.iov[i].addr;
         riov[i].key = vector.msg.iov[i].key;
     }
 
-#if 0
+    if (nremaining > 0) {
+        errx(EXIT_FAILURE, "%s: the receiver's buffer cannot fit the payload",
+            __func__);
+    }
+
+#if 1
     struct fi_msg_rma mrma;
     mrma.msg_iov = payload.iov;
     mrma.desc = payload.desc;
@@ -1232,12 +1245,15 @@ put(state_t *st)
     mrma.context = NULL;
     mrma.data = 0;
 
-    rc = fi_writemsg(pst->ep, &mrma, FI_COMPLETION | FI_DELIVERY_COMPLETE);
+    rc = fi_writemsg(pst->ep, &mrma, 0);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_writemsg");
 
-    /* Await RDMA completion. */
+#   if 0
+    /* Await RDMA completion. Pass flags FI_COMPLETION |
+     * FI_DELIVERY_COMPLETE to fi_writemsg, above.
+     */
     do {
         printf("%s: awaiting RMA completion.\n", __func__);
         ncompleted = fi_cq_sread(pst->cq, &completion, 1, NULL, -1);
@@ -1250,6 +1266,7 @@ put(state_t *st)
         errx(EXIT_FAILURE,
             "%s: expected 1 completion, read %zd", __func__, ncompleted);
     }
+#   endif
 #else
     size_t nwritten = 0;
     for (i = 0; i < vector.msg.niovs && nwritten < txbuflen; i++) {
