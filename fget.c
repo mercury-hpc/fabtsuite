@@ -1038,6 +1038,7 @@ put(state_t *st)
     uint32_t event;
     size_t i;
     int rc;
+    const size_t txbuflen = strlen(txbuf);
 
     rc = fi_mr_reg(st->domain, &initial.msg, sizeof(initial.msg), FI_SEND,
         0, next_key++, 0, initial.mr, NULL);
@@ -1057,7 +1058,7 @@ put(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
-    rc = fi_mr_reg(st->domain, txbuf, strlen(txbuf), FI_WRITE,
+    rc = fi_mr_reg(st->domain, txbuf, txbuflen, FI_WRITE,
         0, next_key++, 0, payload.mr, NULL);
 
     if (rc != 0)
@@ -1207,8 +1208,7 @@ put(state_t *st)
             __func__);
     }
 
-    payload.iov[0] = (struct iovec){.iov_base = txbuf,
-                                    .iov_len = strlen(txbuf)};
+    payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
     payload.desc[0] = fi_mr_desc(payload.mr[0]);
 
     for (i = 0; i < vector.msg.niovs; i++) {
@@ -1251,8 +1251,6 @@ put(state_t *st)
             "%s: expected 1 completion, read %zd", __func__, ncompleted);
     }
 #else
-
-    const size_t txbuflen = strlen(txbuf);
     size_t nwritten = 0;
     for (i = 0; i < vector.msg.niovs && nwritten < txbuflen; i++) {
         const size_t split = 0;
@@ -1278,7 +1276,7 @@ put(state_t *st)
 
 #endif
 
-    progress.msg.nfilled = strlen(txbuf);
+    progress.msg.nfilled = txbuflen;
     progress.msg.nleftover = 0;
 
     progress.iov[0] = (struct iovec){.iov_base = &progress.msg,
