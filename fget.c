@@ -48,6 +48,7 @@ typedef struct progress_msg {
  * Communications state definitions
  */
 typedef struct {
+    bool started;
     struct fid_ep *aep;
     struct fid_eq *active_eq;
     struct fid_cq *cq;
@@ -205,18 +206,12 @@ bailout_for_ofi_ret_impl(int ret, const char *fn, int lineno,
 }
 
 static rcvr_t *
-rcvr_loop(rcvr_t *r)
+rcvr_start(rcvr_t *r)
 {
-    /* completion fields:
-     *
-     * void     *op_context;
-     * uint64_t flags;
-     * size_t   len;
-     */
     struct fi_cq_msg_entry completion;
-    struct fi_msg msg;
     ssize_t ncompleted;
-    int rc;
+
+    r->started = true;
 
     /* Await initial message. */
     do {
@@ -248,6 +243,26 @@ rcvr_loop(rcvr_t *r)
             "received nsources %" PRIu32 ", id %" PRIu32 ", expected 1, 0\n",
             r->initial.msg.nsources, r->initial.msg.id);
     }
+
+    return r;
+}
+
+static rcvr_t *
+rcvr_loop(rcvr_t *r)
+{
+    /* completion fields:
+     *
+     * void     *op_context;
+     * uint64_t flags;
+     * size_t   len;
+     */
+    struct fi_cq_msg_entry completion;
+    struct fi_msg msg;
+    ssize_t ncompleted;
+    int rc;
+
+    if (!r->started)
+        return rcvr_start(r);
 
     /* Transmit vector. */
 
@@ -775,6 +790,10 @@ get(state_t *st)
     ssize_t i;
     uint32_t event;
     int rc;
+
+    memset(r, 0, sizeof(*r));
+
+    r->started = false;
 
     r->initial.niovs = fibonacci_iov_setup(&r->initial.msg,
         sizeof(r->initial.msg), r->initial.iov, st->rx_maxsegs);
