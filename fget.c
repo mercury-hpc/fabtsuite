@@ -86,6 +86,40 @@ typedef struct {
     } payload;
 } rcvr_t;
 
+typedef struct {
+    struct {
+        struct iovec iov[12];
+        void *desc[12];
+        struct fid_mr *mr[12];
+        uint64_t raddr[12];
+        ssize_t niovs;
+        initial_msg_t msg;
+    } initial;
+    struct {
+        struct iovec iov[12];
+        void *desc[12];
+        struct fid_mr *mr[12];
+        uint64_t raddr[12];
+        ssize_t niovs;
+        vector_msg_t msg;
+    } vector;
+    struct {
+        struct iovec iov[12];
+        void *desc[12];
+        struct fid_mr *mr[12];
+        uint64_t raddr[12];
+        ssize_t niovs;
+        progress_msg_t msg;
+    } progress;
+    struct {
+        struct iovec iov[12];
+        void *desc[12];
+        struct fid_mr *mr[12];
+        uint64_t raddr[12];
+        ssize_t niovs;
+    } payload;
+} xmtr_t;
+
 /* On each loop, a worker checks its poll set for any completions.
  * If `loops_since_mark < UINT16_MAX`, a worker increases it by
  * one, and increases `ctxs_serviced_since_mark` by the number
@@ -131,6 +165,7 @@ typedef struct {
     struct fid_ep *ep;
     struct fid_eq *connect_eq;
     struct fid_cq *cq;
+    xmtr_t xmtr;
 } put_state_t;
 
 typedef struct {
@@ -1023,34 +1058,8 @@ put(state_t *st)
     };
     struct fi_eq_cm_entry cm_entry;
     struct fi_msg msg;
-    struct {
-        struct iovec iov[12];
-        void *desc[12];
-        struct fid_mr *mr[12];
-        ssize_t niovs;
-        initial_msg_t msg;
-    } initial;
-    struct {
-        struct iovec iov[12];
-        void *desc[12];
-        struct fid_mr *mr[12];
-        ssize_t niovs;
-        vector_msg_t msg;
-    } vector;
-    struct {
-        struct iovec iov[12];
-        void *desc[12];
-        struct fid_mr *mr[12];
-        ssize_t niovs;
-        progress_msg_t msg;
-    } progress;
     put_state_t *pst = &st->u.put;
-    struct {
-        struct iovec iov[12];
-        void *desc[12];
-        struct fid_mr *mr[12];
-        ssize_t niovs;
-    } payload;
+    xmtr_t *x = &pst->xmtr;
     struct fi_rma_iov riov[12];
     uint64_t next_key = 0;
     ssize_t ncompleted;
@@ -1059,26 +1068,28 @@ put(state_t *st)
     int rc;
     const size_t txbuflen = strlen(txbuf);
 
-    rc = fi_mr_reg(st->domain, &initial.msg, sizeof(initial.msg), FI_SEND,
-        0, next_key++, 0, initial.mr, NULL);
+    memset(x, 0, sizeof(*x));
+
+    rc = fi_mr_reg(st->domain, &x->initial.msg, sizeof(x->initial.msg),
+        FI_SEND, 0, next_key++, 0, x->initial.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
-    rc = fi_mr_reg(st->domain, &vector.msg, sizeof(vector.msg), FI_RECV,
-        0, next_key++, 0, vector.mr, NULL);
+    rc = fi_mr_reg(st->domain, &x->vector.msg, sizeof(x->vector.msg),
+        FI_RECV, 0, next_key++, 0, x->vector.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
-    rc = fi_mr_reg(st->domain, &progress.msg, sizeof(progress.msg), FI_SEND,
-        0, next_key++, 0, progress.mr, NULL);
+    rc = fi_mr_reg(st->domain, &x->progress.msg, sizeof(x->progress.msg),
+        FI_SEND, 0, next_key++, 0, x->progress.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
-    rc = fi_mr_reg(st->domain, txbuf, txbuflen, FI_WRITE,
-        0, next_key++, 0, payload.mr, NULL);
+    rc = fi_mr_reg(st->domain, txbuf, txbuflen,
+        FI_WRITE, 0, next_key++, 0, x->payload.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
@@ -1134,13 +1145,13 @@ put(state_t *st)
     }
 
     /* Post receive for first vector message. */
-    vector.iov[0] = (struct iovec){.iov_base = &vector.msg,
-                                   .iov_len = sizeof(vector.msg)};
-    vector.desc[0] = fi_mr_desc(vector.mr[0]);
+    x->vector.iov[0] = (struct iovec){.iov_base = &x->vector.msg,
+                                   .iov_len = sizeof(x->vector.msg)};
+    x->vector.desc[0] = fi_mr_desc(x->vector.mr[0]);
 
     msg = (struct fi_msg){
-      .msg_iov = vector.iov
-    , .desc = vector.desc
+      .msg_iov = x->vector.iov
+    , .desc = x->vector.desc
     , .iov_count = 1
     , .addr = 0
     , .context = NULL
@@ -1153,17 +1164,17 @@ put(state_t *st)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
 
     /* Setup & transmit initial message. */
-    memset(&initial.msg, 0, sizeof(initial.msg));
-    initial.msg.nsources = 1;
-    initial.msg.id = 0;
+    memset(&x->initial.msg, 0, sizeof(x->initial.msg));
+    x->initial.msg.nsources = 1;
+    x->initial.msg.id = 0;
 
-    initial.iov[0] = (struct iovec){.iov_base = &initial.msg,
-                                    .iov_len = sizeof(initial.msg)};
-    initial.desc[0] = fi_mr_desc(initial.mr[0]);
+    x->initial.iov[0] = (struct iovec){.iov_base = &x->initial.msg,
+                                    .iov_len = sizeof(x->initial.msg)};
+    x->initial.desc[0] = fi_mr_desc(x->initial.mr[0]);
 
     msg = (struct fi_msg){
-      .msg_iov = initial.iov
-    , .desc = initial.desc
+      .msg_iov = x->initial.iov
+    , .desc = x->initial.desc
     , .iov_count = 1
     , .addr = 0
     , .context = NULL
@@ -1195,7 +1206,7 @@ put(state_t *st)
     }
 
     const ptrdiff_t least_vector_msglen =
-        (char *)&vector.msg.iov[0] - (char *)&vector.msg;
+        (char *)&x->vector.msg.iov[0] - (char *)&x->vector.msg;
 
     if (completion.len < least_vector_msglen) {
         errx(EXIT_FAILURE, "%s: expected >= %zu bytes, received %zu",
@@ -1208,27 +1219,27 @@ put(state_t *st)
     }
 
     if ((completion.len - least_vector_msglen) %
-        sizeof(vector.msg.iov[0]) != 0) {
+        sizeof(x->vector.msg.iov[0]) != 0) {
         errx(EXIT_SUCCESS,
             "%s: %zu-byte vector message did not end on vector boundary, "
             "disconnecting...", __func__, completion.len);
     }
 
     const size_t niovs_space = (completion.len - least_vector_msglen) /
-        sizeof(vector.msg.iov[0]);
+        sizeof(x->vector.msg.iov[0]);
 
-    if (niovs_space < vector.msg.niovs) {
+    if (niovs_space < x->vector.msg.niovs) {
         errx(EXIT_SUCCESS, "%s: peer sent truncated vectors, disconnecting...",
             __func__);
     }
 
-    if (vector.msg.niovs > arraycount(riov)) {
+    if (x->vector.msg.niovs > arraycount(riov)) {
         errx(EXIT_SUCCESS, "%s: peer sent too many vectors, disconnecting...",
             __func__);
     }
 
-    payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
-    payload.desc[0] = fi_mr_desc(payload.mr[0]);
+    x->payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
+    x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
 
     size_t nremaining = txbuflen;
 
@@ -1237,15 +1248,15 @@ put(state_t *st)
      * vector to the bytes remaining in `txbuf` after assigning bytes to
      * the preceding vectors.
      */
-    for (i = 0; 0 < nremaining && i < vector.msg.niovs; i++) {
+    for (i = 0; 0 < nremaining && i < x->vector.msg.niovs; i++) {
         printf("%s: received vector %zd "
             "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64 "\n",
-            __func__, i, vector.msg.iov[i].addr, vector.msg.iov[i].len,
-            vector.msg.iov[i].key);
-        riov[i].len = minsize(nremaining, vector.msg.iov[i].len);
+            __func__, i, x->vector.msg.iov[i].addr, x->vector.msg.iov[i].len,
+            x->vector.msg.iov[i].key);
+        riov[i].len = minsize(nremaining, x->vector.msg.iov[i].len);
         nremaining -= riov[i].len;
-        riov[i].addr = vector.msg.iov[i].addr;
-        riov[i].key = vector.msg.iov[i].key;
+        riov[i].addr = x->vector.msg.iov[i].addr;
+        riov[i].key = x->vector.msg.iov[i].key;
     }
 
     if (nremaining > 0) {
@@ -1255,12 +1266,12 @@ put(state_t *st)
 
 #if 1
     struct fi_msg_rma mrma;
-    mrma.msg_iov = payload.iov;
-    mrma.desc = payload.desc;
+    mrma.msg_iov = x->payload.iov;
+    mrma.desc = x->payload.desc;
     mrma.iov_count = 1;
     mrma.addr = 0;
     mrma.rma_iov = riov;
-    mrma.rma_iov_count = vector.msg.niovs;
+    mrma.rma_iov_count = x->vector.msg.niovs;
     mrma.context = NULL;
     mrma.data = 0;
 
@@ -1288,22 +1299,22 @@ put(state_t *st)
 #   endif
 #else
     size_t nwritten = 0;
-    for (i = 0; i < vector.msg.niovs && nwritten < txbuflen; i++) {
+    for (i = 0; i < x->vector.msg.niovs && nwritten < txbuflen; i++) {
         const size_t split = 0;
         if (split > 0 && minsize(riov[i].len, txbuflen - nwritten) > split) {
             rc = fi_write(pst->ep, txbuf + nwritten,
                 split,
-                fi_mr_desc(payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
+                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
             if (rc != 0)
                 bailout_for_ofi_ret(rc, "fi_write");
             rc = fi_write(pst->ep, txbuf + nwritten + split,
                 minsize(riov[i].len, txbuflen - nwritten) - split,
-                fi_mr_desc(payload.mr[0]), 0, riov[i].addr + split,
+                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr + split,
                 riov[i].key, NULL);
         } else {
             rc = fi_write(pst->ep, txbuf + nwritten,
                 minsize(riov[i].len, txbuflen - nwritten),
-                fi_mr_desc(payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
+                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
         }
         if (rc != 0)
             bailout_for_ofi_ret(rc, "fi_write");
@@ -1312,16 +1323,16 @@ put(state_t *st)
 
 #endif
 
-    progress.msg.nfilled = txbuflen;
-    progress.msg.nleftover = 0;
+    x->progress.msg.nfilled = txbuflen;
+    x->progress.msg.nleftover = 0;
 
-    progress.iov[0] = (struct iovec){.iov_base = &progress.msg,
-                                    .iov_len = sizeof(progress.msg)};
-    progress.desc[0] = fi_mr_desc(progress.mr[0]);
+    x->progress.iov[0] = (struct iovec){.iov_base = &x->progress.msg,
+                                    .iov_len = sizeof(x->progress.msg)};
+    x->progress.desc[0] = fi_mr_desc(x->progress.mr[0]);
 
     msg = (struct fi_msg){
-      .msg_iov = progress.iov
-    , .desc = progress.desc
+      .msg_iov = x->progress.iov
+    , .desc = x->progress.desc
     , .iov_count = 1
     , .addr = 0
     , .context = NULL
@@ -1351,7 +1362,7 @@ put(state_t *st)
     }
 
     printf("sent %zu of %zu bytes progress message\n", completion.len,
-        sizeof(progress.msg));
+        sizeof(x->progress.msg));
 
     return EXIT_SUCCESS;
 }
