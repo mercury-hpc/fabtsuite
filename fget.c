@@ -47,11 +47,20 @@ typedef struct progress_msg {
 /*
  * Communications state definitions
  */
+
+struct cxn;
+typedef struct cxn cxn_t;
+
+struct cxn {
+    cxn_t *(*loop)(cxn_t *);
+    struct fid_cq *cq;
+};
+
 typedef struct {
+    cxn_t cxn;
     bool started;
     struct fid_ep *aep;
     struct fid_eq *active_eq;
-    struct fid_cq *cq;
     struct {
         struct iovec iov[12];
         void *desc[12];
@@ -87,6 +96,9 @@ typedef struct {
 } rcvr_t;
 
 typedef struct {
+    cxn_t cxn;
+    bool started;
+    struct fid_ep *ep;
     struct {
         struct iovec iov[12];
         void *desc[12];
@@ -136,19 +148,19 @@ typedef struct {
     uint32_t ctxs_serviced_since_mark;
 } loadavg_t;
 
-#define WORKER_RCVRS_MAX 64
+#define WORKER_CXNS_MAX 64
 #define WORKERS_MAX 128
-#define RCVRS_MAX (WORKER_RCVRS_MAX * WORKERS_MAX)
+#define CXNS_MAX (WORKER_CXNS_MAX * WORKERS_MAX)
 
 typedef struct worker {
     pthread_t thd;
     loadavg_t avg;
-    rcvr_t *rcvr[WORKER_RCVRS_MAX];
-    volatile _Atomic size_t nrcvrs[2];  // number of receivers in each half
-                                        // of rcvrs[]
+    cxn_t *cxn[WORKER_CXNS_MAX];
+    volatile _Atomic size_t ncxns[2];  // number of receivers in each half
+                                        // of cxn[]
     struct fid_poll *pollset[2];
     pthread_mutex_t mtx[2]; /* mtx[0] protects pollset[0] and the first half
-                             * of rcvr[]; mtx[1], pollset[1] and the second
+                             * of cxn[]; mtx[1], pollset[1] and the second
                              * half
                              */
     pthread_cond_t sleep;   /* Used in conjunction with workers_mtx. */
@@ -162,9 +174,7 @@ typedef struct {
 } get_state_t;
 
 typedef struct {
-    struct fid_ep *ep;
     struct fid_eq *connect_eq;
-    struct fid_cq *cq;
     xmtr_t xmtr;
 } put_state_t;
 
@@ -240,7 +250,21 @@ bailout_for_ofi_ret_impl(int ret, const char *fn, int lineno,
     exit(EXIT_FAILURE);
 }
 
-static rcvr_t *
+#if 0
+static int
+maxsize(size_t l, size_t r)
+{
+    return (l > r) ? l : r;
+}
+#endif
+
+static int
+minsize(size_t l, size_t r)
+{
+    return (l < r) ? l : r;
+}
+
+static cxn_t *
 rcvr_start(rcvr_t *r)
 {
     struct fi_cq_msg_entry completion;
@@ -250,7 +274,7 @@ rcvr_start(rcvr_t *r)
 
     /* Await initial message. */
     do {
-        ncompleted = fi_cq_sread(r->cq, &completion, 1, NULL, -1);
+        ncompleted = fi_cq_sread(r->cxn.cq, &completion, 1, NULL, -1);
     } while (ncompleted == -FI_EAGAIN);
 
     if (ncompleted < 0)
@@ -279,20 +303,14 @@ rcvr_start(rcvr_t *r)
             r->initial.msg.nsources, r->initial.msg.id);
     }
 
-    return r;
+    return &r->cxn;
 }
 
-static rcvr_t *
-rcvr_loop(rcvr_t *r)
+static cxn_t *
+rcvr_loop(cxn_t *c)
 {
-    /* completion fields:
-     *
-     * void     *op_context;
-     * uint64_t flags;
-     * size_t   len;
-     */
+    rcvr_t *r = (rcvr_t *)c;
     struct fi_cq_msg_entry completion;
-    struct fi_msg msg;
     ssize_t ncompleted;
     int rc;
 
@@ -301,16 +319,14 @@ rcvr_loop(rcvr_t *r)
 
     /* Transmit vector. */
 
-    msg = (struct fi_msg){
-      .msg_iov = r->vector.iov
-    , .desc = r->vector.desc
-    , .iov_count = r->vector.niovs
-    , .addr = 0
-    , .context = NULL
-    , .data = 0
-    };
-
-    rc = fi_sendmsg(r->aep, &msg, 0);
+    rc = fi_sendmsg(r->aep, &(struct fi_msg){
+          .msg_iov = r->vector.iov
+        , .desc = r->vector.desc
+        , .iov_count = r->vector.niovs
+        , .addr = 0
+        , .context = NULL
+        , .data = 0
+        }, 0);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_sendmsg");
@@ -318,11 +334,11 @@ rcvr_loop(rcvr_t *r)
     /* Await progress message. */
     do {
         printf("%s: awaiting progress message\n", __func__);
-        ncompleted = fi_cq_sread(r->cq, &completion, 1, NULL, -1);
+        ncompleted = fi_cq_sread(r->cxn.cq, &completion, 1, NULL, -1);
 
         if (ncompleted == -FI_EAVAIL) {
             struct fi_cq_err_entry e;
-            ssize_t nfailed = fi_cq_readerr(r->cq, &e, 0);
+            ssize_t nfailed = fi_cq_readerr(r->cxn.cq, &e, 0);
 
             warnx("%s: read %zd errors, %s", __func__, nfailed,
                 fi_strerror(e.err));
@@ -377,6 +393,254 @@ rcvr_loop(rcvr_t *r)
     return NULL;
 }
 
+static cxn_t *
+xmtr_start(xmtr_t *x)
+{
+    int rc;
+
+    x->started = true;
+
+    /* Post receive for first vector message. */
+    x->vector.iov[0] = (struct iovec){.iov_base = &x->vector.msg,
+                                   .iov_len = sizeof(x->vector.msg)};
+    x->vector.desc[0] = fi_mr_desc(x->vector.mr[0]);
+
+    rc = fi_recvmsg(x->ep, &(struct fi_msg){
+          .msg_iov = x->vector.iov
+        , .desc = x->vector.desc
+        , .iov_count = 1
+        , .addr = 0
+        , .context = NULL
+        , .data = 0
+        }, FI_COMPLETION);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_recvmsg");
+
+    /* Setup & transmit initial message. */
+    memset(&x->initial.msg, 0, sizeof(x->initial.msg));
+    x->initial.msg.nsources = 1;
+    x->initial.msg.id = 0;
+
+    x->initial.iov[0] = (struct iovec){.iov_base = &x->initial.msg,
+                                    .iov_len = sizeof(x->initial.msg)};
+    x->initial.desc[0] = fi_mr_desc(x->initial.mr[0]);
+
+    rc = fi_sendmsg(x->ep, &(struct fi_msg){
+          .msg_iov = x->initial.iov
+        , .desc = x->initial.desc
+        , .iov_count = 1
+        , .addr = 0
+        , .context = NULL
+        , .data = 0
+        }, 0);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_sendmsg");
+
+    return &x->cxn;
+}
+
+static cxn_t *
+xmtr_loop(cxn_t *c)
+{
+    xmtr_t *x = (xmtr_t *)c;
+    struct fi_rma_iov riov[12];
+    struct fi_cq_msg_entry completion;
+    const size_t txbuflen = strlen(txbuf);
+    size_t i, nriovs;
+    ssize_t ncompleted;
+    int rc;
+
+    if (!x->started)
+        return xmtr_start(x);
+
+    /* Await reply to initial message: first vector message. */
+    do {
+        ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
+    } while (ncompleted == -FI_EAGAIN);
+
+    if (ncompleted < 0)
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+
+    if (ncompleted != 1) {
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
+    }
+
+    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+    }
+
+    const ptrdiff_t least_vector_msglen =
+        (char *)&x->vector.msg.iov[0] - (char *)&x->vector.msg;
+
+    if (completion.len < least_vector_msglen) {
+        errx(EXIT_FAILURE, "%s: expected >= %zu bytes, received %zu",
+            __func__, least_vector_msglen, completion.len);
+    }
+
+    if (completion.len == least_vector_msglen) {
+        errx(EXIT_SUCCESS, "%s: peer sent 0 vectors, disconnecting...",
+            __func__);
+    }
+
+    if ((completion.len - least_vector_msglen) %
+        sizeof(x->vector.msg.iov[0]) != 0) {
+        errx(EXIT_SUCCESS,
+            "%s: %zu-byte vector message did not end on vector boundary, "
+            "disconnecting...", __func__, completion.len);
+    }
+
+    const size_t niovs_space = (completion.len - least_vector_msglen) /
+        sizeof(x->vector.msg.iov[0]);
+
+    if (niovs_space < x->vector.msg.niovs) {
+        errx(EXIT_SUCCESS, "%s: peer sent truncated vectors, disconnecting...",
+            __func__);
+    }
+
+    if (x->vector.msg.niovs > arraycount(riov)) {
+        errx(EXIT_SUCCESS, "%s: peer sent too many vectors, disconnecting...",
+            __func__);
+    }
+
+    x->payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
+    x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
+
+    size_t nremaining = txbuflen;
+
+    /* TBD only fill riov[] to the number of vectors we need.  Track the
+     * need in a new variable, `nriovs`.  Set the length of the last
+     * vector to the bytes remaining in `txbuf` after assigning bytes to
+     * the preceding vectors.
+     */
+    for (i = 0; 0 < nremaining && i < x->vector.msg.niovs; i++) {
+        printf("%s: received vector %zd "
+            "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64 "\n",
+            __func__, i, x->vector.msg.iov[i].addr, x->vector.msg.iov[i].len,
+            x->vector.msg.iov[i].key);
+        riov[i].len = minsize(nremaining, x->vector.msg.iov[i].len);
+        nremaining -= riov[i].len;
+        riov[i].addr = x->vector.msg.iov[i].addr;
+        riov[i].key = x->vector.msg.iov[i].key;
+    }
+
+    nriovs = i;
+
+    if (nremaining > 0) {
+        errx(EXIT_FAILURE, "%s: the receiver's buffer cannot fit the payload",
+            __func__);
+    }
+
+#if 1
+    struct fi_msg_rma mrma;
+    mrma.msg_iov = x->payload.iov;
+    mrma.desc = x->payload.desc;
+    mrma.iov_count = 1;
+    mrma.addr = 0;
+    mrma.rma_iov = riov;
+    mrma.rma_iov_count = nriovs;
+    mrma.context = NULL;
+    mrma.data = 0;
+
+    rc = fi_writemsg(x->ep, &mrma, 0);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_writemsg");
+
+#   if 0
+    /* Await RDMA completion. Pass flags FI_COMPLETION |
+     * FI_DELIVERY_COMPLETE to fi_writemsg, above.
+     */
+    do {
+        printf("%s: awaiting RMA completion.\n", __func__);
+        ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
+    } while (ncompleted == -FI_EAGAIN);
+
+    if (ncompleted < 0)
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+
+    if (ncompleted != 1) {
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
+    }
+#   endif
+#else
+    size_t nwritten = 0;
+    for (i = 0; i < x->vector.msg.niovs && nwritten < txbuflen; i++) {
+        const size_t split = 0;
+        if (split > 0 && minsize(riov[i].len, txbuflen - nwritten) > split) {
+            rc = fi_write(x->ep, txbuf + nwritten, split,
+                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
+            if (rc != 0)
+                bailout_for_ofi_ret(rc, "fi_write");
+            rc = fi_write(x->ep, txbuf + nwritten + split,
+                minsize(riov[i].len, txbuflen - nwritten) - split,
+                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr + split,
+                riov[i].key, NULL);
+        } else {
+            rc = fi_write(x->ep, txbuf + nwritten,
+                minsize(riov[i].len, txbuflen - nwritten),
+                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
+        }
+        if (rc != 0)
+            bailout_for_ofi_ret(rc, "fi_write");
+        nwritten += minsize(riov[i].len, txbuflen - nwritten);
+    }
+
+#endif
+
+    x->progress.msg.nfilled = txbuflen;
+    x->progress.msg.nleftover = 0;
+
+    x->progress.iov[0] = (struct iovec){.iov_base = &x->progress.msg,
+                                    .iov_len = sizeof(x->progress.msg)};
+    x->progress.desc[0] = fi_mr_desc(x->progress.mr[0]);
+
+    rc = fi_sendmsg(x->ep, &(struct fi_msg){
+          .msg_iov = x->progress.iov
+        , .desc = x->progress.desc
+        , .iov_count = 1
+        , .addr = 0
+        , .context = NULL
+        , .data = 0
+        }, FI_FENCE | FI_COMPLETION);
+
+    /* Await transmission of progress message. */
+    do {
+        printf("%s: awaiting progress message transmission.\n", __func__);
+        ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
+    } while (ncompleted == -FI_EAGAIN);
+
+    if (ncompleted < 0)
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+
+    if (ncompleted != 1) {
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
+    }
+
+    if ((completion.flags & desired_tx_flags) != desired_tx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_tx_flags, completion.flags & desired_tx_flags);
+    }
+
+    printf("sent %zu of %zu bytes progress message\n", completion.len,
+        sizeof(x->progress.msg));
+
+    return NULL;
+}
+
+static cxn_t *
+cxn_loop(cxn_t *c)
+{
+    return c->loop(c);
+}
+
 static void
 worker_run_loop(worker_t *self)
 {
@@ -389,27 +653,27 @@ worker_run_loop(worker_t *self)
             continue;
 
         // find a non-empty receiver slot
-        for (i = 0; i < arraycount(self->rcvr) / 2; i++) {
+        for (i = 0; i < arraycount(self->cxn) / 2; i++) {
             int rc;
-            rcvr_t *r, **rp;
+            cxn_t *c, **cp;
 
-            rp = &self->rcvr[half * arraycount(self->rcvr) / 2 + i];
+            cp = &self->cxn[half * arraycount(self->cxn) / 2 + i];
 
             // skip empty slots
-            if ((r = *rp) == NULL)
+            if ((c = *cp) == NULL)
                 continue;
 
-            // continue at next rcvr_t if `r` did not exit
-            if (rcvr_loop(r) != NULL)
+            // continue at next cxn_t if `c` did not exit
+            if (cxn_loop(c) != NULL)
                 continue;
 
-            *rp = NULL;
+            *cp = NULL;
 
-            if ((rc = fi_poll_del(self->pollset[half], &r->cq->fid, 0)) != 0) {
+            if ((rc = fi_poll_del(self->pollset[half], &c->cq->fid, 0)) != 0) {
                 warn_about_ofi_ret(rc, "fi_poll_del");
                 continue;
             }
-            atomic_fetch_add_explicit(&self->nrcvrs[half], -1,
+            atomic_fetch_add_explicit(&self->ncxns[half], -1,
                 memory_order_relaxed);
         }
 
@@ -423,7 +687,7 @@ worker_is_idle(worker_t *self)
     const ptrdiff_t self_idx = self - &workers[0];
     size_t half, nlocked;
 
-    if (self->nrcvrs[0] != 0 || self->nrcvrs[1] != 0)
+    if (self->ncxns[0] != 0 || self->ncxns[1] != 0)
         return false;
 
     if (self_idx + 1 !=
@@ -438,7 +702,7 @@ worker_is_idle(worker_t *self)
             break;
     }
 
-    bool idle = (nlocked == 2 && self->nrcvrs[0] == 0 && self->nrcvrs[1] == 0 &&
+    bool idle = (nlocked == 2 && self->ncxns[0] == 0 && self->ncxns[1] == 0 &&
         self_idx + 1 == nworkers_running);
 
     if (idle) {
@@ -501,8 +765,8 @@ worker_init(struct fid_domain *dom, worker_t *w)
         if ((rc = fi_poll_open(dom, &attr, &w->pollset[i])) != 0)
             bailout_for_ofi_ret(rc, "fi_poll_open");
     }
-    for (i = 0; i < arraycount(w->rcvr); i++)
-        w->rcvr[i] = NULL;
+    for (i = 0; i < arraycount(w->cxn); i++)
+        w->cxn[i] = NULL;
 }
 
 static void
@@ -531,8 +795,8 @@ worker_teardown(worker_t *w)
         if ((rc = fi_close(&w->pollset[i]->fid)) != 0)
             bailout_for_ofi_ret(rc, "fi_close");
     }
-    for (i = 0; i < arraycount(w->rcvr); i++)
-        assert(w->rcvr[i] == NULL);
+    for (i = 0; i < arraycount(w->cxn); i++)
+        assert(w->cxn[i] == NULL);
 
     if ((rc = pthread_cond_destroy(&w->sleep)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_cond_destroy: %s",
@@ -566,9 +830,9 @@ workers_initialize(void)
 }
 
 static bool
-worker_assign_rcvr(worker_t *w, rcvr_t *r, struct fid_domain *dom)
+worker_assign_cxn(worker_t *w, cxn_t *c, struct fid_domain *dom)
 {
-    rcvr_t **rp;
+    cxn_t **cp;
     size_t half, i;
     int rc;
 
@@ -579,19 +843,19 @@ worker_assign_rcvr(worker_t *w, rcvr_t *r, struct fid_domain *dom)
             continue;
 
         // find an empty receiver slot
-        for (i = 0; i < arraycount(w->rcvr) / 2; i++) {
-            rp = &w->rcvr[half * arraycount(w->rcvr) / 2 + i];
-            if (*rp != NULL)
+        for (i = 0; i < arraycount(w->cxn) / 2; i++) {
+            cp = &w->cxn[half * arraycount(w->cxn) / 2 + i];
+            if (*cp != NULL)
                 continue;
 
-            rc = fi_poll_add(w->pollset[half], &r->cq->fid, 0);
+            rc = fi_poll_add(w->pollset[half], &c->cq->fid, 0);
             if (rc != 0) {
                 warn_about_ofi_ret(rc, "fi_poll_add");
                 continue;
             }
-            atomic_fetch_add_explicit(&w->nrcvrs[half], 1,
+            atomic_fetch_add_explicit(&w->ncxns[half], 1,
                 memory_order_relaxed);
-            *rp = r;
+            *cp = c;
             (void)pthread_mutex_unlock(mtx);
             return true;
         }
@@ -600,34 +864,34 @@ worker_assign_rcvr(worker_t *w, rcvr_t *r, struct fid_domain *dom)
     return false;
 }
 
-/* Try to allocate `r` to an active worker, least active, first.
+/* Try to allocate `c` to an active worker, least active, first.
  * Caller must hold `workers_mtx`.
  */
 static worker_t *
-workers_assign_rcvr_to_running(rcvr_t *r, struct fid_domain *dom)
+workers_assign_cxn_to_running(cxn_t *c, struct fid_domain *dom)
 {
     size_t iplus1;
 
     for (iplus1 = nworkers_running; 0 < iplus1; iplus1--) {
         size_t i = iplus1 - 1;
         worker_t *w = &workers[i];
-        if (worker_assign_rcvr(w, r, dom))
+        if (worker_assign_cxn(w, c, dom))
             return w;
     }
     return NULL;
 }
 
-/* Try to assign `r` to the next idle worker servicing `dom`.
+/* Try to assign `c` to the next idle worker servicing `dom`.
  * Caller must hold `workers_mtx`.
  */
 static worker_t *
-workers_assign_rcvr_to_idle(rcvr_t *r, struct fid_domain *dom)
+workers_assign_cxn_to_idle(cxn_t *c, struct fid_domain *dom)
 {
     size_t i;
 
     if ((i = nworkers_running) < nworkers_allocated) {
         worker_t *w = &workers[i];
-        if (worker_assign_rcvr(w, r, dom))
+        if (worker_assign_cxn(w, c, dom))
             return w;
     }
     return NULL;
@@ -646,7 +910,7 @@ workers_wake(worker_t *w)
 }
 
 static worker_t *
-workers_assign_rcvr(rcvr_t *r, struct fid_domain *dom)
+workers_assign_cxn(cxn_t *c, struct fid_domain *dom)
 {
     worker_t *w;
 
@@ -658,9 +922,9 @@ workers_assign_rcvr(rcvr_t *r, struct fid_domain *dom)
             return NULL;
         }
 
-        if ((w = workers_assign_rcvr_to_running(r, dom)) != NULL)
+        if ((w = workers_assign_cxn_to_running(c, dom)) != NULL)
             ;
-        else if ((w = workers_assign_rcvr_to_idle(r, dom)) != NULL)
+        else if ((w = workers_assign_cxn_to_idle(c, dom)) != NULL)
             workers_wake(w);
         (void)pthread_mutex_unlock(&workers_mtx);
     } while (w == NULL && (w = worker_create(dom)) != NULL);
@@ -731,20 +995,6 @@ fibonacci_iov_setup(void *_buf, size_t len, struct iovec *iov, size_t niovs)
     return i;
 }
 
-#if 0
-static int
-maxsize(size_t l, size_t r)
-{
-    return (l > r) ? l : r;
-}
-#endif
-
-static int
-minsize(size_t l, size_t r)
-{
-    return (l < r) ? l : r;
-}
-
 /* Register the `niovs`-segment I/O vector `iov` using up to `niovs`
  * of the registrations, descriptors, and remote addresses in the
  * vectors `mrp`, `descp`, and `raddrp`, respectively.  Register no
@@ -797,6 +1047,31 @@ err:
     return rc;
 }
 
+static void
+cxn_init(cxn_t *c, cxn_t *(*loop)(cxn_t *))
+{
+    memset(c, 0, sizeof(*c));
+    c->loop = loop;
+}
+
+static void
+xmtr_init(xmtr_t *x)
+{
+    memset(x, 0, sizeof(*x));
+
+    cxn_init(&x->cxn, xmtr_loop);
+    x->started = false;
+}
+
+static void
+rcvr_init(rcvr_t *r)
+{
+    memset(r, 0, sizeof(*r));
+
+    cxn_init(&r->cxn, rcvr_loop);
+    r->started = false;
+}
+
 static int
 get(state_t *st)
 {
@@ -817,7 +1092,6 @@ get(state_t *st)
     , .wait_set = NULL          /* don't care */
     };
     struct fi_eq_cm_entry cm_entry;
-    struct fi_msg msg;
     get_state_t *gst = &st->u.get;
     rcvr_t *r = &gst->rcvr;
     worker_t *w;
@@ -826,9 +1100,7 @@ get(state_t *st)
     uint32_t event;
     int rc;
 
-    memset(r, 0, sizeof(*r));
-
-    r->started = false;
+    rcvr_init(r);
 
     r->initial.niovs = fibonacci_iov_setup(&r->initial.msg,
         sizeof(r->initial.msg), r->initial.iov, st->rx_maxsegs);
@@ -955,12 +1227,12 @@ get(state_t *st)
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    rc = fi_cq_open(st->domain, &cq_attr, &r->cq, NULL);
+    rc = fi_cq_open(st->domain, &cq_attr, &r->cxn.cq, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
-    rc = fi_ep_bind(r->aep, &r->cq->fid,
+    rc = fi_ep_bind(r->aep, &r->cxn.cq->fid,
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT);
 
     if (rc != 0)
@@ -971,30 +1243,26 @@ get(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
 
-    msg = (struct fi_msg){
-      .msg_iov = r->initial.iov
-    , .desc = r->initial.desc
-    , .iov_count = r->initial.niovs
-    , .addr = 0
-    , .context = NULL
-    , .data = 0
-    };
-
-    rc = fi_recvmsg(r->aep, &msg, FI_COMPLETION);
+    rc = fi_recvmsg(r->aep, &(struct fi_msg){
+          .msg_iov = r->initial.iov
+        , .desc = r->initial.desc
+        , .iov_count = r->initial.niovs
+        , .addr = 0
+        , .context = NULL
+        , .data = 0
+        }, FI_COMPLETION);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
 
-    msg = (struct fi_msg){
-      .msg_iov = r->progress.iov
-    , .desc = r->progress.desc
-    , .iov_count = r->progress.niovs
-    , .addr = 0
-    , .context = NULL
-    , .data = 0
-    };
-
-    rc = fi_recvmsg(r->aep, &msg, FI_COMPLETION);
+    rc = fi_recvmsg(r->aep, &(struct fi_msg){
+          .msg_iov = r->progress.iov
+        , .desc = r->progress.desc
+        , .iov_count = r->progress.niovs
+        , .addr = 0
+        , .context = NULL
+        , .data = 0
+        }, FI_COMPLETION);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
@@ -1020,8 +1288,8 @@ get(state_t *st)
             __func__, FI_CONNECTED, event);
     }
 
-    if ((w = workers_assign_rcvr(r, st->domain)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not assign a worker to a new receiver",
+    if ((w = workers_assign_cxn(&r->cxn, st->domain)) == NULL) {
+        errx(EXIT_FAILURE, "%s: could not assign a new receiver to a worker",
             __func__);
     }
 
@@ -1033,13 +1301,6 @@ get(state_t *st)
 static int
 put(state_t *st)
 {
-    /* completion fields:
-     *
-     * void     *op_context;
-     * uint64_t flags;
-     * size_t   len;
-     */
-    struct fi_cq_msg_entry completion;
     struct fi_cq_attr cq_attr = {
       .size = 128
     , .flags = 0
@@ -1057,18 +1318,15 @@ put(state_t *st)
     , .wait_set = NULL          /* don't care */
     };
     struct fi_eq_cm_entry cm_entry;
-    struct fi_msg msg;
     put_state_t *pst = &st->u.put;
     xmtr_t *x = &pst->xmtr;
-    struct fi_rma_iov riov[12];
+    worker_t *w;
     uint64_t next_key = 0;
-    ssize_t ncompleted;
     uint32_t event;
-    size_t i;
     int rc;
     const size_t txbuflen = strlen(txbuf);
 
-    memset(x, 0, sizeof(*x));
+    xmtr_init(x);
 
     rc = fi_mr_reg(st->domain, &x->initial.msg, sizeof(x->initial.msg),
         FI_SEND, 0, next_key++, 0, x->initial.mr, NULL);
@@ -1094,12 +1352,12 @@ put(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
-    rc = fi_endpoint(st->domain, st->info, &pst->ep, NULL);
+    rc = fi_endpoint(st->domain, st->info, &x->ep, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
-    rc = fi_cq_open(st->domain, &cq_attr, &pst->cq, NULL);
+    rc = fi_cq_open(st->domain, &cq_attr, &x->cxn.cq, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
@@ -1109,23 +1367,23 @@ put(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open");
 
-    rc = fi_ep_bind(pst->ep, &pst->connect_eq->fid, 0);
+    rc = fi_ep_bind(x->ep, &pst->connect_eq->fid, 0);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    rc = fi_ep_bind(pst->ep, &pst->cq->fid,
+    rc = fi_ep_bind(x->ep, &x->cxn.cq->fid,
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    rc = fi_enable(pst->ep);
+    rc = fi_enable(x->ep);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
 
-    rc = fi_connect(pst->ep, st->info->dest_addr, NULL, 0);
+    rc = fi_connect(x->ep, st->info->dest_addr, NULL, 0);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_connect dest_addr %p", st->info->dest_addr);
@@ -1144,225 +1402,12 @@ put(state_t *st)
             __func__, FI_CONNECTED, event);
     }
 
-    /* Post receive for first vector message. */
-    x->vector.iov[0] = (struct iovec){.iov_base = &x->vector.msg,
-                                   .iov_len = sizeof(x->vector.msg)};
-    x->vector.desc[0] = fi_mr_desc(x->vector.mr[0]);
-
-    msg = (struct fi_msg){
-      .msg_iov = x->vector.iov
-    , .desc = x->vector.desc
-    , .iov_count = 1
-    , .addr = 0
-    , .context = NULL
-    , .data = 0
-    };
-
-    rc = fi_recvmsg(pst->ep, &msg, FI_COMPLETION);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_recvmsg");
-
-    /* Setup & transmit initial message. */
-    memset(&x->initial.msg, 0, sizeof(x->initial.msg));
-    x->initial.msg.nsources = 1;
-    x->initial.msg.id = 0;
-
-    x->initial.iov[0] = (struct iovec){.iov_base = &x->initial.msg,
-                                    .iov_len = sizeof(x->initial.msg)};
-    x->initial.desc[0] = fi_mr_desc(x->initial.mr[0]);
-
-    msg = (struct fi_msg){
-      .msg_iov = x->initial.iov
-    , .desc = x->initial.desc
-    , .iov_count = 1
-    , .addr = 0
-    , .context = NULL
-    , .data = 0
-    };
-
-    rc = fi_sendmsg(pst->ep, &msg, 0);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_sendmsg");
-
-    /* Await reply to initial message: first vector message. */
-    do {
-        ncompleted = fi_cq_sread(pst->cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
-
-    if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
-
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
-    }
-
-    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
-    }
-
-    const ptrdiff_t least_vector_msglen =
-        (char *)&x->vector.msg.iov[0] - (char *)&x->vector.msg;
-
-    if (completion.len < least_vector_msglen) {
-        errx(EXIT_FAILURE, "%s: expected >= %zu bytes, received %zu",
-            __func__, least_vector_msglen, completion.len);
-    }
-
-    if (completion.len == least_vector_msglen) {
-        errx(EXIT_SUCCESS, "%s: peer sent 0 vectors, disconnecting...",
+    if ((w = workers_assign_cxn(&x->cxn, st->domain)) == NULL) {
+        errx(EXIT_FAILURE, "%s: could not assign a new transmitter to a worker",
             __func__);
     }
 
-    if ((completion.len - least_vector_msglen) %
-        sizeof(x->vector.msg.iov[0]) != 0) {
-        errx(EXIT_SUCCESS,
-            "%s: %zu-byte vector message did not end on vector boundary, "
-            "disconnecting...", __func__, completion.len);
-    }
-
-    const size_t niovs_space = (completion.len - least_vector_msglen) /
-        sizeof(x->vector.msg.iov[0]);
-
-    if (niovs_space < x->vector.msg.niovs) {
-        errx(EXIT_SUCCESS, "%s: peer sent truncated vectors, disconnecting...",
-            __func__);
-    }
-
-    if (x->vector.msg.niovs > arraycount(riov)) {
-        errx(EXIT_SUCCESS, "%s: peer sent too many vectors, disconnecting...",
-            __func__);
-    }
-
-    x->payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
-    x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
-
-    size_t nremaining = txbuflen;
-
-    /* TBD only fill riov[] to the number of vectors we need.  Track the
-     * need in a new variable, `nriovs`.  Set the length of the last
-     * vector to the bytes remaining in `txbuf` after assigning bytes to
-     * the preceding vectors.
-     */
-    for (i = 0; 0 < nremaining && i < x->vector.msg.niovs; i++) {
-        printf("%s: received vector %zd "
-            "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64 "\n",
-            __func__, i, x->vector.msg.iov[i].addr, x->vector.msg.iov[i].len,
-            x->vector.msg.iov[i].key);
-        riov[i].len = minsize(nremaining, x->vector.msg.iov[i].len);
-        nremaining -= riov[i].len;
-        riov[i].addr = x->vector.msg.iov[i].addr;
-        riov[i].key = x->vector.msg.iov[i].key;
-    }
-
-    if (nremaining > 0) {
-        errx(EXIT_FAILURE, "%s: the receiver's buffer cannot fit the payload",
-            __func__);
-    }
-
-#if 1
-    struct fi_msg_rma mrma;
-    mrma.msg_iov = x->payload.iov;
-    mrma.desc = x->payload.desc;
-    mrma.iov_count = 1;
-    mrma.addr = 0;
-    mrma.rma_iov = riov;
-    mrma.rma_iov_count = x->vector.msg.niovs;
-    mrma.context = NULL;
-    mrma.data = 0;
-
-    rc = fi_writemsg(pst->ep, &mrma, 0);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_writemsg");
-
-#   if 0
-    /* Await RDMA completion. Pass flags FI_COMPLETION |
-     * FI_DELIVERY_COMPLETE to fi_writemsg, above.
-     */
-    do {
-        printf("%s: awaiting RMA completion.\n", __func__);
-        ncompleted = fi_cq_sread(pst->cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
-
-    if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
-
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
-    }
-#   endif
-#else
-    size_t nwritten = 0;
-    for (i = 0; i < x->vector.msg.niovs && nwritten < txbuflen; i++) {
-        const size_t split = 0;
-        if (split > 0 && minsize(riov[i].len, txbuflen - nwritten) > split) {
-            rc = fi_write(pst->ep, txbuf + nwritten,
-                split,
-                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
-            if (rc != 0)
-                bailout_for_ofi_ret(rc, "fi_write");
-            rc = fi_write(pst->ep, txbuf + nwritten + split,
-                minsize(riov[i].len, txbuflen - nwritten) - split,
-                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr + split,
-                riov[i].key, NULL);
-        } else {
-            rc = fi_write(pst->ep, txbuf + nwritten,
-                minsize(riov[i].len, txbuflen - nwritten),
-                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
-        }
-        if (rc != 0)
-            bailout_for_ofi_ret(rc, "fi_write");
-        nwritten += minsize(riov[i].len, txbuflen - nwritten);
-    }
-
-#endif
-
-    x->progress.msg.nfilled = txbuflen;
-    x->progress.msg.nleftover = 0;
-
-    x->progress.iov[0] = (struct iovec){.iov_base = &x->progress.msg,
-                                    .iov_len = sizeof(x->progress.msg)};
-    x->progress.desc[0] = fi_mr_desc(x->progress.mr[0]);
-
-    msg = (struct fi_msg){
-      .msg_iov = x->progress.iov
-    , .desc = x->progress.desc
-    , .iov_count = 1
-    , .addr = 0
-    , .context = NULL
-    , .data = 0
-    };
-
-    rc = fi_sendmsg(pst->ep, &msg, FI_FENCE | FI_COMPLETION);
-
-    /* Await transmission of progress message. */
-    do {
-        printf("%s: awaiting progress message transmission.\n", __func__);
-        ncompleted = fi_cq_sread(pst->cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
-
-    if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
-
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
-    }
-
-    if ((completion.flags & desired_tx_flags) != desired_tx_flags) {
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_tx_flags, completion.flags & desired_tx_flags);
-    }
-
-    printf("sent %zu of %zu bytes progress message\n", completion.len,
-        sizeof(x->progress.msg));
+    workers_join_all();
 
     return EXIT_SUCCESS;
 }
