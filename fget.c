@@ -44,6 +44,46 @@ typedef struct progress_msg {
     uint64_t nleftover;
 } progress_msg_t;
 
+/* Communication buffers */
+
+struct buf;
+typedef struct buf buf_t;
+
+struct buf {
+    size_t nfull;
+    size_t nallocated;
+    struct fid_mr mr;
+    void *desc;
+    char content[];
+};
+
+typedef struct fifo {
+    uint64_t insertions;
+    uint64_t removals;
+    size_t index_mask;  // for some integer n > 0, 2^n - 1 == index_mask
+    buf_t *buf[];
+} fifo_t;
+
+typedef struct buflist {
+    size_t nfull;
+    size_t nallocated;
+    buf_t *buf[];
+} buflist_t;
+
+/* Communication terminals: sources and sinks */
+
+typedef struct {
+    int (*trade)(buflist_t *ready, buflist_t *completed);
+} terminal_t;
+
+typedef struct {
+    terminal_t term;
+} sink_t;
+
+typedef struct {
+    terminal_t term;
+} source_t;
+
 /*
  * Communications state definitions
  */
@@ -51,8 +91,14 @@ typedef struct progress_msg {
 struct cxn;
 typedef struct cxn cxn_t;
 
+struct session;
+typedef struct session session_t;
+
+struct worker;
+typedef struct worker worker_t;
+
 struct cxn {
-    cxn_t *(*loop)(cxn_t *);
+    session_t *(*loop)(worker_t *, session_t *);
     struct fid_cq *cq;
 };
 
@@ -100,27 +146,18 @@ typedef struct {
     bool started;
     struct fid_ep *ep;
     struct {
-        struct iovec iov[12];
-        void *desc[12];
-        struct fid_mr *mr[12];
-        uint64_t raddr[12];
-        ssize_t niovs;
+        void *desc;
+        struct fid_mr *mr;
         initial_msg_t msg;
     } initial;
     struct {
-        struct iovec iov[12];
-        void *desc[12];
-        struct fid_mr *mr[12];
-        uint64_t raddr[12];
-        ssize_t niovs;
+        void *desc;
+        struct fid_mr *mr;
         vector_msg_t msg;
     } vector;
     struct {
-        struct iovec iov[12];
-        void *desc[12];
-        struct fid_mr *mr[12];
-        uint64_t raddr[12];
-        ssize_t niovs;
+        void *desc;
+        struct fid_mr *mr;
         progress_msg_t msg;
     } progress;
     struct {
@@ -148,24 +185,33 @@ typedef struct {
     uint32_t ctxs_serviced_since_mark;
 } loadavg_t;
 
-#define WORKER_CXNS_MAX 64
+#define WORKER_SESSIONS_MAX 64
 #define WORKERS_MAX 128
-#define CXNS_MAX (WORKER_CXNS_MAX * WORKERS_MAX)
+#define SESSIONS_MAX (WORKER_SESSIONS_MAX * WORKERS_MAX)
 
-typedef struct worker {
+struct session {
+    terminal_t *terminal;
+    cxn_t *cxn;
+    fifo_t *ready_for_cxn;
+    fifo_t *ready_for_terminal;
+};
+
+struct worker {
     pthread_t thd;
     loadavg_t avg;
-    cxn_t *cxn[WORKER_CXNS_MAX];
-    volatile _Atomic size_t ncxns[2];  // number of receivers in each half
-                                        // of cxn[]
+    terminal_t *term[WORKER_SESSIONS_MAX];
+    session_t session[WORKER_SESSIONS_MAX];
+    volatile _Atomic size_t nsessions[2];   // number of sessions in each half
+                                            // of session[]
     struct fid_poll *pollset[2];
     pthread_mutex_t mtx[2]; /* mtx[0] protects pollset[0] and the first half
-                             * of cxn[]; mtx[1], pollset[1] and the second
+                             * of session[]; mtx[1], pollset[1] and the second
                              * half
                              */
     pthread_cond_t sleep;   /* Used in conjunction with workers_mtx. */
     volatile atomic_bool cancelled;
-} worker_t;
+    buflist_t *freebufs;    /* Free buffer reservoir. */
+};
 
 typedef struct {
     struct fid_eq *listen_eq;
@@ -264,9 +310,75 @@ minsize(size_t l, size_t r)
     return (l < r) ? l : r;
 }
 
-static cxn_t *
-rcvr_start(rcvr_t *r)
+#if 0
+static inline bool
+size_is_power_of_2(size_t size)
 {
+    return ((size - 1) & size) == 0;
+}
+
+static fifo_t *
+fifo_create(size_t size)
+{
+    if (!size_is_power_of_2(size))
+        return NULL;
+
+    fifo_t *f = malloc(offsetof(fifo_t, buf[0]) + sizeof(f->buf[0]) * size);
+
+    if (f == NULL)
+        return NULL;
+
+    f->insertions = f->removals = 0;
+    f->index_mask = size - 1;
+
+    return f;
+}
+
+static inline buf_t *
+fifo_get(fifo_t *f)
+{
+    assert(f->insertions >= f->removals);
+
+    if (f->insertions == f->removals)
+        return NULL;
+
+    buf_t *b = f->buf[f->removals & (uint64_t)f->index_mask];
+    f->removals++;
+
+    return b;
+}
+
+static inline bool
+fifo_empty(fifo_t *f)
+{
+    return f->insertions == f->removals;
+}
+
+static inline bool
+fifo_full(fifo_t *f)
+{
+    return f->insertions - f->removals == f->index_mask + 1;
+}
+
+static inline bool
+fifo_put(fifo_t *f, buf_t *b)
+{
+    assert(f->insertions - f->removals <= f->index_mask + 1);
+
+    if (f->insertions - f->removals > f->index_mask)
+        return false;
+
+    f->buf[f->insertions & (uint64_t)f->index_mask] = b;
+    f->insertions++;
+
+    return true;
+}
+#endif
+
+static session_t *
+rcvr_start(worker_t *w, session_t *s)
+{
+    rcvr_t *r = (rcvr_t *)s->cxn;
     struct fi_cq_msg_entry completion;
     ssize_t ncompleted;
 
@@ -303,19 +415,19 @@ rcvr_start(rcvr_t *r)
             r->initial.msg.nsources, r->initial.msg.id);
     }
 
-    return &r->cxn;
+    return s;
 }
 
-static cxn_t *
-rcvr_loop(cxn_t *c)
+static session_t *
+rcvr_loop(worker_t *w, session_t *s)
 {
-    rcvr_t *r = (rcvr_t *)c;
+    rcvr_t *r = (rcvr_t *)s->cxn;
     struct fi_cq_msg_entry completion;
     ssize_t ncompleted;
     int rc;
 
     if (!r->started)
-        return rcvr_start(r);
+        return rcvr_start(w, s);
 
     /* Transmit vector. */
 
@@ -393,21 +505,21 @@ rcvr_loop(cxn_t *c)
     return NULL;
 }
 
-static cxn_t *
-xmtr_start(xmtr_t *x)
+static session_t *
+xmtr_start(session_t *s)
 {
+    xmtr_t *x = (xmtr_t *)s->cxn;
     int rc;
 
     x->started = true;
 
     /* Post receive for first vector message. */
-    x->vector.iov[0] = (struct iovec){.iov_base = &x->vector.msg,
-                                   .iov_len = sizeof(x->vector.msg)};
-    x->vector.desc[0] = fi_mr_desc(x->vector.mr[0]);
+    x->vector.desc = fi_mr_desc(x->vector.mr);
 
     rc = fi_recvmsg(x->ep, &(struct fi_msg){
-          .msg_iov = x->vector.iov
-        , .desc = x->vector.desc
+          .msg_iov = &(struct iovec){.iov_base = &x->vector.msg,
+                                     .iov_len = sizeof(x->vector.msg)}
+        , .desc = &x->vector.desc
         , .iov_count = 1
         , .addr = 0
         , .context = NULL
@@ -422,13 +534,12 @@ xmtr_start(xmtr_t *x)
     x->initial.msg.nsources = 1;
     x->initial.msg.id = 0;
 
-    x->initial.iov[0] = (struct iovec){.iov_base = &x->initial.msg,
-                                    .iov_len = sizeof(x->initial.msg)};
-    x->initial.desc[0] = fi_mr_desc(x->initial.mr[0]);
+    x->initial.desc = fi_mr_desc(x->initial.mr);
 
     rc = fi_sendmsg(x->ep, &(struct fi_msg){
-          .msg_iov = x->initial.iov
-        , .desc = x->initial.desc
+          .msg_iov = &(struct iovec){.iov_base = &x->initial.msg,
+                                     .iov_len = sizeof(x->initial.msg)}
+        , .desc = &x->initial.desc
         , .iov_count = 1
         , .addr = 0
         , .context = NULL
@@ -438,13 +549,13 @@ xmtr_start(xmtr_t *x)
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_sendmsg");
 
-    return &x->cxn;
+    return s;
 }
 
-static cxn_t *
-xmtr_loop(cxn_t *c)
+static session_t *
+xmtr_loop(worker_t *w, session_t *s)
 {
-    xmtr_t *x = (xmtr_t *)c;
+    xmtr_t *x = (xmtr_t *)s->cxn;
     struct fi_rma_iov riov[12];
     struct fi_cq_msg_entry completion;
     const size_t txbuflen = strlen(txbuf);
@@ -453,7 +564,7 @@ xmtr_loop(cxn_t *c)
     int rc;
 
     if (!x->started)
-        return xmtr_start(x);
+        return xmtr_start(s);
 
     /* Await reply to initial message: first vector message. */
     do {
@@ -596,13 +707,12 @@ xmtr_loop(cxn_t *c)
     x->progress.msg.nfilled = txbuflen;
     x->progress.msg.nleftover = 0;
 
-    x->progress.iov[0] = (struct iovec){.iov_base = &x->progress.msg,
-                                    .iov_len = sizeof(x->progress.msg)};
-    x->progress.desc[0] = fi_mr_desc(x->progress.mr[0]);
+    x->progress.desc = fi_mr_desc(x->progress.mr);
 
     rc = fi_sendmsg(x->ep, &(struct fi_msg){
-          .msg_iov = x->progress.iov
-        , .desc = x->progress.desc
+          .msg_iov = &(struct iovec){.iov_base = &x->progress.msg,
+                                     .iov_len = sizeof(x->progress.msg)}
+        , .desc = &x->progress.desc
         , .iov_count = 1
         , .addr = 0
         , .context = NULL
@@ -635,10 +745,10 @@ xmtr_loop(cxn_t *c)
     return NULL;
 }
 
-static cxn_t *
-cxn_loop(cxn_t *c)
+static session_t *
+cxn_loop(worker_t *w, session_t *s)
 {
-    return c->loop(c);
+    return s->cxn->loop(w, s);
 }
 
 static void
@@ -653,18 +763,20 @@ worker_run_loop(worker_t *self)
             continue;
 
         // find a non-empty receiver slot
-        for (i = 0; i < arraycount(self->cxn) / 2; i++) {
+        for (i = 0; i < arraycount(self->session) / 2; i++) {
             int rc;
+            session_t *s;
             cxn_t *c, **cp;
 
-            cp = &self->cxn[half * arraycount(self->cxn) / 2 + i];
+            s = &self->session[half * arraycount(self->session) / 2 + i];
+            cp = &s->cxn;
 
             // skip empty slots
             if ((c = *cp) == NULL)
                 continue;
 
             // continue at next cxn_t if `c` did not exit
-            if (cxn_loop(c) != NULL)
+            if (cxn_loop(self, s) != NULL)
                 continue;
 
             *cp = NULL;
@@ -673,7 +785,7 @@ worker_run_loop(worker_t *self)
                 warn_about_ofi_ret(rc, "fi_poll_del");
                 continue;
             }
-            atomic_fetch_add_explicit(&self->ncxns[half], -1,
+            atomic_fetch_add_explicit(&self->nsessions[half], -1,
                 memory_order_relaxed);
         }
 
@@ -687,7 +799,7 @@ worker_is_idle(worker_t *self)
     const ptrdiff_t self_idx = self - &workers[0];
     size_t half, nlocked;
 
-    if (self->ncxns[0] != 0 || self->ncxns[1] != 0)
+    if (self->nsessions[0] != 0 || self->nsessions[1] != 0)
         return false;
 
     if (self_idx + 1 !=
@@ -702,8 +814,9 @@ worker_is_idle(worker_t *self)
             break;
     }
 
-    bool idle = (nlocked == 2 && self->ncxns[0] == 0 && self->ncxns[1] == 0 &&
-        self_idx + 1 == nworkers_running);
+    bool idle = (nlocked == 2 &&
+                 self->nsessions[0] == 0 && self->nsessions[1] == 0 &&
+                 self_idx + 1 == nworkers_running);
 
     if (idle) {
         nworkers_running--;
@@ -748,7 +861,7 @@ worker_init(struct fid_domain *dom, worker_t *w)
 {
     struct fi_poll_attr attr = {.flags = 0};
     int rc;
-    size_t i;
+    size_t i, buflen;
 
     w->cancelled = false;
 
@@ -765,8 +878,42 @@ worker_init(struct fid_domain *dom, worker_t *w)
         if ((rc = fi_poll_open(dom, &attr, &w->pollset[i])) != 0)
             bailout_for_ofi_ret(rc, "fi_poll_open");
     }
-    for (i = 0; i < arraycount(w->cxn); i++)
-        w->cxn[i] = NULL;
+    for (i = 0; i < arraycount(w->session); i++)
+        w->session[i] = (session_t){.cxn = NULL, .terminal = NULL};
+
+    buflist_t *bl = malloc(offsetof(buflist_t, buf[256]));
+    if (bl == NULL)
+        err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
+
+    bl->nallocated = 256;
+    bl->nfull = bl->nallocated / 2;
+    for (buflen = 0, i = 0; i < bl->nfull; i++) {
+        buf_t *buf;
+
+        // buflen cycle: 7 -> 256 -> 4096 -> 7 -> ....
+        switch (buflen) {
+        case 0:
+        default:
+            buflen = 7;
+            break;
+        case 7:
+            buflen = 256;
+            break;
+        case 256:
+            buflen = 4096;
+            break;
+        case 4096:
+            buflen = 7;
+            break;
+        }
+        buf = malloc(offsetof(buf_t, content[0]) + buflen);
+        if (buf == NULL)
+            err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
+        buf->nallocated = buflen;
+        buf->nfull = 0;
+        bl->buf[i] = buf;
+    }
+    w->freebufs = bl;
 }
 
 static void
@@ -795,13 +942,14 @@ worker_teardown(worker_t *w)
         if ((rc = fi_close(&w->pollset[i]->fid)) != 0)
             bailout_for_ofi_ret(rc, "fi_close");
     }
-    for (i = 0; i < arraycount(w->cxn); i++)
-        assert(w->cxn[i] == NULL);
+    for (i = 0; i < arraycount(w->session); i++)
+        assert(w->session[i].cxn == NULL && w->session[i].terminal == NULL);
 
     if ((rc = pthread_cond_destroy(&w->sleep)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_cond_destroy: %s",
             __func__, __LINE__, strerror(rc));
     }
+    // TBD release buffers and free-buffer reservior.
 }
 #endif
 
@@ -843,8 +991,8 @@ worker_assign_cxn(worker_t *w, cxn_t *c, struct fid_domain *dom)
             continue;
 
         // find an empty receiver slot
-        for (i = 0; i < arraycount(w->cxn) / 2; i++) {
-            cp = &w->cxn[half * arraycount(w->cxn) / 2 + i];
+        for (i = 0; i < arraycount(w->session) / 2; i++) {
+            cp = &w->session[half * arraycount(w->session) / 2 + i].cxn;
             if (*cp != NULL)
                 continue;
 
@@ -853,7 +1001,7 @@ worker_assign_cxn(worker_t *w, cxn_t *c, struct fid_domain *dom)
                 warn_about_ofi_ret(rc, "fi_poll_add");
                 continue;
             }
-            atomic_fetch_add_explicit(&w->ncxns[half], 1,
+            atomic_fetch_add_explicit(&w->nsessions[half], 1,
                 memory_order_relaxed);
             *cp = c;
             (void)pthread_mutex_unlock(mtx);
@@ -1048,7 +1196,7 @@ err:
 }
 
 static void
-cxn_init(cxn_t *c, cxn_t *(*loop)(cxn_t *))
+cxn_init(cxn_t *c, session_t *(*loop)(worker_t *, session_t *))
 {
     memset(c, 0, sizeof(*c));
     c->loop = loop;
@@ -1329,19 +1477,19 @@ put(state_t *st)
     xmtr_init(x);
 
     rc = fi_mr_reg(st->domain, &x->initial.msg, sizeof(x->initial.msg),
-        FI_SEND, 0, next_key++, 0, x->initial.mr, NULL);
+        FI_SEND, 0, next_key++, 0, &x->initial.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_mr_reg(st->domain, &x->vector.msg, sizeof(x->vector.msg),
-        FI_RECV, 0, next_key++, 0, x->vector.mr, NULL);
+        FI_RECV, 0, next_key++, 0, &x->vector.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_mr_reg(st->domain, &x->progress.msg, sizeof(x->progress.msg),
-        FI_SEND, 0, next_key++, 0, x->progress.mr, NULL);
+        FI_SEND, 0, next_key++, 0, &x->progress.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
