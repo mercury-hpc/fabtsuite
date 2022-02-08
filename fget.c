@@ -52,7 +52,7 @@ typedef struct buf buf_t;
 struct buf {
     size_t nfull;
     size_t nallocated;
-    struct fid_mr mr;
+    struct fid_mr *mr;
     void *desc;
     char content[];
 };
@@ -198,6 +198,7 @@ struct session {
 
 struct worker {
     pthread_t thd;
+    struct fid_domain *dom;
     loadavg_t avg;
     terminal_t *term[WORKER_SESSIONS_MAX];
     session_t session[WORKER_SESSIONS_MAX];
@@ -210,7 +211,11 @@ struct worker {
                              */
     pthread_cond_t sleep;   /* Used in conjunction with workers_mtx. */
     volatile atomic_bool cancelled;
-    buflist_t *freebufs;    /* Free buffer reservoir. */
+    struct {    /* Free buffer reservoirs. */
+        buflist_t *tx;
+        buflist_t *rx;
+    } freebufs;
+    uint64_t next_key;
 };
 
 typedef struct {
@@ -252,6 +257,8 @@ static bool workers_assignment_suspended = false;
 
 static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
 static const uint64_t desired_tx_flags = FI_SEND | FI_MSG;
+
+static uint64_t _Atomic next_key_pool = 256;
 
 static char txbuf[] =
     "If this message was received in error then please "
@@ -856,38 +863,29 @@ worker_outer_loop(void *arg)
     return NULL;
 }
 
-static void
-worker_init(struct fid_domain *dom, worker_t *w)
+static uint64_t
+worker_next_key(worker_t *w)
 {
-    struct fi_poll_attr attr = {.flags = 0};
-    int rc;
+    if (w->next_key % 256 == 0) {
+            w->next_key = atomic_fetch_add_explicit(&next_key_pool, 256,
+                memory_order_relaxed);
+    }
+
+    return w->next_key++;
+}
+
+static bool
+worker_buflist_replenish(worker_t *w, buflist_t *bl)
+{
     size_t i, buflen;
+    int rc;
 
-    w->cancelled = false;
+    if (bl->nfull >= bl->nallocated / 2)
+        return true;
 
-    if ((rc = pthread_cond_init(&w->sleep, NULL)) != 0) {
-        errx(EXIT_FAILURE, "%s.%d: pthread_cond_init: %s", __func__, __LINE__,
-            strerror(rc));
-    }
+    size_t ntofill = bl->nallocated / 2 - bl->nfull;
 
-    for (i = 0; i < arraycount(w->mtx); i++) {
-        if ((rc = pthread_mutex_init(&w->mtx[i], NULL)) != 0) {
-            errx(EXIT_FAILURE, "%s.%d: pthread_mutex_init: %s",
-                __func__, __LINE__, strerror(rc));
-        }
-        if ((rc = fi_poll_open(dom, &attr, &w->pollset[i])) != 0)
-            bailout_for_ofi_ret(rc, "fi_poll_open");
-    }
-    for (i = 0; i < arraycount(w->session); i++)
-        w->session[i] = (session_t){.cxn = NULL, .terminal = NULL};
-
-    buflist_t *bl = malloc(offsetof(buflist_t, buf[256]));
-    if (bl == NULL)
-        err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
-
-    bl->nallocated = 256;
-    bl->nfull = bl->nallocated / 2;
-    for (buflen = 0, i = 0; i < bl->nfull; i++) {
+    for (buflen = 0, i = bl->nfull; i < ntofill; i++) {
         buf_t *buf;
 
         // buflen cycle: 7 -> 256 -> 4096 -> 7 -> ....
@@ -911,9 +909,122 @@ worker_init(struct fid_domain *dom, worker_t *w)
             err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
         buf->nallocated = buflen;
         buf->nfull = 0;
+
+        rc = fi_mr_reg(w->dom, buf->content, buflen,
+            FI_SEND, 0, worker_next_key(w), 0, &buf->mr, NULL);
+
+        if (rc != 0) {
+            warn_about_ofi_ret(rc, "fi_mr_reg");
+            free(buf);
+            break;
+        }
+
+        buf->desc = fi_mr_desc(buf->mr);
         bl->buf[i] = buf;
     }
-    w->freebufs = bl;
+    bl->nfull = i;
+
+    return bl->nfull > 0;
+}
+
+static void
+worker_buflist_destroy(struct fid_domain *dom, buflist_t *bl)
+{
+    size_t i;
+    int rc;
+
+    for (i = 0; i < bl->nfull; i++) {
+        buf_t *b = bl->buf[i];
+
+        if ((rc = fi_close(&b->mr->fid)) != 0)
+            warn_about_ofi_ret(rc, "fi_mr_reg");
+
+        free(b);
+    }
+    bl->nfull = bl->nallocated = 0;
+    free(bl);
+}
+
+static buflist_t *
+worker_buflist_create(worker_t *w)
+{
+    buflist_t *bl = malloc(offsetof(buflist_t, buf[256]));
+
+    if (bl == NULL)
+        err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
+
+    bl->nallocated = 256;
+    bl->nfull = 0;
+
+    if (!worker_buflist_replenish(w, bl)) {
+        worker_buflist_destroy(w->dom, bl);
+        return NULL;
+    }
+
+    return bl;
+}
+
+#if 0
+static buf_t *
+buflist_get(buflist_t *bl)
+{
+    if (bl->nfull == 0)
+        return NULL;
+
+    return bl->buf[--bl->nfull];
+}
+
+static bool
+buflist_put(buflist_t *bl, buf_t *b)
+{
+    if (bl->nfull == bl->nallocated)
+        return false;
+
+    bl->buf[bl->nfull++] = b;
+    return true;
+}
+
+static buf_t *
+worker_rxbuf_get(worker_t *w)
+{
+    buf_t *b;
+
+    while ((b = buflist_get(w->freebufs.rx)) == NULL &&
+           worker_buflist_replenish(w, w->freebufs.rx))
+        ;   // do nothing
+
+    return b;
+}
+#endif
+
+static void
+worker_init(worker_t *w, struct fid_domain *dom)
+{
+    struct fi_poll_attr attr = {.flags = 0};
+    int rc;
+    size_t i;
+
+    w->cancelled = false;
+    w->dom = dom;
+
+    if ((rc = pthread_cond_init(&w->sleep, NULL)) != 0) {
+        errx(EXIT_FAILURE, "%s.%d: pthread_cond_init: %s", __func__, __LINE__,
+            strerror(rc));
+    }
+
+    for (i = 0; i < arraycount(w->mtx); i++) {
+        if ((rc = pthread_mutex_init(&w->mtx[i], NULL)) != 0) {
+            errx(EXIT_FAILURE, "%s.%d: pthread_mutex_init: %s",
+                __func__, __LINE__, strerror(rc));
+        }
+        if ((rc = fi_poll_open(dom, &attr, &w->pollset[i])) != 0)
+            bailout_for_ofi_ret(rc, "fi_poll_open");
+    }
+    for (i = 0; i < arraycount(w->session); i++)
+        w->session[i] = (session_t){.cxn = NULL, .terminal = NULL};
+
+    w->freebufs.rx = worker_buflist_create(w);
+    w->freebufs.tx = worker_buflist_create(w);
 }
 
 static void
@@ -963,7 +1074,7 @@ worker_create(struct fid_domain *dom)
         ? &workers[nworkers_allocated++]
         : NULL;
     if (w != NULL)
-        worker_init(dom, w);
+        worker_init(w, dom);
     (void)pthread_mutex_unlock(&workers_mtx);
 
     if (w != NULL)
