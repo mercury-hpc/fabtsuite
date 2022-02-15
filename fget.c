@@ -65,6 +65,7 @@ typedef struct fifo {
 } fifo_t;
 
 typedef struct buflist {
+    uint64_t access;
     size_t nfull;
     size_t nallocated;
     buf_t *buf[];
@@ -72,16 +73,22 @@ typedef struct buflist {
 
 /* Communication terminals: sources and sinks */
 
-typedef struct {
-    int (*trade)(buflist_t *ready, buflist_t *completed);
-} terminal_t;
+struct terminal;
+typedef struct terminal terminal_t;
+
+struct terminal {
+    /* trade(t, ready, completed) */
+    int (*trade)(terminal_t *, fifo_t *, fifo_t *);
+};
 
 typedef struct {
-    terminal_t term;
+    terminal_t terminal;
+    size_t idx;
+    size_t txbuflen;
 } sink_t;
 
 typedef struct {
-    terminal_t term;
+    terminal_t terminal;
 } source_t;
 
 /*
@@ -106,7 +113,8 @@ typedef struct {
     cxn_t cxn;
     bool started;
     struct fid_ep *aep;
-    struct fid_eq *active_eq;
+    struct fid_eq *eq;
+    fifo_t *rxfifo;
     struct {
         struct iovec iov[12];
         void *desc[12];
@@ -145,6 +153,7 @@ typedef struct {
     cxn_t cxn;
     bool started;
     struct fid_ep *ep;
+    struct fid_eq *eq;
     struct {
         void *desc;
         struct fid_mr *mr;
@@ -163,6 +172,8 @@ typedef struct {
     struct {
         struct iovec iov[12];
         void *desc[12];
+        struct iovec iov2[12];
+        void *desc2[12];
         struct fid_mr *mr[12];
         uint64_t raddr[12];
         ssize_t niovs;
@@ -211,22 +222,26 @@ struct worker {
                              */
     pthread_cond_t sleep;   /* Used in conjunction with workers_mtx. */
     volatile atomic_bool cancelled;
-    struct {    /* Free buffer reservoirs. */
+    struct {
         buflist_t *tx;
         buflist_t *rx;
-    } freebufs;
+    } freebufs;    /* Reservoirs for free buffers. */
     uint64_t next_key;
+    size_t mr_maxsegs;
+    size_t rma_maxsegs;
+    size_t rx_maxsegs;
 };
 
 typedef struct {
     struct fid_eq *listen_eq;
     struct fid_pep *pep;
+    sink_t sink;
     rcvr_t rcvr;
 } get_state_t;
 
 typedef struct {
-    struct fid_eq *connect_eq;
     xmtr_t xmtr;
+    source_t source;
 } put_state_t;
 
 typedef struct {
@@ -257,8 +272,10 @@ static bool workers_assignment_suspended = false;
 
 static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
 static const uint64_t desired_tx_flags = FI_SEND | FI_MSG;
+static const uint64_t desired_wr_flags =
+    FI_RMA | FI_WRITE | FI_COMPLETION | FI_DELIVERY_COMPLETE;
 
-static uint64_t _Atomic next_key_pool = 256;
+static uint64_t _Atomic next_key_pool = 512;
 
 static char txbuf[] =
     "If this message was received in error then please "
@@ -317,7 +334,6 @@ minsize(size_t l, size_t r)
     return (l < r) ? l : r;
 }
 
-#if 0
 static inline bool
 size_is_power_of_2(size_t size)
 {
@@ -341,6 +357,12 @@ fifo_create(size_t size)
     return f;
 }
 
+static void
+fifo_destroy(fifo_t *f)
+{
+    free(f);
+}
+
 static inline buf_t *
 fifo_get(fifo_t *f)
 {
@@ -353,6 +375,17 @@ fifo_get(fifo_t *f)
     f->removals++;
 
     return b;
+}
+
+static inline buf_t *
+fifo_peek(fifo_t *f)
+{
+    assert(f->insertions >= f->removals);
+
+    if (f->insertions == f->removals)
+        return NULL;
+
+    return f->buf[f->removals & (uint64_t)f->index_mask];
 }
 
 static inline bool
@@ -380,16 +413,276 @@ fifo_put(fifo_t *f, buf_t *b)
 
     return true;
 }
+
+static buf_t *
+buflist_get(buflist_t *bl)
+{
+    if (bl->nfull == 0)
+        return NULL;
+
+    return bl->buf[--bl->nfull];
+}
+
+#if 0
+static bool
+buflist_put(buflist_t *bl, buf_t *b)
+{
+    if (bl->nfull == bl->nallocated)
+        return false;
+
+    bl->buf[bl->nfull++] = b;
+    return true;
+}
 #endif
+
+static bool
+session_init(session_t *s, cxn_t *c, terminal_t *t)
+{
+    memset(s, 0, sizeof(*s));
+
+    s->cxn = c;
+    s->terminal = t;
+
+    if ((s->ready_for_cxn = fifo_create(64)) == NULL)
+        return NULL;
+
+    if ((s->ready_for_terminal = fifo_create(64)) == NULL) {
+        fifo_destroy(s->ready_for_cxn);
+        return NULL;
+    }
+
+    return s;
+}
+
+static uint64_t
+worker_next_key(worker_t *w)
+{
+    if (w->next_key % 256 == 0) {
+            w->next_key = atomic_fetch_add_explicit(&next_key_pool, 256,
+                memory_order_relaxed);
+    }
+
+    return w->next_key++;
+}
+
+static bool
+worker_buflist_replenish(worker_t *w, buflist_t *bl)
+{
+    size_t i, buflen;
+    int rc;
+
+    if (bl->nfull >= bl->nallocated / 2)
+        return true;
+
+    size_t ntofill = bl->nallocated / 2 - bl->nfull;
+
+    for (buflen = 0, i = bl->nfull; i < ntofill; i++) {
+        buf_t *buf;
+
+        // buflen cycle: 7 -> 11 -> 13 -> 17 -> 19 -> 23 -> 29 -> 31 -> 7
+        switch (buflen) {
+        case 0:
+        default:
+            buflen = 7;
+            break;
+        case 7:
+            buflen = 11;
+            break;
+        case 11:
+            buflen = 13;
+            break;
+        case 13:
+            buflen = 17;
+            break;
+        case 17:
+            buflen = 19;
+            break;
+        case 23:
+            buflen = 29;
+            break;
+        case 29:
+            buflen = 31;
+            break;
+        case 31:
+            buflen = 7;
+            break;
+        }
+        buf = malloc(offsetof(buf_t, content[0]) + buflen);
+        if (buf == NULL)
+            err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
+        warnx("%s: pushing %zu-byte buffer", __func__, buflen);
+        buf->nallocated = buflen;
+        buf->nfull = 0;
+
+        rc = fi_mr_reg(w->dom, buf->content, buflen,
+            bl->access, 0, worker_next_key(w), 0, &buf->mr, NULL);
+
+        if (rc != 0) {
+            warn_about_ofi_ret(rc, "fi_mr_reg");
+            free(buf);
+            break;
+        }
+
+        buf->desc = fi_mr_desc(buf->mr);
+        bl->buf[i] = buf;
+    }
+    bl->nfull = i;
+
+    return bl->nfull > 0;
+}
+
+static buf_t *
+worker_rxbuf_get(worker_t *w)
+{
+    buf_t *b;
+
+    while ((b = buflist_get(w->freebufs.rx)) == NULL &&
+           worker_buflist_replenish(w, w->freebufs.rx))
+        ;   // do nothing
+
+    if (b != NULL)
+        warnx("%s: buf length %zu", __func__, b->nallocated);
+    return b;
+}
+
+static size_t
+fibonacci_iov_setup(void *_buf, size_t len, struct iovec *iov, size_t niovs)
+{
+    char *buf = _buf;
+    ssize_t i;
+    struct fibo {
+        size_t prev, curr;
+    } state = {.prev = 0, .curr = 1}; // Fibonacci sequence state
+
+    if (niovs < 1 && len > 0)
+        return -1;
+
+    if (niovs > SSIZE_MAX)
+        niovs = SSIZE_MAX;
+
+    for (i = 0; len > 0 && i < niovs - 1; i++) {
+        iov[i].iov_len = (state.curr < len) ? state.curr : len;
+        iov[i].iov_base = buf;
+        len -= iov[i].iov_len;
+        buf += iov[i].iov_len;
+        state = (struct fibo){.prev = state.curr,
+                              .curr = state.prev + state.curr};
+    }
+    if (len > 0) {
+        iov[i].iov_len = len;
+        iov[i].iov_base = buf;
+        i++;
+    }
+    return i;
+}
+
+/* Register the `niovs`-segment I/O vector `iov` using up to `niovs`
+ * of the registrations, descriptors, and remote addresses in the
+ * vectors `mrp`, `descp`, and `raddrp`, respectively.  Register no
+ * more than `maxsegs` segments in a single `fi_mr_regv` call.
+ */
+static int
+mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
+    size_t niovs, size_t maxsegs, uint64_t access, uint64_t offset,
+    uint64_t *next_keyp, uint64_t flags, struct fid_mr **mrp,
+    void **descp, uint64_t *raddrp, void *context)
+{
+    int rc;
+    size_t i, j, nregs = (niovs + maxsegs - 1) / maxsegs;
+    size_t nleftover;
+    uint64_t next_key = *next_keyp;
+
+    for (nleftover = niovs, i = 0;
+         i < nregs;
+         iov += maxsegs, nleftover -= maxsegs, i++) {
+        struct fid_mr *mr;
+        uint64_t raddr = 0;
+
+        size_t nsegs = minsize(nleftover, maxsegs);
+
+        warnx("%zu remaining I/O vectors", nleftover);
+
+        rc = fi_mr_regv(domain, iov, nsegs,
+            access, offset, next_key++, flags, &mr, context);
+
+        if (rc != 0)
+            goto err;
+
+        for (j = 0; j < nsegs; j++) {
+            warnx("filling descriptor %zu", i * maxsegs + j);
+            mrp[i * maxsegs + j] = mr;
+            descp[i * maxsegs + j] = fi_mr_desc(mr);
+            raddrp[i * maxsegs + j] = raddr;
+            raddr += iov[j].iov_len;
+        }
+    }
+
+    *next_keyp = next_key;
+
+    return 0;
+
+err:
+    for (j = 0; j < i; j++)
+        (void)fi_close(&mrp[j]->fid);
+
+    return rc;
+}
 
 static session_t *
 rcvr_start(worker_t *w, session_t *s)
 {
     rcvr_t *r = (rcvr_t *)s->cxn;
     struct fi_cq_msg_entry completion;
+    size_t i, nleftover, nloaded;
     ssize_t ncompleted;
+    int rc;
+    buf_t *paybuf[16];
+    size_t npaybufs = 0;
+    uint64_t next_key = 256;
 
     r->started = true;
+
+    for (nleftover = sizeof(r->payload.rxbuf), nloaded = 0; nleftover > 0; ) {
+        buf_t *b = worker_rxbuf_get(w);
+
+        if (b == NULL)
+            errx(EXIT_FAILURE, "%s: could not get a buffer", __func__);
+
+        b->nfull = minsize(nleftover, b->nallocated);
+        nleftover -= b->nfull;
+        nloaded += b->nfull;
+        if (npaybufs == arraycount(paybuf))
+            errx(EXIT_FAILURE, "%s: could not queue rx buffer", __func__);
+        paybuf[npaybufs++] = b;
+    }
+
+    r->vector.msg.niovs = npaybufs;
+    for (i = 0; i < npaybufs; i++) {
+        buf_t *b = paybuf[i];
+        fprintf(stderr, "paybuf[%zu]->nfull = %zu\n", i, b->nfull);
+        if (!fifo_put(r->rxfifo, b))
+            errx(EXIT_FAILURE, "%s: could not re-queue rx buffer", __func__);
+        r->vector.msg.iov[i].addr = 0; // 
+        r->vector.msg.iov[i].len = b->nfull;
+        r->vector.msg.iov[i].key = fi_mr_key(b->mr);
+    }
+
+    r->vector.niovs = fibonacci_iov_setup(&r->vector.msg,
+        (char *)&r->vector.msg.iov[r->vector.msg.niovs] -
+        (char *)&r->vector.msg,
+        r->vector.iov, w->rx_maxsegs);
+
+    if (r->vector.niovs < 1) {
+        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
+            __func__, r->vector.niovs);
+    }
+
+    rc = mr_regv_all(w->dom, r->vector.iov, r->vector.niovs,
+        minsize(2, w->mr_maxsegs), FI_SEND, 0, &next_key, 0,
+        r->vector.mr, r->vector.desc, r->vector.raddr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "mr_regv_all");
 
     /* Await initial message. */
     do {
@@ -425,10 +718,35 @@ rcvr_start(worker_t *w, session_t *s)
     return s;
 }
 
+/* Return 0 if the sink is accepting more bytes, -1 if unexpected
+ * bytes are on `ready`, 1 if the sink expects no more bytes.
+ */
+static int
+sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
+{
+    sink_t *s = (sink_t *)t;
+    buf_t *b;
+
+    while ((b = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
+        if (b->nfull > s->txbuflen - s->idx)
+            return -1;
+
+        if (memcmp(&txbuf[s->idx], b->content, b->nfull) != 0)
+            return -1;
+
+        (void)fifo_get(ready);
+        (void)fifo_put(completed, b);
+
+        s->idx += b->nfull;
+    }
+    return (s->idx == s->txbuflen) ? 0 : 1;
+}
+
 static session_t *
 rcvr_loop(worker_t *w, session_t *s)
 {
     rcvr_t *r = (rcvr_t *)s->cxn;
+    terminal_t *t = s->terminal;
     struct fi_cq_msg_entry completion;
     ssize_t ncompleted;
     int rc;
@@ -452,22 +770,26 @@ rcvr_loop(worker_t *w, session_t *s)
 
     /* Await progress message. */
     do {
-        printf("%s: awaiting progress message\n", __func__);
+        warnx("%s: awaiting progress message, context %p, last len %zu, count %zu", __func__,
+            (void *)&r->progress, r->progress.iov[r->progress.niovs - 1].iov_len, r->progress.niovs);
         ncompleted = fi_cq_sread(r->cxn.cq, &completion, 1, NULL, -1);
-
-        if (ncompleted == -FI_EAVAIL) {
-            struct fi_cq_err_entry e;
-            ssize_t nfailed = fi_cq_readerr(r->cxn.cq, &e, 0);
-
-            warnx("%s: read %zd errors, %s", __func__, nfailed,
-                fi_strerror(e.err));
-            warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
-                __func__, e.flags, desired_rx_flags);
-            abort();
-        }
     } while (ncompleted == -FI_EAGAIN);
 
-    if (ncompleted < 0)
+    if (ncompleted == -FI_EAVAIL) {
+        struct fi_cq_err_entry e;
+        char errbuf[256];
+        ssize_t nfailed = fi_cq_readerr(r->cxn.cq, &e, 0);
+
+        warnx("%s: read %zd errors, %s", __func__, nfailed,
+            fi_strerror(e.err));
+        warnx("%s: context %p", __func__, (void *)e.op_context);
+        warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
+            __func__, e.flags, desired_rx_flags);
+        warnx("%s: provider error %s", __func__,
+            fi_cq_strerror(r->cxn.cq, e.prov_errno, e.err_data, errbuf,
+                sizeof(errbuf)));
+        goto out;
+    } else if (ncompleted < 0)
         bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
 
     if (ncompleted != 1) {
@@ -500,14 +822,58 @@ rcvr_loop(worker_t *w, session_t *s)
             r->progress.msg.nleftover);
     }
 
-    /* Verify received payload. */
-    printf("%zu bytes filled\n", r->progress.msg.nfilled);
+    size_t nremaining;
 
-    if (strlen(txbuf) != r->progress.msg.nfilled)
-        errx(EXIT_FAILURE, "unexpected received message length");
+    for (nremaining = r->progress.msg.nfilled;
+         nremaining > 0 && !fifo_full(s->ready_for_terminal); ) {
+        buf_t *b = fifo_peek(r->rxfifo);
 
-    if (strncmp(txbuf, r->payload.rxbuf, r->progress.msg.nfilled) != 0)
-        errx(EXIT_FAILURE, "unexpected received message content");
+        (void)fifo_get(r->rxfifo);
+
+        if (nremaining < b->nfull) {
+            b->nfull = nremaining;
+            nremaining = 0;
+        } else {
+            nremaining -= b->nfull;
+        }
+
+        (void)fifo_put(s->ready_for_terminal, b);
+    }
+
+    if (sink_trade(t, s->ready_for_terminal, s->ready_for_cxn) != 0)
+        errx(EXIT_FAILURE, "unexpected received message");
+
+out:
+
+    warnx("%s: shutting down connection", __func__);
+    struct fi_eq_cm_entry cm_entry;
+    uint32_t event;
+
+    rc = fi_shutdown(r->aep, 0);
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_shutdown");
+
+    do {
+        warnx("%s: awaiting shutdown", __func__);
+        rc = fi_eq_sread(r->eq, &event, &cm_entry, sizeof(cm_entry),
+            -1 /* wait forever */, 0 /* flags */ );
+    } while (rc == -FI_EAGAIN);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_eq_sread");
+
+    if (event != FI_SHUTDOWN) {
+        errx(EXIT_FAILURE,
+            "%s: expected connected event (%" PRIu32 "), received %" PRIu32,
+            __func__, FI_SHUTDOWN, event);
+    }
+
+    warnx("%s: shutdown occurred, closing...", __func__);
+    rc = fi_close(&r->aep->fid);
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_close");
+
+    warnx("%s: closed.", __func__);
 
     return NULL;
 }
@@ -559,16 +925,128 @@ xmtr_start(session_t *s)
     return s;
 }
 
+typedef struct write_fully_params {
+    struct fid_ep *ep;
+    const struct iovec *iov_in;
+    void **desc_in;
+    struct iovec *iov_out;
+    void **desc_out;
+    size_t niovs;
+    size_t *niovs_out;
+    const struct fi_rma_iov *riov_in;
+    struct fi_rma_iov *riov_out;
+    size_t nriovs;
+    size_t *nriovs_out;
+    size_t len;
+    size_t maxsegs;
+    uint64_t flags;
+    void *context;
+} write_fully_params_t;
+
+static ssize_t
+write_fully(write_fully_params_t p)
+{
+    ssize_t rc;
+    size_t i, j, nremaining;
+    struct {
+        size_t local;
+        size_t remote;
+    } sumlen = {.local = 0, .remote = 0}, nsegs = {.local = 0, .remote = 0};
+    size_t maxsegs = minsize(p.maxsegs, minsize(p.nriovs, p.niovs));
+
+    for (i = 0; i < maxsegs; i++) {
+        sumlen.local += p.iov_in[i].iov_len;
+        sumlen.remote += p.riov_in[i].len;
+    }
+
+    const size_t len = minsize(minsize(sumlen.local, sumlen.remote),
+                               minsize(p.len, SSIZE_MAX));
+
+    for (i = 0, nremaining = len; 0 < nremaining && i < maxsegs; i++) {
+        p.iov_out[i] = p.iov_in[i];
+        p.desc_out[i] = p.desc_in[i];
+        if (p.iov_in[i].iov_len > nremaining) {
+            p.iov_out[i].iov_len = nremaining;
+            nremaining = 0;
+        } else {
+            nremaining -= p.iov_in[i].iov_len;
+        }
+    }
+
+    nsegs.local = i;
+
+    for (i = 0, nremaining = len; 0 < nremaining && i < maxsegs; i++) {
+        p.riov_out[i] = p.riov_in[i];
+        if (p.riov_in[i].len > nremaining) {
+            p.riov_out[i].len = nremaining;
+            nremaining = 0;
+        } else {
+            nremaining -= p.riov_in[i].len;
+        }
+    }
+
+    nsegs.remote = i;
+
+    struct fi_msg_rma mrma;
+    mrma.msg_iov = p.iov_out;
+    mrma.desc = p.desc_out;
+    mrma.iov_count = nsegs.local;
+    mrma.addr = 0;
+    mrma.rma_iov = p.riov_out;
+    mrma.rma_iov_count = nsegs.remote;
+    mrma.context = p.context;
+    mrma.data = 0;
+
+    rc = fi_writemsg(p.ep, &mrma, p.flags);
+
+    if (rc != 0)
+        return rc;
+
+    for (i = j = 0, nremaining = len; i < p.niovs; i++) {
+        if (nremaining >= p.iov_in[i].iov_len) {
+            nremaining -= p.iov_in[i].iov_len;
+            continue;
+        }
+        p.desc_out[j] = p.desc_in[i];
+        p.iov_out[j] = p.iov_in[i];
+        if (nremaining > 0) {
+            p.iov_out[j].iov_len -= nremaining;
+            p.iov_out[j].iov_base = (char *)p.iov_out[j].iov_base + nremaining;
+            nremaining = 0;
+        }
+        j++;
+    }
+    *p.niovs_out = j;
+
+    for (i = j = 0, nremaining = len; i < p.nriovs; i++) {
+        if (nremaining >= p.riov_in[i].len) {
+            nremaining -= p.riov_in[i].len;
+            continue;
+        }
+        p.riov_out[j] = p.riov_in[i];
+        if (nremaining > 0) {
+            p.riov_out[j].len -= nremaining;
+            p.riov_out[j].addr = p.riov_out[j].addr + nremaining;
+            nremaining = 0;
+        }
+        j++;
+    }
+
+    *p.nriovs_out = j;
+    return len;
+}
+
 static session_t *
 xmtr_loop(worker_t *w, session_t *s)
 {
+    struct fi_eq_cm_entry cm_entry;
     xmtr_t *x = (xmtr_t *)s->cxn;
-    struct fi_rma_iov riov[12];
+    struct fi_rma_iov riov[12], riov2[12];
     struct fi_cq_msg_entry completion;
     const size_t txbuflen = strlen(txbuf);
-    size_t i, nriovs;
-    ssize_t ncompleted;
-    int rc;
+    size_t i, orig_nriovs;
+    ssize_t ncompleted, rc;
+    uint32_t event;
 
     if (!x->started)
         return xmtr_start(s);
@@ -636,8 +1114,8 @@ xmtr_loop(worker_t *w, session_t *s)
      * the preceding vectors.
      */
     for (i = 0; 0 < nremaining && i < x->vector.msg.niovs; i++) {
-        printf("%s: received vector %zd "
-            "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64 "\n",
+        warnx("%s: received vector %zd "
+            "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
             __func__, i, x->vector.msg.iov[i].addr, x->vector.msg.iov[i].len,
             x->vector.msg.iov[i].key);
         riov[i].len = minsize(nremaining, x->vector.msg.iov[i].len);
@@ -646,7 +1124,7 @@ xmtr_loop(worker_t *w, session_t *s)
         riov[i].key = x->vector.msg.iov[i].key;
     }
 
-    nriovs = i;
+    orig_nriovs = i;
 
     if (nremaining > 0) {
         errx(EXIT_FAILURE, "%s: the receiver's buffer cannot fit the payload",
@@ -654,6 +1132,8 @@ xmtr_loop(worker_t *w, session_t *s)
     }
 
 #if 1
+
+#if 0
     struct fi_msg_rma mrma;
     mrma.msg_iov = x->payload.iov;
     mrma.desc = x->payload.desc;
@@ -661,31 +1141,72 @@ xmtr_loop(worker_t *w, session_t *s)
     mrma.addr = 0;
     mrma.rma_iov = riov;
     mrma.rma_iov_count = nriovs;
-    mrma.context = NULL;
+    mrma.context = &x->payload;
     mrma.data = 0;
+#endif
 
-    rc = fi_writemsg(x->ep, &mrma, 0);
+    bool which = true;
+    ssize_t nwritten, total;
+    size_t nriovs = orig_nriovs;
+    size_t niovs = 1, niovs_out = 0, nriovs_out = 0;
 
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_writemsg");
+    for (total = 0; total < txbuflen; total += nwritten, which = !which) {
+        write_fully_params_t p = {.ep = x->ep,
+            .iov_in = which ? x->payload.iov : x->payload.iov2,
+            .desc_in = which ? x->payload.desc : x->payload.desc2,
+            .iov_out = which ? x->payload.iov2 : x->payload.iov,
+            .desc_out = which ? x->payload.desc2 : x->payload.desc,
+            .niovs = niovs,
+            .niovs_out = &niovs_out,
+            .riov_in = which ? riov : riov2,
+            .riov_out = which ? riov2 : riov,
+            .nriovs = nriovs,
+            .nriovs_out = &nriovs_out,
+            .len = txbuflen - total,
+            .maxsegs = minsize(w->rma_maxsegs, x->vector.msg.niovs),
+            .flags = FI_COMPLETION | FI_DELIVERY_COMPLETE,
+            .context = &x->payload};
 
-#   if 0
-    /* Await RDMA completion. Pass flags FI_COMPLETION |
-     * FI_DELIVERY_COMPLETE to fi_writemsg, above.
-     */
-    do {
-        printf("%s: awaiting RMA completion.\n", __func__);
-        ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
+        nwritten = write_fully(p);
 
-    if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+        if (nwritten < 0)
+            bailout_for_ofi_ret(nwritten, "write_fully");
 
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
+        niovs = niovs_out;
+        nriovs = nriovs_out;
+
+        /* Await RDMA completion. Pass flags FI_COMPLETION |
+         * FI_DELIVERY_COMPLETE to fi_writemsg, above.
+         */
+        do {
+            warnx("%s: awaiting RMA completion, context %p, remote count %zu",
+                __func__, (void *)&x->payload, orig_nriovs);
+            ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
+        } while (ncompleted == -FI_EAGAIN);
+
+        if (ncompleted == -FI_EAVAIL) {
+            struct fi_cq_err_entry e;
+            char errbuf[256];
+            ssize_t nfailed = fi_cq_readerr(x->cxn.cq, &e, 0);
+
+            warnx("%s: read %zd errors, %s", __func__, nfailed,
+                fi_strerror(e.err));
+            warnx("%s: context %p", __func__, (void *)e.op_context);
+            warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
+                __func__, e.flags, desired_wr_flags);
+            warnx("%s: provider error %s", __func__,
+                fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
+                    sizeof(errbuf)));
+            goto out;
+        } else if (ncompleted < 0) {
+            bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+        }
+
+        if (ncompleted != 1) {
+            errx(EXIT_FAILURE,
+                "%s: expected 1 completion, read %zd", __func__, ncompleted);
+        }
     }
-#   endif
 #else
     size_t nwritten = 0;
     for (i = 0; i < x->vector.msg.niovs && nwritten < txbuflen; i++) {
@@ -716,23 +1237,42 @@ xmtr_loop(worker_t *w, session_t *s)
 
     x->progress.desc = fi_mr_desc(x->progress.mr);
 
+    struct iovec iov = {.iov_base = &x->progress.msg,
+                                     .iov_len = sizeof(x->progress.msg)};
     rc = fi_sendmsg(x->ep, &(struct fi_msg){
-          .msg_iov = &(struct iovec){.iov_base = &x->progress.msg,
-                                     .iov_len = sizeof(x->progress.msg)}
+          .msg_iov = &iov
         , .desc = &x->progress.desc
         , .iov_count = 1
         , .addr = 0
-        , .context = NULL
+        , .context = &x->progress
         , .data = 0
-        }, FI_FENCE | FI_COMPLETION);
+        }, FI_COMPLETION);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_sendmsg");
 
     /* Await transmission of progress message. */
     do {
-        printf("%s: awaiting progress message transmission.\n", __func__);
+        warnx("%s: awaiting progress message transmission, context %p, len %zu", __func__,
+            (void *)&x->progress, iov.iov_len);
         ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
     } while (ncompleted == -FI_EAGAIN);
 
-    if (ncompleted < 0)
+    if (ncompleted == -FI_EAVAIL) {
+        struct fi_cq_err_entry e;
+        char errbuf[256];
+        ssize_t nfailed = fi_cq_readerr(x->cxn.cq, &e, 0);
+
+        warnx("%s: read %zd errors, %s", __func__, nfailed,
+            fi_strerror(e.err));
+        warnx("%s: context %p", __func__, (void *)e.op_context);
+        warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
+            __func__, e.flags, desired_rx_flags);
+        warnx("%s: provider error %s", __func__,
+            fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
+                sizeof(errbuf)));
+        abort();
+    } else if (ncompleted < 0)
         bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
 
     if (ncompleted != 1) {
@@ -746,8 +1286,30 @@ xmtr_loop(worker_t *w, session_t *s)
             __func__, desired_tx_flags, completion.flags & desired_tx_flags);
     }
 
-    printf("sent %zu of %zu bytes progress message\n", completion.len,
-        sizeof(x->progress.msg));
+    warnx("sent %zu-byte progress message", sizeof(x->progress.msg));
+
+out:
+
+    warnx("%s: shutting down connection", __func__);
+
+    rc = fi_shutdown(x->ep, 0);
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_shutdown");
+
+    do {
+        warnx("%s: awaiting peer shutdown", __func__);
+        rc = fi_eq_sread(x->eq, &event, &cm_entry, sizeof(cm_entry),
+            -1 /* wait forever */, 0 /* flags */ );
+    } while (rc == -FI_EAGAIN);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_eq_sread");
+
+    if (event != FI_SHUTDOWN) {
+        errx(EXIT_FAILURE,
+            "%s: expected connected event (%" PRIu32 "), received %" PRIu32,
+            __func__, FI_SHUTDOWN, event);
+    }
 
     return NULL;
 }
@@ -863,70 +1425,6 @@ worker_outer_loop(void *arg)
     return NULL;
 }
 
-static uint64_t
-worker_next_key(worker_t *w)
-{
-    if (w->next_key % 256 == 0) {
-            w->next_key = atomic_fetch_add_explicit(&next_key_pool, 256,
-                memory_order_relaxed);
-    }
-
-    return w->next_key++;
-}
-
-static bool
-worker_buflist_replenish(worker_t *w, buflist_t *bl)
-{
-    size_t i, buflen;
-    int rc;
-
-    if (bl->nfull >= bl->nallocated / 2)
-        return true;
-
-    size_t ntofill = bl->nallocated / 2 - bl->nfull;
-
-    for (buflen = 0, i = bl->nfull; i < ntofill; i++) {
-        buf_t *buf;
-
-        // buflen cycle: 7 -> 256 -> 4096 -> 7 -> ....
-        switch (buflen) {
-        case 0:
-        default:
-            buflen = 7;
-            break;
-        case 7:
-            buflen = 256;
-            break;
-        case 256:
-            buflen = 4096;
-            break;
-        case 4096:
-            buflen = 7;
-            break;
-        }
-        buf = malloc(offsetof(buf_t, content[0]) + buflen);
-        if (buf == NULL)
-            err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
-        buf->nallocated = buflen;
-        buf->nfull = 0;
-
-        rc = fi_mr_reg(w->dom, buf->content, buflen,
-            FI_SEND, 0, worker_next_key(w), 0, &buf->mr, NULL);
-
-        if (rc != 0) {
-            warn_about_ofi_ret(rc, "fi_mr_reg");
-            free(buf);
-            break;
-        }
-
-        buf->desc = fi_mr_desc(buf->mr);
-        bl->buf[i] = buf;
-    }
-    bl->nfull = i;
-
-    return bl->nfull > 0;
-}
-
 static void
 worker_buflist_destroy(struct fid_domain *dom, buflist_t *bl)
 {
@@ -946,14 +1444,15 @@ worker_buflist_destroy(struct fid_domain *dom, buflist_t *bl)
 }
 
 static buflist_t *
-worker_buflist_create(worker_t *w)
+worker_buflist_create(worker_t *w, uint64_t access)
 {
     buflist_t *bl = malloc(offsetof(buflist_t, buf[256]));
 
     if (bl == NULL)
         err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
 
-    bl->nallocated = 256;
+    bl->access = access;
+    bl->nallocated = 16;
     bl->nfull = 0;
 
     if (!worker_buflist_replenish(w, bl)) {
@@ -964,48 +1463,18 @@ worker_buflist_create(worker_t *w)
     return bl;
 }
 
-#if 0
-static buf_t *
-buflist_get(buflist_t *bl)
-{
-    if (bl->nfull == 0)
-        return NULL;
-
-    return bl->buf[--bl->nfull];
-}
-
-static bool
-buflist_put(buflist_t *bl, buf_t *b)
-{
-    if (bl->nfull == bl->nallocated)
-        return false;
-
-    bl->buf[bl->nfull++] = b;
-    return true;
-}
-
-static buf_t *
-worker_rxbuf_get(worker_t *w)
-{
-    buf_t *b;
-
-    while ((b = buflist_get(w->freebufs.rx)) == NULL &&
-           worker_buflist_replenish(w, w->freebufs.rx))
-        ;   // do nothing
-
-    return b;
-}
-#endif
-
 static void
-worker_init(worker_t *w, struct fid_domain *dom)
+worker_init(worker_t *w, const state_t *st)
 {
     struct fi_poll_attr attr = {.flags = 0};
     int rc;
     size_t i;
 
     w->cancelled = false;
-    w->dom = dom;
+    w->dom = st->domain;
+    w->mr_maxsegs = st->mr_maxsegs;
+    w->rma_maxsegs = st->rma_maxsegs;
+    w->rx_maxsegs = st->rx_maxsegs;
 
     if ((rc = pthread_cond_init(&w->sleep, NULL)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_cond_init: %s", __func__, __LINE__,
@@ -1017,14 +1486,14 @@ worker_init(worker_t *w, struct fid_domain *dom)
             errx(EXIT_FAILURE, "%s.%d: pthread_mutex_init: %s",
                 __func__, __LINE__, strerror(rc));
         }
-        if ((rc = fi_poll_open(dom, &attr, &w->pollset[i])) != 0)
+        if ((rc = fi_poll_open(w->dom, &attr, &w->pollset[i])) != 0)
             bailout_for_ofi_ret(rc, "fi_poll_open");
     }
     for (i = 0; i < arraycount(w->session); i++)
         w->session[i] = (session_t){.cxn = NULL, .terminal = NULL};
 
-    w->freebufs.rx = worker_buflist_create(w);
-    w->freebufs.tx = worker_buflist_create(w);
+    w->freebufs.rx = worker_buflist_create(w, FI_RECV | FI_REMOTE_WRITE);
+    w->freebufs.tx = worker_buflist_create(w, FI_SEND);
 }
 
 static void
@@ -1065,7 +1534,7 @@ worker_teardown(worker_t *w)
 #endif
 
 static worker_t *
-worker_create(struct fid_domain *dom)
+worker_create(state_t *st)
 {
     worker_t *w;
 
@@ -1074,7 +1543,7 @@ worker_create(struct fid_domain *dom)
         ? &workers[nworkers_allocated++]
         : NULL;
     if (w != NULL)
-        worker_init(w, dom);
+        worker_init(w, st);
     (void)pthread_mutex_unlock(&workers_mtx);
 
     if (w != NULL)
@@ -1089,9 +1558,8 @@ workers_initialize(void)
 }
 
 static bool
-worker_assign_cxn(worker_t *w, cxn_t *c, struct fid_domain *dom)
+worker_assign_session(worker_t *w, session_t *s)
 {
-    cxn_t **cp;
     size_t half, i;
     int rc;
 
@@ -1103,18 +1571,20 @@ worker_assign_cxn(worker_t *w, cxn_t *c, struct fid_domain *dom)
 
         // find an empty receiver slot
         for (i = 0; i < arraycount(w->session) / 2; i++) {
-            cp = &w->session[half * arraycount(w->session) / 2 + i].cxn;
-            if (*cp != NULL)
+            session_t *slot =
+                &w->session[half * arraycount(w->session) / 2 + i];
+
+            if (slot->cxn != NULL)
                 continue;
 
-            rc = fi_poll_add(w->pollset[half], &c->cq->fid, 0);
+            rc = fi_poll_add(w->pollset[half], &s->cxn->cq->fid, 0);
             if (rc != 0) {
                 warn_about_ofi_ret(rc, "fi_poll_add");
                 continue;
             }
             atomic_fetch_add_explicit(&w->nsessions[half], 1,
                 memory_order_relaxed);
-            *cp = c;
+            *slot = *s;
             (void)pthread_mutex_unlock(mtx);
             return true;
         }
@@ -1127,14 +1597,14 @@ worker_assign_cxn(worker_t *w, cxn_t *c, struct fid_domain *dom)
  * Caller must hold `workers_mtx`.
  */
 static worker_t *
-workers_assign_cxn_to_running(cxn_t *c, struct fid_domain *dom)
+workers_assign_session_to_running(session_t *s)
 {
     size_t iplus1;
 
     for (iplus1 = nworkers_running; 0 < iplus1; iplus1--) {
         size_t i = iplus1 - 1;
         worker_t *w = &workers[i];
-        if (worker_assign_cxn(w, c, dom))
+        if (worker_assign_session(w, s))
             return w;
     }
     return NULL;
@@ -1144,13 +1614,13 @@ workers_assign_cxn_to_running(cxn_t *c, struct fid_domain *dom)
  * Caller must hold `workers_mtx`.
  */
 static worker_t *
-workers_assign_cxn_to_idle(cxn_t *c, struct fid_domain *dom)
+workers_assign_session_to_idle(session_t *s)
 {
     size_t i;
 
     if ((i = nworkers_running) < nworkers_allocated) {
         worker_t *w = &workers[i];
-        if (worker_assign_cxn(w, c, dom))
+        if (worker_assign_session(w, s))
             return w;
     }
     return NULL;
@@ -1169,7 +1639,7 @@ workers_wake(worker_t *w)
 }
 
 static worker_t *
-workers_assign_cxn(cxn_t *c, struct fid_domain *dom)
+workers_assign_session(state_t *st, session_t *s)
 {
     worker_t *w;
 
@@ -1181,12 +1651,12 @@ workers_assign_cxn(cxn_t *c, struct fid_domain *dom)
             return NULL;
         }
 
-        if ((w = workers_assign_cxn_to_running(c, dom)) != NULL)
+        if ((w = workers_assign_session_to_running(s)) != NULL)
             ;
-        else if ((w = workers_assign_cxn_to_idle(c, dom)) != NULL)
+        else if ((w = workers_assign_session_to_idle(s)) != NULL)
             workers_wake(w);
         (void)pthread_mutex_unlock(&workers_mtx);
-    } while (w == NULL && (w = worker_create(dom)) != NULL);
+    } while (w == NULL && (w = worker_create(st)) != NULL);
 
     return w;
 }
@@ -1223,89 +1693,6 @@ workers_join_all(void)
     }
 }
 
-static size_t
-fibonacci_iov_setup(void *_buf, size_t len, struct iovec *iov, size_t niovs)
-{
-    char *buf = _buf;
-    ssize_t i;
-    struct fibo {
-        size_t prev, curr;
-    } state = {.prev = 0, .curr = 1}; // Fibonacci sequence state
-
-    if (niovs < 1 && len > 0)
-        return -1;
-
-    if (niovs > SSIZE_MAX)
-        niovs = SSIZE_MAX;
-
-    for (i = 0; len > 0 && i < niovs - 1; i++) {
-        iov[i].iov_len = (state.curr < len) ? state.curr : len;
-        iov[i].iov_base = buf;
-        len -= iov[i].iov_len;
-        buf += iov[i].iov_len;
-        state = (struct fibo){.prev = state.curr,
-                              .curr = state.prev + state.curr};
-    }
-    if (len > 0) {
-        iov[i].iov_len = len;
-        iov[i].iov_base = buf;
-        i++;
-    }
-    return i;
-}
-
-/* Register the `niovs`-segment I/O vector `iov` using up to `niovs`
- * of the registrations, descriptors, and remote addresses in the
- * vectors `mrp`, `descp`, and `raddrp`, respectively.  Register no
- * more than `maxsegs` segments in a single `fi_mr_regv` call.
- */
-static int
-mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
-    size_t niovs, size_t maxsegs, uint64_t access, uint64_t offset,
-    uint64_t *next_keyp, uint64_t flags, struct fid_mr **mrp,
-    void **descp, uint64_t *raddrp, void *context)
-{
-    int rc;
-    size_t i, j, nregs = (niovs + maxsegs - 1) / maxsegs;
-    size_t nleftover;
-    uint64_t next_key = *next_keyp;
-
-    for (nleftover = niovs, i = 0;
-         i < nregs;
-         iov += maxsegs, nleftover -= maxsegs, i++) {
-        struct fid_mr *mr;
-        uint64_t raddr = 0;
-
-        size_t nsegs = minsize(nleftover, maxsegs);
-
-        printf("%zu remaining I/O vectors\n", nleftover);
-
-        rc = fi_mr_regv(domain, iov, nsegs,
-            access, offset, next_key++, flags, &mr, context);
-
-        if (rc != 0)
-            goto err;
-
-        for (j = 0; j < nsegs; j++) {
-            printf("filling descriptor %zu\n", i * maxsegs + j);
-            mrp[i * maxsegs + j] = mr;
-            descp[i * maxsegs + j] = fi_mr_desc(mr);
-            raddrp[i * maxsegs + j] = raddr;
-            raddr += iov[j].iov_len;
-        }
-    }
-
-    *next_keyp = next_key;
-
-    return 0;
-
-err:
-    for (j = 0; j < i; j++)
-        (void)fi_close(&mrp[j]->fid);
-
-    return rc;
-}
-
 static void
 cxn_init(cxn_t *c, session_t *(*loop)(worker_t *, session_t *))
 {
@@ -1323,11 +1710,21 @@ xmtr_init(xmtr_t *x)
 }
 
 static void
+sink_init(sink_t *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->terminal.trade = sink_trade;
+    s->txbuflen = strlen(txbuf);
+    s->idx = 0;
+}
+
+static void
 rcvr_init(rcvr_t *r)
 {
     memset(r, 0, sizeof(*r));
 
     cxn_init(&r->cxn, rcvr_loop);
+    r->rxfifo = fifo_create(64);
     r->started = false;
 }
 
@@ -1353,13 +1750,18 @@ get(state_t *st)
     struct fi_eq_cm_entry cm_entry;
     get_state_t *gst = &st->u.get;
     rcvr_t *r = &gst->rcvr;
+    sink_t *s = &gst->sink;
+    session_t sess;
     worker_t *w;
     uint64_t next_key = 0;
-    ssize_t i;
     uint32_t event;
     int rc;
 
     rcvr_init(r);
+    sink_init(s);
+
+    if (!session_init(&sess, &r->cxn, &s->terminal))
+        errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
 
     r->initial.niovs = fibonacci_iov_setup(&r->initial.msg,
         sizeof(r->initial.msg), r->initial.iov, st->rx_maxsegs);
@@ -1377,14 +1779,6 @@ get(state_t *st)
             __func__, r->progress.niovs);
     }
 
-    r->payload.niovs = fibonacci_iov_setup(r->payload.rxbuf,
-        sizeof(r->payload.rxbuf), r->payload.iov, st->rx_maxsegs);
-
-    if (r->payload.niovs < 1) {
-        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
-            __func__, r->payload.niovs);
-    }
-
     rc = mr_regv_all(st->domain, r->initial.iov, r->initial.niovs,
         minsize(2, st->mr_maxsegs), FI_RECV, 0, &next_key, 0,
         r->initial.mr, r->initial.desc, r->initial.raddr, NULL);
@@ -1399,39 +1793,6 @@ get(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "mr_regv_all");
 
-    rc = mr_regv_all(st->domain, r->payload.iov, r->payload.niovs,
-        minsize(2, st->mr_maxsegs), FI_REMOTE_WRITE, 0, &next_key, 0,
-        r->payload.mr, r->payload.desc, r->payload.raddr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "mr_regv_all");
-
-    r->vector.msg.niovs = r->payload.niovs;
-    for (i = 0; i < r->payload.niovs; i++) {
-        printf("payload.iov[%zd].iov_len = %zu\n", i,
-            r->payload.iov[i].iov_len);
-        r->vector.msg.iov[i].addr = r->payload.raddr[i];
-        r->vector.msg.iov[i].len = r->payload.iov[i].iov_len;
-        r->vector.msg.iov[i].key = fi_mr_key(r->payload.mr[i]);
-    }
-
-    r->vector.niovs = fibonacci_iov_setup(&r->vector.msg,
-        (char *)&r->vector.msg.iov[r->vector.msg.niovs] -
-        (char *)&r->vector.msg,
-        r->vector.iov, st->rx_maxsegs);
-
-    if (r->vector.niovs < 1) {
-        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
-            __func__, r->vector.niovs);
-    }
-
-    rc = mr_regv_all(st->domain, r->vector.iov, r->vector.niovs,
-        minsize(2, st->mr_maxsegs), FI_SEND, 0, &next_key, 0,
-        r->vector.mr, r->vector.desc, r->vector.raddr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "mr_regv_all");
-
     rc = fi_passive_ep(st->fabric, st->info, &gst->pep, NULL);
 
     if (rc != 0)
@@ -1442,7 +1803,7 @@ get(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open (listen)");
 
-    rc = fi_eq_open(st->fabric, &eq_attr, &r->active_eq, NULL);
+    rc = fi_eq_open(st->fabric, &eq_attr, &r->eq, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open (active)");
@@ -1481,7 +1842,7 @@ get(state_t *st)
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
-    rc = fi_ep_bind(r->aep, &r->active_eq->fid, 0);
+    rc = fi_ep_bind(r->aep, &r->eq->fid, 0);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
@@ -1519,7 +1880,7 @@ get(state_t *st)
         , .desc = r->progress.desc
         , .iov_count = r->progress.niovs
         , .addr = 0
-        , .context = NULL
+        , .context = &r->progress
         , .data = 0
         }, FI_COMPLETION);
 
@@ -1534,7 +1895,7 @@ get(state_t *st)
     fi_freeinfo(cm_entry.info);
 
     do {
-        rc = fi_eq_sread(r->active_eq, &event, &cm_entry, sizeof(cm_entry),
+        rc = fi_eq_sread(r->eq, &event, &cm_entry, sizeof(cm_entry),
             -1 /* wait forever */, 0 /* flags */ );
     } while (rc == -FI_EAGAIN);
 
@@ -1547,7 +1908,7 @@ get(state_t *st)
             __func__, FI_CONNECTED, event);
     }
 
-    if ((w = workers_assign_cxn(&r->cxn, st->domain)) == NULL) {
+    if ((w = workers_assign_session(st, &sess)) == NULL) {
         errx(EXIT_FAILURE, "%s: could not assign a new receiver to a worker",
             __func__);
     }
@@ -1579,6 +1940,8 @@ put(state_t *st)
     struct fi_eq_cm_entry cm_entry;
     put_state_t *pst = &st->u.put;
     xmtr_t *x = &pst->xmtr;
+    source_t *s = &pst->source;
+    session_t sess;
     worker_t *w;
     uint64_t next_key = 0;
     uint32_t event;
@@ -1586,6 +1949,9 @@ put(state_t *st)
     const size_t txbuflen = strlen(txbuf);
 
     xmtr_init(x);
+
+    if (!session_init(&sess, &x->cxn, &s->terminal))
+        errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
 
     rc = fi_mr_reg(st->domain, &x->initial.msg, sizeof(x->initial.msg),
         FI_SEND, 0, next_key++, 0, &x->initial.mr, NULL);
@@ -1621,12 +1987,12 @@ put(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
-    rc = fi_eq_open(st->fabric, &eq_attr, &pst->connect_eq, NULL);
+    rc = fi_eq_open(st->fabric, &eq_attr, &x->eq, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open");
 
-    rc = fi_ep_bind(x->ep, &pst->connect_eq->fid, 0);
+    rc = fi_ep_bind(x->ep, &x->eq->fid, 0);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
@@ -1648,7 +2014,7 @@ put(state_t *st)
         bailout_for_ofi_ret(rc, "fi_connect dest_addr %p", st->info->dest_addr);
 
     do {
-        rc = fi_eq_sread(pst->connect_eq, &event, &cm_entry, sizeof(cm_entry),
+        rc = fi_eq_sread(x->eq, &event, &cm_entry, sizeof(cm_entry),
             -1 /* wait forever */, 0 /* flags */ );
     } while (rc == -FI_EAGAIN);
 
@@ -1661,7 +2027,7 @@ put(state_t *st)
             __func__, FI_CONNECTED, event);
     }
 
-    if ((w = workers_assign_cxn(&x->cxn, st->domain)) == NULL) {
+    if ((w = workers_assign_session(st, &sess)) == NULL) {
         errx(EXIT_FAILURE, "%s: could not assign a new transmitter to a worker",
             __func__);
     }
@@ -1717,13 +2083,13 @@ main(int argc, char **argv)
 
     workers_initialize();
 
-    printf("%ld POSIX I/O vector items maximum\n", sysconf(_SC_IOV_MAX));
+    warnx("%ld POSIX I/O vector items maximum", sysconf(_SC_IOV_MAX));
 
     if ((hints = fi_allocinfo()) == NULL)
         errx(EXIT_FAILURE, "%s: fi_allocinfo", __func__);
 
     hints->ep_attr->type = FI_EP_MSG;
-    hints->caps = FI_FENCE | FI_MSG | FI_RMA | FI_REMOTE_WRITE | FI_WRITE;
+    hints->caps = FI_MSG | FI_RMA | FI_REMOTE_WRITE | FI_WRITE;
     hints->mode = FI_CONTEXT;
     hints->domain_attr->mr_mode = FI_MR_PROV_KEY;
 
@@ -1747,7 +2113,12 @@ main(int argc, char **argv)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_getinfo");
 
-    printf("%d infos found\n", count_info(st.info));
+    warnx("%d infos found", count_info(st.info));
+
+    if ((st.info->mode & FI_CONTEXT) != 0) {
+        errx(EXIT_FAILURE,
+           "contexts should embed fi_context, but I don't do that, yet.");
+    }
 
     rc = fi_fabric(st.info->fabric_attr, &st.fabric, NULL /* app context */);
 
@@ -1756,42 +2127,41 @@ main(int argc, char **argv)
 
     rc = fi_domain(st.fabric, st.info, &st.domain, NULL);
 
-    printf("provider %s, memory-registration I/O vector limit %zu\n",
+    warnx("provider %s, memory-registration I/O vector limit %zu",
         st.info->fabric_attr->prov_name,
         st.info->domain_attr->mr_iov_limit);
 
-    printf("provider %s %s application-requested memory-registration keys\n",
+    warnx("provider %s %s application-requested memory-registration keys",
         st.info->fabric_attr->prov_name,
         ((st.info->domain_attr->mr_mode & FI_MR_PROV_KEY) != 0)
             ? "does not support"
             : "supports");
 
     if ((st.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0) {
-        printf("provider %s RDMA uses virtual addresses instead of offsets, "
-            "quitting.\n",
-            st.info->fabric_attr->prov_name);
+        warnx("provider %s RDMA uses virtual addresses instead of offsets, "
+            "quitting.", st.info->fabric_attr->prov_name);
         exit(EXIT_FAILURE);
     }
 
-    printf("Rx/Tx I/O vector limits %zu/%zu\n",
+    warnx("Rx/Tx I/O vector limits %zu/%zu",
         st.info->rx_attr->iov_limit, st.info->tx_attr->iov_limit);
 
-    printf("RMA I/O vector limit %zu\n", st.info->tx_attr->rma_iov_limit);
+    warnx("RMA I/O vector limit %zu", st.info->tx_attr->rma_iov_limit);
 
     st.mr_maxsegs = 1; // st.info->domain_attr->mr_iov_limit;
-    st.rx_maxsegs = st.info->rx_attr->iov_limit;
-    st.tx_maxsegs = st.info->tx_attr->iov_limit;
+    st.rx_maxsegs = 1;
+    st.tx_maxsegs = 1;
     st.rma_maxsegs = st.info->tx_attr->rma_iov_limit;
 
 #if 0
-    printf("maximum endpoint message size (RMA limit) %zu\n",
+    warnx("maximum endpoint message size (RMA limit) %zu",
         st.info->ep_attr->max_msg_size);
 #endif
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_domain");
 
-    printf("starting personality '%s'\n", personality_to_name(personality));
+    warnx("starting personality '%s'", personality_to_name(personality));
 
     return (*personality)(&st);
 }
