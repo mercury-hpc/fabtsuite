@@ -1131,20 +1131,6 @@ xmtr_loop(worker_t *w, session_t *s)
             __func__);
     }
 
-#if 1
-
-#if 0
-    struct fi_msg_rma mrma;
-    mrma.msg_iov = x->payload.iov;
-    mrma.desc = x->payload.desc;
-    mrma.iov_count = 1;
-    mrma.addr = 0;
-    mrma.rma_iov = riov;
-    mrma.rma_iov_count = nriovs;
-    mrma.context = &x->payload;
-    mrma.data = 0;
-#endif
-
     bool which = true;
     ssize_t nwritten, total;
     size_t nriovs = orig_nriovs;
@@ -1207,30 +1193,6 @@ xmtr_loop(worker_t *w, session_t *s)
                 "%s: expected 1 completion, read %zd", __func__, ncompleted);
         }
     }
-#else
-    size_t nwritten = 0;
-    for (i = 0; i < x->vector.msg.niovs && nwritten < txbuflen; i++) {
-        const size_t split = 0;
-        if (split > 0 && minsize(riov[i].len, txbuflen - nwritten) > split) {
-            rc = fi_write(x->ep, txbuf + nwritten, split,
-                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
-            if (rc != 0)
-                bailout_for_ofi_ret(rc, "fi_write");
-            rc = fi_write(x->ep, txbuf + nwritten + split,
-                minsize(riov[i].len, txbuflen - nwritten) - split,
-                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr + split,
-                riov[i].key, NULL);
-        } else {
-            rc = fi_write(x->ep, txbuf + nwritten,
-                minsize(riov[i].len, txbuflen - nwritten),
-                fi_mr_desc(x->payload.mr[0]), 0, riov[i].addr, riov[i].key, NULL);
-        }
-        if (rc != 0)
-            bailout_for_ofi_ret(rc, "fi_write");
-        nwritten += minsize(riov[i].len, txbuflen - nwritten);
-    }
-
-#endif
 
     x->progress.msg.nfilled = txbuflen;
     x->progress.msg.nleftover = 0;
