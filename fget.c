@@ -1106,30 +1106,22 @@ xmtr_loop(worker_t *w, session_t *s)
     x->payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
     x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
 
-    size_t nremaining = txbuflen;
-
     /* TBD only fill riov[] to the number of vectors we need.  Track the
      * need in a new variable, `nriovs`.  Set the length of the last
      * vector to the bytes remaining in `txbuf` after assigning bytes to
      * the preceding vectors.
      */
-    for (i = 0; 0 < nremaining && i < x->vector.msg.niovs; i++) {
+    for (i = 0; i < x->vector.msg.niovs; i++) {
         warnx("%s: received vector %zd "
             "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
             __func__, i, x->vector.msg.iov[i].addr, x->vector.msg.iov[i].len,
             x->vector.msg.iov[i].key);
-        riov[i].len = minsize(nremaining, x->vector.msg.iov[i].len);
-        nremaining -= riov[i].len;
+        riov[i].len = x->vector.msg.iov[i].len;
         riov[i].addr = x->vector.msg.iov[i].addr;
         riov[i].key = x->vector.msg.iov[i].key;
     }
 
     orig_nriovs = i;
-
-    if (nremaining > 0) {
-        errx(EXIT_FAILURE, "%s: the receiver's buffer cannot fit the payload",
-            __func__);
-    }
 
     bool which = true;
     ssize_t nwritten, total;
