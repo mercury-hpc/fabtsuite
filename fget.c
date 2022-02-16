@@ -718,6 +718,33 @@ rcvr_start(worker_t *w, session_t *s)
     return s;
 }
 
+#if 0
+/* Return 0 if the source is producing more bytes,
+ * 1 if the source will produce no more bytes.
+ */
+static int
+source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
+{
+    sink_t *s = (sink_t *)t;
+    buf_t *b;
+
+    while ((b = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
+        if (s->idx == s->txbuflen)
+            return 1;
+
+        b->nfull = minsize(s->txbuflen - s->idx, b->nallocated);
+
+        memcpy(b->content, &txbuf[s->idx], b->nfull);
+
+        (void)fifo_get(ready);
+        (void)fifo_put(completed, b);
+
+        s->idx += b->nfull;
+    }
+    return (s->idx == s->txbuflen) ? 1 : 0;
+}
+#endif
+
 /* Return 0 if the sink is accepting more bytes, -1 if unexpected
  * bytes are on `ready`, 1 if the sink expects no more bytes.
  */
@@ -1106,11 +1133,6 @@ xmtr_loop(worker_t *w, session_t *s)
     x->payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
     x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
 
-    /* TBD only fill riov[] to the number of vectors we need.  Track the
-     * need in a new variable, `nriovs`.  Set the length of the last
-     * vector to the bytes remaining in `txbuf` after assigning bytes to
-     * the preceding vectors.
-     */
     for (i = 0; i < x->vector.msg.niovs; i++) {
         warnx("%s: received vector %zd "
             "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
