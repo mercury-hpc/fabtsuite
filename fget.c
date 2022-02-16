@@ -739,7 +739,7 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 
         s->idx += b->nfull;
     }
-    return (s->idx == s->txbuflen) ? 0 : 1;
+    return (s->idx == s->txbuflen) ? 1 : 0;
 }
 
 static session_t *
@@ -840,7 +840,7 @@ rcvr_loop(worker_t *w, session_t *s)
         (void)fifo_put(s->ready_for_terminal, b);
     }
 
-    if (sink_trade(t, s->ready_for_terminal, s->ready_for_cxn) != 0)
+    if (sink_trade(t, s->ready_for_terminal, s->ready_for_cxn) != 1)
         errx(EXIT_FAILURE, "unexpected received message");
 
 out:
