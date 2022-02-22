@@ -30,7 +30,14 @@ typedef struct initial_msg {
     nonce_t nonce;
     uint32_t nsources;
     uint32_t id;
+    uint32_t addrlen;
+    char addr[512];
 } initial_msg_t;
+
+typedef struct ack_msg {
+    uint32_t addrlen;
+    char addr[512];
+} ack_msg_t;
 
 typedef struct vector_msg {
     uint32_t niovs;
@@ -106,15 +113,25 @@ typedef struct worker worker_t;
 
 struct cxn {
     session_t *(*loop)(worker_t *, session_t *);
+    fi_addr_t peer_addr;
     struct fid_cq *cq;
+    struct fid_av *av;
 };
 
 typedef struct {
     cxn_t cxn;
     bool started;
-    struct fid_ep *aep;
+    struct fid_ep *ep;
     struct fid_eq *eq;
     fifo_t *rxfifo;
+    struct {
+        struct iovec iov[12];
+        void *desc[12];
+        struct fid_mr *mr[12];
+        uint64_t raddr[12];
+        ssize_t niovs;
+        ack_msg_t msg;
+    } ack;
     struct {
         struct iovec iov[12];
         void *desc[12];
@@ -138,6 +155,7 @@ typedef struct {
         uint64_t raddr[12];
         ssize_t niovs;
         progress_msg_t msg;
+        struct fi_context context;
     } progress;
     struct {
         struct iovec iov[12];
@@ -162,12 +180,18 @@ typedef struct {
     struct {
         void *desc;
         struct fid_mr *mr;
+        ack_msg_t msg;
+    } ack;
+    struct {
+        void *desc;
+        struct fid_mr *mr;
         vector_msg_t msg;
     } vector;
     struct {
         void *desc;
         struct fid_mr *mr;
         progress_msg_t msg;
+        struct fi_context context;
     } progress;
     struct {
         struct iovec iov[12];
@@ -177,6 +201,7 @@ typedef struct {
         struct fid_mr *mr[12];
         uint64_t raddr[12];
         ssize_t niovs;
+        struct fi_context context;
     } payload;
 } xmtr_t;
 
@@ -234,7 +259,8 @@ struct worker {
 
 typedef struct {
     struct fid_eq *listen_eq;
-    struct fid_pep *pep;
+    struct fid_ep *listen_ep;
+    struct fid_cq *listen_cq;
     sink_t sink;
     rcvr_t rcvr;
 } get_state_t;
@@ -632,9 +658,7 @@ static session_t *
 rcvr_start(worker_t *w, session_t *s)
 {
     rcvr_t *r = (rcvr_t *)s->cxn;
-    struct fi_cq_msg_entry completion;
     size_t i, nleftover, nloaded;
-    ssize_t ncompleted;
     int rc;
     buf_t *paybuf[16];
     size_t npaybufs = 0;
@@ -684,42 +708,11 @@ rcvr_start(worker_t *w, session_t *s)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "mr_regv_all");
 
-    /* Await initial message. */
-    do {
-        ncompleted = fi_cq_sread(r->cxn.cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
-
-    if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
-
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
-    }
-
-    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
-    }
-
-    if (completion.len != sizeof(r->initial.msg)) {
-        errx(EXIT_FAILURE,
-            "initially received %zu bytes, expected %zu\n", completion.len,
-            sizeof(r->initial.msg));
-    }
-
-    if (r->initial.msg.nsources != 1 || r->initial.msg.id != 0) {
-        errx(EXIT_FAILURE,
-            "received nsources %" PRIu32 ", id %" PRIu32 ", expected 1, 0\n",
-            r->initial.msg.nsources, r->initial.msg.id);
-    }
-
     return s;
 }
 
 #if 0
-/* Return 0 if the source is producing more bytes,
+/* Return 0 if the source is producing more bytes, 
  * 1 if the source will produce no more bytes.
  */
 static int
@@ -783,22 +776,42 @@ rcvr_loop(worker_t *w, session_t *s)
 
     /* Transmit vector. */
 
-    rc = fi_sendmsg(r->aep, &(struct fi_msg){
+    while ((rc = fi_sendmsg(r->ep, &(struct fi_msg){
           .msg_iov = r->vector.iov
         , .desc = r->vector.desc
         , .iov_count = r->vector.niovs
-        , .addr = 0
+        , .addr = r->cxn.peer_addr
         , .context = NULL
         , .data = 0
-        }, 0);
+        }, 0)) == -FI_EAGAIN) {
+
+        /* Await reply to initial message: first vector message. */
+        ncompleted = fi_cq_read(r->cxn.cq, &completion, 1);
+
+        if (ncompleted == -FI_EAGAIN)
+            continue;
+
+        if (ncompleted < 0)
+            bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+
+        if (ncompleted != 1) {
+            errx(EXIT_FAILURE,
+                "%s: expected 1 completion, read %zd", __func__, ncompleted);
+        }
+
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+    }
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_sendmsg");
 
     /* Await progress message. */
     do {
-        warnx("%s: awaiting progress message, context %p, last len %zu, count %zu", __func__,
-            (void *)&r->progress, r->progress.iov[r->progress.niovs - 1].iov_len, r->progress.niovs);
+        warnx("%s: awaiting progress message, context %p, "
+            "last len %zu, count %zu", __func__, (void *)&r->progress,
+            r->progress.iov[r->progress.niovs - 1].iov_len, r->progress.niovs);
         ncompleted = fi_cq_sread(r->cxn.cq, &completion, 1, NULL, -1);
     } while (ncompleted == -FI_EAGAIN);
 
@@ -876,7 +889,7 @@ out:
     struct fi_eq_cm_entry cm_entry;
     uint32_t event;
 
-    rc = fi_shutdown(r->aep, 0);
+    rc = fi_shutdown(r->ep, 0);
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_shutdown");
 
@@ -896,7 +909,7 @@ out:
     }
 
     warnx("%s: shutdown occurred, closing...", __func__);
-    rc = fi_close(&r->aep->fid);
+    rc = fi_close(&r->ep->fid);
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_close");
 
@@ -908,7 +921,9 @@ out:
 static session_t *
 xmtr_start(session_t *s)
 {
+    struct fi_cq_msg_entry completion;
     xmtr_t *x = (xmtr_t *)s->cxn;
+    ssize_t ncompleted;
     int rc;
 
     x->started = true;
@@ -917,11 +932,11 @@ xmtr_start(session_t *s)
     x->vector.desc = fi_mr_desc(x->vector.mr);
 
     rc = fi_recvmsg(x->ep, &(struct fi_msg){
-          .msg_iov = &(struct iovec){.iov_base = &x->vector.msg,
-                                     .iov_len = sizeof(x->vector.msg)}
-        , .desc = &x->vector.desc
+          .msg_iov = &(struct iovec){.iov_base = &x->ack.msg,
+                                     .iov_len = sizeof(x->ack.msg)}
+        , .desc = &x->ack.desc
         , .iov_count = 1
-        , .addr = 0
+        , .addr = x->cxn.peer_addr
         , .context = NULL
         , .data = 0
         }, FI_COMPLETION);
@@ -929,25 +944,87 @@ xmtr_start(session_t *s)
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
 
-    /* Setup & transmit initial message. */
-    memset(&x->initial.msg, 0, sizeof(x->initial.msg));
-    x->initial.msg.nsources = 1;
-    x->initial.msg.id = 0;
-
-    x->initial.desc = fi_mr_desc(x->initial.mr);
-
-    rc = fi_sendmsg(x->ep, &(struct fi_msg){
+    /* Transmit initial message. */
+    while ((rc = fi_sendmsg(x->ep, &(struct fi_msg){
           .msg_iov = &(struct iovec){.iov_base = &x->initial.msg,
                                      .iov_len = sizeof(x->initial.msg)}
         , .desc = &x->initial.desc
         , .iov_count = 1
-        , .addr = 0
+        , .addr = x->cxn.peer_addr
         , .context = NULL
         , .data = 0
-        }, 0);
+        }, 0)) == -FI_EAGAIN) {
+
+        /* Await reply to initial message: first vector message. */
+        ncompleted = fi_cq_read(x->cxn.cq, &completion, 1);
+
+        if (ncompleted == -FI_EAGAIN)
+            continue;
+
+        if (ncompleted < 0)
+            bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+
+        if (ncompleted != 1) {
+            errx(EXIT_FAILURE,
+                "%s: expected 1 completion, read %zd", __func__, ncompleted);
+        }
+
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+    }
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_sendmsg");
+
+    /* Await reply to initial message: first ack message. */
+    do {
+        warnx("%s: awaiting ack message reception", __func__);
+        ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
+    } while (ncompleted == -FI_EAGAIN);
+
+    if (ncompleted < 0)
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+
+    if (ncompleted != 1) {
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
+    }
+
+    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+    }
+
+    if (completion.len != sizeof(x->ack.msg))
+        errx(EXIT_SUCCESS, "%s: ack is incorrect size", __func__);
+
+    fi_addr_t oaddr = x->cxn.peer_addr;
+    rc = fi_av_insert(x->cxn.av, x->ack.msg.addr, 1, &x->cxn.peer_addr,
+        0, NULL);
+
+    if (rc < 0) {
+        bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p", x->ack.msg.addr);
+    }
+
+    rc = fi_av_remove(x->cxn.av, &oaddr, 1, 0);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_av_remove old dest_addr");
+
+    rc = fi_recvmsg(x->ep, &(struct fi_msg){
+          .msg_iov = &(struct iovec){.iov_base = &x->vector.msg,
+                                     .iov_len = sizeof(x->vector.msg)}
+        , .desc = &x->vector.desc
+        , .iov_count = 1
+        , .addr = x->cxn.peer_addr
+        , .context = NULL
+        , .data = 0
+        }, FI_COMPLETION);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_recvmsg");
 
     return s;
 }
@@ -967,7 +1044,8 @@ typedef struct write_fully_params {
     size_t len;
     size_t maxsegs;
     uint64_t flags;
-    void *context;
+    fi_addr_t addr;
+    struct fi_context *context;
 } write_fully_params_t;
 
 static ssize_t
@@ -1014,15 +1092,16 @@ write_fully(write_fully_params_t p)
 
     nsegs.remote = i;
 
-    struct fi_msg_rma mrma;
-    mrma.msg_iov = p.iov_out;
-    mrma.desc = p.desc_out;
-    mrma.iov_count = nsegs.local;
-    mrma.addr = 0;
-    mrma.rma_iov = p.riov_out;
-    mrma.rma_iov_count = nsegs.remote;
-    mrma.context = p.context;
-    mrma.data = 0;
+    struct fi_msg_rma mrma = {
+      .msg_iov = p.iov_out
+    , .desc = p.desc_out
+    , .iov_count = nsegs.local
+    , .addr = p.addr
+    , .rma_iov = p.riov_out
+    , .rma_iov_count = nsegs.remote
+    , .context = p.context
+    , .data = 0
+    };
 
     rc = fi_writemsg(p.ep, &mrma, p.flags);
 
@@ -1165,7 +1244,8 @@ xmtr_loop(worker_t *w, session_t *s)
             .len = txbuflen - total,
             .maxsegs = minsize(w->rma_maxsegs, x->vector.msg.niovs),
             .flags = FI_COMPLETION | FI_DELIVERY_COMPLETE,
-            .context = &x->payload};
+            .context = &x->payload.context,
+            .addr = x->cxn.peer_addr};
 
         nwritten = write_fully(p);
 
@@ -1219,8 +1299,8 @@ xmtr_loop(worker_t *w, session_t *s)
           .msg_iov = &iov
         , .desc = &x->progress.desc
         , .iov_count = 1
-        , .addr = 0
-        , .context = &x->progress
+        , .addr = x->cxn.peer_addr
+        , .context = &x->progress.context
         , .data = 0
         }, FI_COMPLETION);
 
@@ -1670,18 +1750,20 @@ workers_join_all(void)
 }
 
 static void
-cxn_init(cxn_t *c, session_t *(*loop)(worker_t *, session_t *))
+cxn_init(cxn_t *c, struct fid_av *av,
+    session_t *(*loop)(worker_t *, session_t *))
 {
     memset(c, 0, sizeof(*c));
     c->loop = loop;
+    c->av = av;
 }
 
 static void
-xmtr_init(xmtr_t *x)
+xmtr_init(xmtr_t *x, struct fid_av *av)
 {
     memset(x, 0, sizeof(*x));
 
-    cxn_init(&x->cxn, xmtr_loop);
+    cxn_init(&x->cxn, av, xmtr_loop);
     x->started = false;
 }
 
@@ -1695,11 +1777,11 @@ sink_init(sink_t *s)
 }
 
 static void
-rcvr_init(rcvr_t *r)
+rcvr_init(rcvr_t *r, struct fid_av *av)
 {
     memset(r, 0, sizeof(*r));
 
-    cxn_init(&r->cxn, rcvr_loop);
+    cxn_init(&r->cxn, av, rcvr_loop);
     r->rxfifo = fifo_create(64);
     r->started = false;
 }
@@ -1707,6 +1789,15 @@ rcvr_init(rcvr_t *r)
 static int
 get(state_t *st)
 {
+    struct fi_av_attr av_attr = {
+      .type = FI_AV_UNSPEC
+    , .rx_ctx_bits = 0
+    , .count = 0
+    , .ep_per_node = 0
+    , .name = NULL
+    , .map_addr = NULL
+    , .flags = 0
+    };
     struct fi_cq_attr cq_attr = {
       .size = 128
     , .flags = 0
@@ -1723,17 +1814,23 @@ get(state_t *st)
     , .signaling_vector = 0     /* don't care */
     , .wait_set = NULL          /* don't care */
     };
-    struct fi_eq_cm_entry cm_entry;
+    struct fid_av *av;
     get_state_t *gst = &st->u.get;
     rcvr_t *r = &gst->rcvr;
     sink_t *s = &gst->sink;
     session_t sess;
+    struct fi_cq_msg_entry completion;
+    ssize_t ncompleted;
     worker_t *w;
     uint64_t next_key = 0;
-    uint32_t event;
     int rc;
 
-    rcvr_init(r);
+    rc = fi_av_open(st->domain, &av_attr, &av, NULL); 
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_av_open");
+
+    rcvr_init(r, av);
     sink_init(s);
 
     if (!session_init(&sess, &r->cxn, &s->terminal))
@@ -1747,6 +1844,28 @@ get(state_t *st)
             __func__, r->initial.niovs);
     }
 
+    rc = mr_regv_all(st->domain, r->initial.iov, r->initial.niovs,
+        minsize(2, st->mr_maxsegs), FI_RECV, 0, &next_key, 0,
+        r->initial.mr, r->initial.desc, r->initial.raddr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "mr_regv_all");
+
+    r->ack.niovs = fibonacci_iov_setup(&r->ack.msg,
+        sizeof(r->ack.msg), r->ack.iov, st->rx_maxsegs);
+
+    if (r->ack.niovs < 1) {
+        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
+            __func__, r->ack.niovs);
+    }
+
+    rc = mr_regv_all(st->domain, r->ack.iov, r->ack.niovs,
+        minsize(2, st->mr_maxsegs), FI_RECV, 0, &next_key, 0,
+        r->ack.mr, r->ack.desc, r->ack.raddr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "mr_regv_all");
+
     r->progress.niovs = fibonacci_iov_setup(&r->progress.msg,
         sizeof(r->progress.msg), r->progress.iov, st->rx_maxsegs);
 
@@ -1755,13 +1874,6 @@ get(state_t *st)
             __func__, r->progress.niovs);
     }
 
-    rc = mr_regv_all(st->domain, r->initial.iov, r->initial.niovs,
-        minsize(2, st->mr_maxsegs), FI_RECV, 0, &next_key, 0,
-        r->initial.mr, r->initial.desc, r->initial.raddr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "mr_regv_all");
-
     rc = mr_regv_all(st->domain, r->progress.iov, r->progress.niovs,
         minsize(2, st->mr_maxsegs), FI_RECV, 0, &next_key, 0,
         r->progress.mr, r->progress.desc, r->progress.raddr, NULL);
@@ -1769,81 +1881,42 @@ get(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "mr_regv_all");
 
-    rc = fi_passive_ep(st->fabric, st->info, &gst->pep, NULL);
+    rc = fi_endpoint(st->domain, st->info, &gst->listen_ep, NULL);
 
     if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_passive_ep");
+        bailout_for_ofi_ret(rc, "fi_endpoint");
 
     rc = fi_eq_open(st->fabric, &eq_attr, &gst->listen_eq, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open (listen)");
 
-    rc = fi_eq_open(st->fabric, &eq_attr, &r->eq, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_eq_open (active)");
-
-    rc = fi_pep_bind(gst->pep, &gst->listen_eq->fid, 0);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_pep_bind");
-
-    rc = fi_listen(gst->pep);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_listen");
-
-    do {
-        rc = fi_eq_sread(gst->listen_eq, &event, &cm_entry, sizeof(cm_entry),
-            -1 /* wait forever */, 0 /* flags */ );
-    } while (rc == -FI_EAGAIN);
-
-#if 0
-    if (rc == -FI_EINTR)
-        errx(EXIT_FAILURE, "%s: fi_eq_sread: interrupted", __func__);
-#endif
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_eq_sread");
-
-    if (event != FI_CONNREQ) {
-        errx(EXIT_FAILURE,
-            "%s: expected connreq event (%" PRIu32 "), received %" PRIu32,
-            __func__, FI_CONNREQ, event);
-    }
-
-    rc = fi_endpoint(st->domain, cm_entry.info, &r->aep, NULL);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_endpoint");
-
-    rc = fi_ep_bind(r->aep, &r->eq->fid, 0);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_ep_bind");
-
-    rc = fi_cq_open(st->domain, &cq_attr, &r->cxn.cq, NULL);
+    rc = fi_cq_open(st->domain, &cq_attr, &gst->listen_cq, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
-    rc = fi_ep_bind(r->aep, &r->cxn.cq->fid,
-        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT);
+    if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_cq->fid,
+        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
+        bailout_for_ofi_ret(rc, "fi_ep_bind (completion queue)");
 
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_ep_bind");
+    if ((rc = fi_eq_open(st->fabric, &eq_attr, &r->eq, NULL)) != 0)
+        bailout_for_ofi_ret(rc, "fi_eq_open (active)");
 
-    rc = fi_enable(r->aep);
+    if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_eq->fid, 0)) != 0)
+        bailout_for_ofi_ret(rc, "fi_ep_bind (event queue)");
 
-    if (rc != 0)
+    if ((rc = fi_ep_bind(gst->listen_ep, &av->fid, 0)) != 0)
+        bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
+
+    if ((rc = fi_enable(gst->listen_ep)) != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
 
-    rc = fi_recvmsg(r->aep, &(struct fi_msg){
+    rc = fi_recvmsg(gst->listen_ep, &(struct fi_msg){
           .msg_iov = r->initial.iov
         , .desc = r->initial.desc
         , .iov_count = r->initial.niovs
-        , .addr = 0
+        , .addr = r->cxn.peer_addr
         , .context = NULL
         , .data = 0
         }, FI_COMPLETION);
@@ -1851,21 +1924,8 @@ get(state_t *st)
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
 
-    rc = fi_recvmsg(r->aep, &(struct fi_msg){
-          .msg_iov = r->progress.iov
-        , .desc = r->progress.desc
-        , .iov_count = r->progress.niovs
-        , .addr = 0
-        , .context = &r->progress
-        , .data = 0
-        }, FI_COMPLETION);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_recvmsg");
-
-    rc = fi_accept(r->aep, NULL, 0);
-
-    if (rc < 0)
+#if 0
+    if ((rc = fi_accept(r->ep, NULL, 0)) < 0)
         bailout_for_ofi_ret(rc, "fi_accept");
 
     fi_freeinfo(cm_entry.info);
@@ -1883,6 +1943,131 @@ get(state_t *st)
             "%s: expected connected event (%" PRIu32 "), received %" PRIu32,
             __func__, FI_CONNECTED, event);
     }
+#endif
+
+    /* Await initial message. */
+    do {
+        ncompleted = fi_cq_sread(gst->listen_cq, &completion, 1, NULL, -1);
+    } while (ncompleted == -FI_EAGAIN);
+
+    if (ncompleted < 0)
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+
+    if (ncompleted != 1) {
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
+    }
+
+    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+    }
+
+    if (completion.len != sizeof(r->initial.msg)) {
+        errx(EXIT_FAILURE,
+            "initially received %zu bytes, expected %zu\n", completion.len,
+            sizeof(r->initial.msg));
+    }
+
+    if (r->initial.msg.nsources != 1 || r->initial.msg.id != 0) {
+        errx(EXIT_FAILURE,
+            "received nsources %" PRIu32 ", id %" PRIu32 ", expected 1, 0\n",
+            r->initial.msg.nsources, r->initial.msg.id);
+    }
+
+    rc = fi_av_insert(r->cxn.av, r->initial.msg.addr, 1, &r->cxn.peer_addr,
+        0, NULL);
+
+    if (rc < 0) {
+        bailout_for_ofi_ret(rc, "fi_av_insert initial.msg.addr %p",
+            r->initial.msg.addr);
+    }
+
+    struct fi_info *ep_info, *hints = fi_dupinfo(st->info);
+
+    hints->dest_addr = r->initial.msg.addr;
+    hints->dest_addrlen = r->initial.msg.addrlen;
+    hints->src_addr = NULL;
+    hints->src_addrlen = 0;
+
+    rc = fi_getinfo(FI_VERSION(1, 13), NULL, NULL, 0, hints, &ep_info);
+
+    if ((rc = fi_endpoint(st->domain, ep_info, &r->ep, NULL)) < 0)
+        bailout_for_ofi_ret(rc, "fi_endpoint");
+
+    hints->dest_addr = NULL;    // fi_freeinfo wants to free(3) dest_addr
+    hints->dest_addrlen = 0;
+    fi_freeinfo(hints);
+
+    fi_freeinfo(ep_info);
+
+    if ((rc = fi_ep_bind(r->ep, &r->eq->fid, 0)) < 0)
+        bailout_for_ofi_ret(rc, "fi_ep_bind");
+
+    if ((rc = fi_cq_open(st->domain, &cq_attr, &r->cxn.cq, NULL)) != 0)
+        bailout_for_ofi_ret(rc, "fi_cq_open");
+
+    if ((rc = fi_ep_bind(r->ep, &r->cxn.cq->fid,
+        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
+        bailout_for_ofi_ret(rc, "fi_ep_bind");
+
+    if ((rc = fi_ep_bind(r->ep, &av->fid, 0)) != 0)
+        bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
+
+    if ((rc = fi_enable(r->ep)) != 0)
+        bailout_for_ofi_ret(rc, "fi_enable");
+
+    rc = fi_recvmsg(r->ep, &(struct fi_msg){
+          .msg_iov = r->progress.iov
+        , .desc = r->progress.desc
+        , .iov_count = r->progress.niovs
+        , .addr = r->cxn.peer_addr
+        , .context = &r->progress.context
+        , .data = 0
+        }, FI_COMPLETION);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_recvmsg");
+
+    size_t addrlen = sizeof(r->ack.msg.addr);
+
+    rc = fi_getname(&r->ep->fid, r->ack.msg.addr, &addrlen);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_getname");
+
+    r->ack.msg.addrlen = (uint32_t)addrlen;
+
+    while ((rc = fi_sendmsg(r->ep, &(struct fi_msg){
+          .msg_iov = r->ack.iov
+        , .desc = r->ack.desc
+        , .iov_count = r->ack.niovs
+        , .addr = r->cxn.peer_addr
+        , .context = NULL
+        , .data = 0
+        }, 0)) == -FI_EAGAIN) {
+        /* Await reply to initial message: first vector message. */
+        ncompleted = fi_cq_read(r->cxn.cq, &completion, 1);
+
+        if (ncompleted == -FI_EAGAIN)
+            continue;
+
+        if (ncompleted < 0)
+            bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+
+        if (ncompleted != 1) {
+            errx(EXIT_FAILURE,
+                "%s: expected 1 completion, read %zd", __func__, ncompleted);
+        }
+
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+    }
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_sendmsg");
 
     if ((w = workers_assign_session(st, &sess)) == NULL) {
         errx(EXIT_FAILURE, "%s: could not assign a new receiver to a worker",
@@ -1897,6 +2082,15 @@ get(state_t *st)
 static int
 put(state_t *st)
 {
+    struct fi_av_attr av_attr = {
+      .type = FI_AV_UNSPEC
+    , .rx_ctx_bits = 0
+    , .count = 0
+    , .ep_per_node = 0
+    , .name = NULL
+    , .map_addr = NULL
+    , .flags = 0
+    };
     struct fi_cq_attr cq_attr = {
       .size = 128
     , .flags = 0
@@ -1913,24 +2107,34 @@ put(state_t *st)
     , .signaling_vector = 0     /* don't care */
     , .wait_set = NULL          /* don't care */
     };
-    struct fi_eq_cm_entry cm_entry;
+    session_t sess;
     put_state_t *pst = &st->u.put;
     xmtr_t *x = &pst->xmtr;
     source_t *s = &pst->source;
-    session_t sess;
+    struct fid_av *av;
     worker_t *w;
     uint64_t next_key = 0;
-    uint32_t event;
     int rc;
     const size_t txbuflen = strlen(txbuf);
 
-    xmtr_init(x);
+    rc = fi_av_open(st->domain, &av_attr, &av, NULL); 
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_av_open");
+
+    xmtr_init(x, av);
 
     if (!session_init(&sess, &x->cxn, &s->terminal))
         errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
 
     rc = fi_mr_reg(st->domain, &x->initial.msg, sizeof(x->initial.msg),
         FI_SEND, 0, next_key++, 0, &x->initial.mr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_mr_reg");
+
+    rc = fi_mr_reg(st->domain, &x->ack.msg, sizeof(x->ack.msg),
+        FI_SEND, 0, next_key++, 0, &x->ack.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
@@ -1979,29 +2183,36 @@ put(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
+    if ((rc = fi_ep_bind(x->ep, &av->fid, 0)) != 0)
+        bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
+
     rc = fi_enable(x->ep);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
 
-    rc = fi_connect(x->ep, st->info->dest_addr, NULL, 0);
+    rc = fi_av_insert(av, st->info->dest_addr, 1, &x->cxn.peer_addr, 0, NULL);
+
+    if (rc < 0) {
+        bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p",
+            st->info->dest_addr);
+    }
+
+    /* Setup initial message. */
+    memset(&x->initial.msg, 0, sizeof(x->initial.msg));
+    x->initial.msg.nsources = 1;
+    x->initial.msg.id = 0;
+
+    x->initial.desc = fi_mr_desc(x->initial.mr);
+
+    size_t addrlen = sizeof(x->initial.msg.addr);
+
+    rc = fi_getname(&x->ep->fid, x->initial.msg.addr, &addrlen);
 
     if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_connect dest_addr %p", st->info->dest_addr);
+        bailout_for_ofi_ret(rc, "fi_getname");
 
-    do {
-        rc = fi_eq_sread(x->eq, &event, &cm_entry, sizeof(cm_entry),
-            -1 /* wait forever */, 0 /* flags */ );
-    } while (rc == -FI_EAGAIN);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_eq_sread");
-
-    if (event != FI_CONNECTED) {
-        errx(EXIT_FAILURE,
-            "%s: expected connected event (%" PRIu32 "), received %" PRIu32,
-            __func__, FI_CONNECTED, event);
-    }
+    x->initial.msg.addrlen = (uint32_t)addrlen;
 
     if ((w = workers_assign_session(st, &sess)) == NULL) {
         errx(EXIT_FAILURE, "%s: could not assign a new transmitter to a worker",
@@ -2064,7 +2275,7 @@ main(int argc, char **argv)
     if ((hints = fi_allocinfo()) == NULL)
         errx(EXIT_FAILURE, "%s: fi_allocinfo", __func__);
 
-    hints->ep_attr->type = FI_EP_MSG;
+    hints->ep_attr->type = FI_EP_RDM;
     hints->caps = FI_MSG | FI_RMA | FI_REMOTE_WRITE | FI_WRITE;
     hints->mode = FI_CONTEXT;
     hints->domain_attr->mr_mode = FI_MR_PROV_KEY;
