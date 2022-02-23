@@ -921,8 +921,8 @@ rcvr_loop(worker_t *w, session_t *s)
 out:
 
     warnx("%s: closing...", __func__);
-    rc = fi_close(&r->ep->fid);
-    if (rc < 0)
+
+    if ((rc = fi_close(&r->ep->fid)) < 0)
         bailout_for_ofi_ret(rc, "fi_close");
 
     warnx("%s: closed.", __func__);
@@ -1303,8 +1303,11 @@ xmtr_loop(worker_t *w, session_t *s)
 
     x->progress.desc = fi_mr_desc(x->progress.mr);
 
-    struct iovec iov = {.iov_base = &x->progress.msg,
-                                     .iov_len = sizeof(x->progress.msg)};
+    struct iovec iov = {
+      .iov_base = &x->progress.msg
+    , .iov_len = sizeof(x->progress.msg)
+    };
+
     rc = fi_sendmsg(x->ep, &(struct fi_msg){
           .msg_iov = &iov
         , .desc = &x->progress.desc
