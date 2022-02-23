@@ -232,6 +232,10 @@ struct session {
     fifo_t *ready_for_terminal;
 };
 
+typedef struct keysource {
+    uint64_t next_key;
+} keysource_t;
+
 struct worker {
     pthread_t thd;
     struct fid_domain *dom;
@@ -251,7 +255,7 @@ struct worker {
         buflist_t *tx;
         buflist_t *rx;
     } freebufs;    /* Reservoirs for free buffers. */
-    uint64_t next_key;
+    keysource_t keys;
     size_t mr_maxsegs;
     size_t rma_maxsegs;
     size_t rx_maxsegs;
@@ -282,6 +286,7 @@ typedef struct {
     size_t rx_maxsegs;
     size_t tx_maxsegs;
     size_t rma_maxsegs;
+    keysource_t keys;
 } state_t;
 
 typedef int (*personality_t)(state_t *);
@@ -480,15 +485,21 @@ session_init(session_t *s, cxn_t *c, terminal_t *t)
     return s;
 }
 
-static uint64_t
-worker_next_key(worker_t *w)
+static void
+keysource_init(keysource_t *s)
 {
-    if (w->next_key % 256 == 0) {
-            w->next_key = atomic_fetch_add_explicit(&next_key_pool, 256,
+    memset(s, 0, sizeof(*s));
+}
+
+static uint64_t
+keysource_next(keysource_t *s)
+{
+    if (s->next_key % 256 == 0) {
+            s->next_key = atomic_fetch_add_explicit(&next_key_pool, 256,
                 memory_order_relaxed);
     }
 
-    return w->next_key++;
+    return s->next_key++;
 }
 
 static bool
@@ -541,7 +552,7 @@ worker_buflist_replenish(worker_t *w, buflist_t *bl)
         buf->nfull = 0;
 
         rc = fi_mr_reg(w->dom, buf->content, buflen,
-            bl->access, 0, worker_next_key(w), 0, &buf->mr, NULL);
+            bl->access, 0, keysource_next(&w->keys), 0, &buf->mr, NULL);
 
         if (rc != 0) {
             warn_about_ofi_ret(rc, "fi_mr_reg");
@@ -610,13 +621,12 @@ fibonacci_iov_setup(void *_buf, size_t len, struct iovec *iov, size_t niovs)
 static int
 mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
     size_t niovs, size_t maxsegs, uint64_t access, uint64_t offset,
-    uint64_t *next_keyp, uint64_t flags, struct fid_mr **mrp,
+    keysource_t *keys, uint64_t flags, struct fid_mr **mrp,
     void **descp, uint64_t *raddrp, void *context)
 {
     int rc;
     size_t i, j, nregs = (niovs + maxsegs - 1) / maxsegs;
     size_t nleftover;
-    uint64_t next_key = *next_keyp;
 
     for (nleftover = niovs, i = 0;
          i < nregs;
@@ -629,7 +639,7 @@ mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
         warnx("%zu remaining I/O vectors", nleftover);
 
         rc = fi_mr_regv(domain, iov, nsegs,
-            access, offset, next_key++, flags, &mr, context);
+            access, offset, keysource_next(keys), flags, &mr, context);
 
         if (rc != 0)
             goto err;
@@ -642,8 +652,6 @@ mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
             raddr += iov[j].iov_len;
         }
     }
-
-    *next_keyp = next_key;
 
     return 0;
 
@@ -662,7 +670,6 @@ rcvr_start(worker_t *w, session_t *s)
     int rc;
     buf_t *paybuf[16];
     size_t npaybufs = 0;
-    uint64_t next_key = 256;
 
     r->started = true;
 
@@ -702,7 +709,7 @@ rcvr_start(worker_t *w, session_t *s)
     }
 
     rc = mr_regv_all(w->dom, r->vector.iov, r->vector.niovs,
-        minsize(2, w->mr_maxsegs), FI_SEND, 0, &next_key, 0,
+        minsize(2, w->mr_maxsegs), FI_SEND, 0, &w->keys, 0,
         r->vector.mr, r->vector.desc, r->vector.raddr, NULL);
 
     if (rc != 0)
@@ -1531,6 +1538,7 @@ worker_init(worker_t *w, const state_t *st)
     w->mr_maxsegs = st->mr_maxsegs;
     w->rma_maxsegs = st->rma_maxsegs;
     w->rx_maxsegs = st->rx_maxsegs;
+    keysource_init(&w->keys);
 
     if ((rc = pthread_cond_init(&w->sleep, NULL)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_cond_init: %s", __func__, __LINE__,
@@ -1822,7 +1830,6 @@ get(state_t *st)
     struct fi_cq_msg_entry completion;
     ssize_t ncompleted;
     worker_t *w;
-    uint64_t next_key = 0;
     int rc;
 
     rc = fi_av_open(st->domain, &av_attr, &av, NULL); 
@@ -1845,7 +1852,7 @@ get(state_t *st)
     }
 
     rc = mr_regv_all(st->domain, r->initial.iov, r->initial.niovs,
-        minsize(2, st->mr_maxsegs), FI_RECV, 0, &next_key, 0,
+        minsize(2, st->mr_maxsegs), FI_RECV, 0, &st->keys, 0,
         r->initial.mr, r->initial.desc, r->initial.raddr, NULL);
 
     if (rc != 0)
@@ -1860,7 +1867,7 @@ get(state_t *st)
     }
 
     rc = mr_regv_all(st->domain, r->ack.iov, r->ack.niovs,
-        minsize(2, st->mr_maxsegs), FI_RECV, 0, &next_key, 0,
+        minsize(2, st->mr_maxsegs), FI_RECV, 0, &st->keys, 0,
         r->ack.mr, r->ack.desc, r->ack.raddr, NULL);
 
     if (rc != 0)
@@ -1875,7 +1882,7 @@ get(state_t *st)
     }
 
     rc = mr_regv_all(st->domain, r->progress.iov, r->progress.niovs,
-        minsize(2, st->mr_maxsegs), FI_RECV, 0, &next_key, 0,
+        minsize(2, st->mr_maxsegs), FI_RECV, 0, &st->keys, 0,
         r->progress.mr, r->progress.desc, r->progress.raddr, NULL);
 
     if (rc != 0)
@@ -2113,7 +2120,6 @@ put(state_t *st)
     source_t *s = &pst->source;
     struct fid_av *av;
     worker_t *w;
-    uint64_t next_key = 0;
     int rc;
     const size_t txbuflen = strlen(txbuf);
 
@@ -2128,31 +2134,31 @@ put(state_t *st)
         errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
 
     rc = fi_mr_reg(st->domain, &x->initial.msg, sizeof(x->initial.msg),
-        FI_SEND, 0, next_key++, 0, &x->initial.mr, NULL);
+        FI_SEND, 0, keysource_next(&st->keys), 0, &x->initial.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_mr_reg(st->domain, &x->ack.msg, sizeof(x->ack.msg),
-        FI_SEND, 0, next_key++, 0, &x->ack.mr, NULL);
+        FI_SEND, 0, keysource_next(&st->keys), 0, &x->ack.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_mr_reg(st->domain, &x->vector.msg, sizeof(x->vector.msg),
-        FI_RECV, 0, next_key++, 0, &x->vector.mr, NULL);
+        FI_RECV, 0, keysource_next(&st->keys), 0, &x->vector.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_mr_reg(st->domain, &x->progress.msg, sizeof(x->progress.msg),
-        FI_SEND, 0, next_key++, 0, &x->progress.mr, NULL);
+        FI_SEND, 0, keysource_next(&st->keys), 0, &x->progress.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_mr_reg(st->domain, txbuf, txbuflen,
-        FI_WRITE, 0, next_key++, 0, x->payload.mr, NULL);
+        FI_WRITE, 0, keysource_next(&st->keys), 0, x->payload.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
@@ -2269,6 +2275,8 @@ main(int argc, char **argv)
         errx(EXIT_FAILURE, "program personality '%s' is not implemented", prog);
 
     workers_initialize();
+
+    keysource_init(&st.keys);
 
     warnx("%ld POSIX I/O vector items maximum", sysconf(_SC_IOV_MAX));
 
