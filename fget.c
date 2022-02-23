@@ -1061,7 +1061,7 @@ typedef struct write_fully_params {
 } write_fully_params_t;
 
 static ssize_t
-write_fully(write_fully_params_t p)
+write_fully(const write_fully_params_t p)
 {
     ssize_t rc;
     size_t i, j, nremaining;
