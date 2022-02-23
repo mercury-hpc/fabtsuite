@@ -693,7 +693,7 @@ rcvr_start(worker_t *w, session_t *s)
         fprintf(stderr, "paybuf[%zu]->nfull = %zu\n", i, b->nfull);
         if (!fifo_put(r->rxfifo, b))
             errx(EXIT_FAILURE, "%s: could not re-queue rx buffer", __func__);
-        r->vector.msg.iov[i].addr = 0; // 
+        r->vector.msg.iov[i].addr = 0;
         r->vector.msg.iov[i].len = b->nfull;
         r->vector.msg.iov[i].key = fi_mr_key(b->mr);
     }
