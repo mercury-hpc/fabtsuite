@@ -80,12 +80,18 @@ typedef struct buflist {
 
 /* Communication terminals: sources and sinks */
 
+typedef enum {
+    tr_ready
+,   tr_end
+,   tr_error
+} trade_result_t;
+
 struct terminal;
 typedef struct terminal terminal_t;
 
 struct terminal {
     /* trade(t, ready, completed) */
-    int (*trade)(terminal_t *, fifo_t *, fifo_t *);
+    trade_result_t (*trade)(terminal_t *, fifo_t *, fifo_t *);
 };
 
 typedef struct {
@@ -123,6 +129,7 @@ typedef struct {
     bool started;
     struct fid_ep *ep;
     struct fid_eq *eq;
+    uint64_t nfull;
     fifo_t *rxfifo;
     struct {
         struct iovec iov[12];
@@ -748,7 +755,7 @@ source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 /* Return 0 if the sink is accepting more bytes, -1 if unexpected
  * bytes are on `ready`, 1 if the sink expects no more bytes.
  */
-static int
+static trade_result_t
 sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 {
     sink_t *s = (sink_t *)t;
@@ -797,58 +804,18 @@ truncate_iov(const truncate_iov_params_t p)
 }
 #endif
 
-static session_t *
-rcvr_loop(worker_t *w, session_t *s)
+static rcvr_t *
+rcvr_progress_rx(rcvr_t *r)
 {
-    rcvr_t *r = (rcvr_t *)s->cxn;
-    terminal_t *t = s->terminal;
     struct fi_cq_msg_entry completion;
     ssize_t ncompleted;
-    int rc;
 
-    if (!r->started)
-        return rcvr_start(w, s);
-
-    /* Transmit vector. */
-
-    while ((rc = fi_sendmsg(r->ep, &(struct fi_msg){
-          .msg_iov = r->vector.iov
-        , .desc = r->vector.desc
-        , .iov_count = r->vector.niovs
-        , .addr = r->cxn.peer_addr
-        , .context = NULL
-        , .data = 0
-        }, 0)) == -FI_EAGAIN) {
-
-        /* Await reply to initial message: first vector message. */
-        ncompleted = fi_cq_read(r->cxn.cq, &completion, 1);
-
-        if (ncompleted == -FI_EAGAIN)
-            continue;
-
-        if (ncompleted < 0)
-            bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
-
-        if (ncompleted != 1) {
-            errx(EXIT_FAILURE,
-                "%s: expected 1 completion, read %zd", __func__, ncompleted);
-        }
-
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
-    }
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_sendmsg");
-
-    /* Await progress message. */
-    do {
-        warnx("%s: awaiting progress message, context %p, "
-            "last len %zu, count %zu", __func__, (void *)&r->progress,
-            r->progress.iov[r->progress.niovs - 1].iov_len, r->progress.niovs);
-        ncompleted = fi_cq_sread(r->cxn.cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
+    /* Check for progress message arrival. */
+    warnx("%s: checking for progress message, context %p, "
+        "last len %zu, count %zu", __func__, (void *)&r->progress,
+        r->progress.iov[r->progress.niovs - 1].iov_len, r->progress.niovs);
+    if ((ncompleted = fi_cq_read(r->cxn.cq, &completion, 1)) == -FI_EAGAIN)
+        return r;
 
     if (ncompleted == -FI_EAVAIL) {
         struct fi_cq_err_entry e;
@@ -863,7 +830,7 @@ rcvr_loop(worker_t *w, session_t *s)
         warnx("%s: provider error %s", __func__,
             fi_cq_strerror(r->cxn.cq, e.prov_errno, e.err_data, errbuf,
                 sizeof(errbuf)));
-        goto out;
+        return NULL;
     } else if (ncompleted < 0)
         bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
 
@@ -884,7 +851,8 @@ rcvr_loop(worker_t *w, session_t *s)
             sizeof(r->progress.msg));
     }
 
-    if (r->progress.msg.nfilled != strlen(txbuf)) {
+    r->nfull += r->progress.msg.nfilled;
+    if (r->nfull != strlen(txbuf)) {
         errx(EXIT_FAILURE,
             "progress: %" PRIu64 " bytes filled, expected %" PRIu64 "\n",
             r->progress.msg.nfilled,
@@ -897,9 +865,43 @@ rcvr_loop(worker_t *w, session_t *s)
             r->progress.msg.nleftover);
     }
 
+    return r;
+}
+
+static session_t *
+rcvr_loop(worker_t *w, session_t *s)
+{
+    rcvr_t *r = (rcvr_t *)s->cxn;
+    terminal_t *t = s->terminal;
+    int rc;
+
+    if (!r->started)
+        return rcvr_start(w, s);
+
+    /* Transmit vector. */
+
+    if (r->vector.msg.niovs == 0)
+        ; // nothing to do
+    else if ((rc = fi_sendmsg(r->ep, &(struct fi_msg){
+          .msg_iov = r->vector.iov
+        , .desc = r->vector.desc
+        , .iov_count = r->vector.niovs
+        , .addr = r->cxn.peer_addr
+        , .context = NULL
+        , .data = 0
+        }, 0)) == -FI_EAGAIN)
+        return s;
+    else if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_sendmsg");
+    else
+        r->vector.msg.niovs = 0;
+
+    if (rcvr_progress_rx(r) == NULL)
+        goto out;
+
     size_t nremaining;
 
-    for (nremaining = r->progress.msg.nfilled;
+    for (nremaining = r->nfull;
          nremaining > 0 && !fifo_full(s->ready_for_terminal); ) {
         buf_t *b = fifo_peek(r->rxfifo);
 
@@ -915,19 +917,20 @@ rcvr_loop(worker_t *w, session_t *s)
         (void)fifo_put(s->ready_for_terminal, b);
     }
 
-    if (sink_trade(t, s->ready_for_terminal, s->ready_for_cxn) != 1)
-        errx(EXIT_FAILURE, "unexpected received message");
-
 out:
-
-    warnx("%s: closing...", __func__);
-
-    if ((rc = fi_close(&r->ep->fid)) < 0)
-        bailout_for_ofi_ret(rc, "fi_close");
-
-    warnx("%s: closed.", __func__);
-
-    return NULL;
+    switch (sink_trade(t, s->ready_for_terminal, s->ready_for_cxn)) {
+    case tr_ready:
+        return s;
+    case tr_error:
+    default:
+        warnx("unexpected received message");
+        /* FALLTHROUGH */
+    case tr_end:
+        if ((rc = fi_close(&r->ep->fid)) < 0)
+            bailout_for_ofi_ret(rc, "fi_close");
+        warnx("%s: closed.", __func__);
+        return NULL;
+    }
 }
 
 static session_t *
@@ -1365,6 +1368,7 @@ out:
 static session_t *
 cxn_loop(worker_t *w, session_t *s)
 {
+    warnx("%s: going around", __func__);
     return s->cxn->loop(w, s);
 }
 
@@ -1374,14 +1378,22 @@ worker_run_loop(worker_t *self)
     size_t half, i;
 
     for (half = 0; half < 2; half++) {
+        void *context;
         pthread_mutex_t *mtx = &self->mtx[half];
+        int rc;
 
         if (pthread_mutex_trylock(mtx) == EBUSY)
             continue;
 
-        // find a non-empty receiver slot
+        if ((rc = fi_poll(self->pollset[half], &context, 1)) < 0) {
+            (void)pthread_mutex_unlock(mtx);
+            bailout_for_ofi_ret(rc, "fi_poll");
+        }
+
+        /* Find a non-empty session slot and go once through
+         * connection & terminal loops.
+         */
         for (i = 0; i < arraycount(self->session) / 2; i++) {
-            int rc;
             session_t *s;
             cxn_t *c, **cp;
 
