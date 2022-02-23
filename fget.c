@@ -892,30 +892,7 @@ rcvr_loop(worker_t *w, session_t *s)
 
 out:
 
-    warnx("%s: shutting down connection", __func__);
-    struct fi_eq_cm_entry cm_entry;
-    uint32_t event;
-
-    rc = fi_shutdown(r->ep, 0);
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_shutdown");
-
-    do {
-        warnx("%s: awaiting shutdown", __func__);
-        rc = fi_eq_sread(r->eq, &event, &cm_entry, sizeof(cm_entry),
-            -1 /* wait forever */, 0 /* flags */ );
-    } while (rc == -FI_EAGAIN);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_eq_sread");
-
-    if (event != FI_SHUTDOWN) {
-        errx(EXIT_FAILURE,
-            "%s: expected connected event (%" PRIu32 "), received %" PRIu32,
-            __func__, FI_SHUTDOWN, event);
-    }
-
-    warnx("%s: shutdown occurred, closing...", __func__);
+    warnx("%s: closing...", __func__);
     rc = fi_close(&r->ep->fid);
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_close");
@@ -1152,14 +1129,12 @@ write_fully(write_fully_params_t p)
 static session_t *
 xmtr_loop(worker_t *w, session_t *s)
 {
-    struct fi_eq_cm_entry cm_entry;
     xmtr_t *x = (xmtr_t *)s->cxn;
     struct fi_rma_iov riov[12], riov2[12];
     struct fi_cq_msg_entry completion;
     const size_t txbuflen = strlen(txbuf);
     size_t i, orig_nriovs;
     ssize_t ncompleted, rc;
-    uint32_t event;
 
     if (!x->started)
         return xmtr_start(s);
@@ -1352,27 +1327,6 @@ xmtr_loop(worker_t *w, session_t *s)
     warnx("sent %zu-byte progress message", sizeof(x->progress.msg));
 
 out:
-
-    warnx("%s: shutting down connection", __func__);
-
-    rc = fi_shutdown(x->ep, 0);
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_shutdown");
-
-    do {
-        warnx("%s: awaiting peer shutdown", __func__);
-        rc = fi_eq_sread(x->eq, &event, &cm_entry, sizeof(cm_entry),
-            -1 /* wait forever */, 0 /* flags */ );
-    } while (rc == -FI_EAGAIN);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_eq_sread");
-
-    if (event != FI_SHUTDOWN) {
-        errx(EXIT_FAILURE,
-            "%s: expected connected event (%" PRIu32 "), received %" PRIu32,
-            __func__, FI_SHUTDOWN, event);
-    }
 
     return NULL;
 }
