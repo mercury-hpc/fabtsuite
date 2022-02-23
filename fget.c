@@ -1752,11 +1752,49 @@ cxn_init(cxn_t *c, struct fid_av *av,
 }
 
 static void
-xmtr_init(xmtr_t *x, struct fid_av *av)
+xmtr_memory_init(state_t *st, xmtr_t *x)
+{
+    const size_t txbuflen = strlen(txbuf);
+    int rc;
+
+    rc = fi_mr_reg(st->domain, &x->initial.msg, sizeof(x->initial.msg),
+        FI_SEND, 0, keysource_next(&st->keys), 0, &x->initial.mr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_mr_reg");
+
+    rc = fi_mr_reg(st->domain, &x->ack.msg, sizeof(x->ack.msg),
+        FI_RECV, 0, keysource_next(&st->keys), 0, &x->ack.mr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_mr_reg");
+
+    rc = fi_mr_reg(st->domain, &x->vector.msg, sizeof(x->vector.msg),
+        FI_RECV, 0, keysource_next(&st->keys), 0, &x->vector.mr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_mr_reg");
+
+    rc = fi_mr_reg(st->domain, &x->progress.msg, sizeof(x->progress.msg),
+        FI_SEND, 0, keysource_next(&st->keys), 0, &x->progress.mr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_mr_reg");
+
+    rc = fi_mr_reg(st->domain, txbuf, txbuflen,
+        FI_WRITE, 0, keysource_next(&st->keys), 0, x->payload.mr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_mr_reg");
+}
+
+static void
+xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
 {
     memset(x, 0, sizeof(*x));
 
     cxn_init(&x->cxn, av, xmtr_loop);
+    xmtr_memory_init(st, x);
     x->started = false;
 }
 
@@ -1770,11 +1808,63 @@ sink_init(sink_t *s)
 }
 
 static void
-rcvr_init(rcvr_t *r, struct fid_av *av)
+rcvr_memory_init(state_t *st, rcvr_t *r)
+{
+    int rc;
+
+    r->initial.niovs = fibonacci_iov_setup(&r->initial.msg,
+        sizeof(r->initial.msg), r->initial.iov, st->rx_maxsegs);
+
+    if (r->initial.niovs < 1) {
+        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
+            __func__, r->initial.niovs);
+    }
+
+    rc = mr_regv_all(st->domain, r->initial.iov, r->initial.niovs,
+        minsize(2, st->mr_maxsegs), FI_RECV, 0, &st->keys, 0,
+        r->initial.mr, r->initial.desc, r->initial.raddr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "mr_regv_all");
+
+    r->ack.niovs = fibonacci_iov_setup(&r->ack.msg,
+        sizeof(r->ack.msg), r->ack.iov, st->rx_maxsegs);
+
+    if (r->ack.niovs < 1) {
+        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
+            __func__, r->ack.niovs);
+    }
+
+    rc = mr_regv_all(st->domain, r->ack.iov, r->ack.niovs,
+        minsize(2, st->mr_maxsegs), FI_RECV, 0, &st->keys, 0,
+        r->ack.mr, r->ack.desc, r->ack.raddr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "mr_regv_all");
+
+    r->progress.niovs = fibonacci_iov_setup(&r->progress.msg,
+        sizeof(r->progress.msg), r->progress.iov, st->rx_maxsegs);
+
+    if (r->progress.niovs < 1) {
+        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
+            __func__, r->progress.niovs);
+    }
+
+    rc = mr_regv_all(st->domain, r->progress.iov, r->progress.niovs,
+        minsize(2, st->mr_maxsegs), FI_RECV, 0, &st->keys, 0,
+        r->progress.mr, r->progress.desc, r->progress.raddr, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "mr_regv_all");
+}
+
+static void
+rcvr_init(state_t *st, rcvr_t *r, struct fid_av *av)
 {
     memset(r, 0, sizeof(*r));
 
     cxn_init(&r->cxn, av, rcvr_loop);
+    rcvr_memory_init(st, r);
     r->rxfifo = fifo_create(64);
     r->started = false;
 }
@@ -1822,56 +1912,11 @@ get(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_av_open");
 
-    rcvr_init(r, av);
+    rcvr_init(st, r, av);
     sink_init(s);
 
     if (!session_init(&sess, &r->cxn, &s->terminal))
         errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
-
-    r->initial.niovs = fibonacci_iov_setup(&r->initial.msg,
-        sizeof(r->initial.msg), r->initial.iov, st->rx_maxsegs);
-
-    if (r->initial.niovs < 1) {
-        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
-            __func__, r->initial.niovs);
-    }
-
-    rc = mr_regv_all(st->domain, r->initial.iov, r->initial.niovs,
-        minsize(2, st->mr_maxsegs), FI_RECV, 0, &st->keys, 0,
-        r->initial.mr, r->initial.desc, r->initial.raddr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "mr_regv_all");
-
-    r->ack.niovs = fibonacci_iov_setup(&r->ack.msg,
-        sizeof(r->ack.msg), r->ack.iov, st->rx_maxsegs);
-
-    if (r->ack.niovs < 1) {
-        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
-            __func__, r->ack.niovs);
-    }
-
-    rc = mr_regv_all(st->domain, r->ack.iov, r->ack.niovs,
-        minsize(2, st->mr_maxsegs), FI_RECV, 0, &st->keys, 0,
-        r->ack.mr, r->ack.desc, r->ack.raddr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "mr_regv_all");
-
-    r->progress.niovs = fibonacci_iov_setup(&r->progress.msg,
-        sizeof(r->progress.msg), r->progress.iov, st->rx_maxsegs);
-
-    if (r->progress.niovs < 1) {
-        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
-            __func__, r->progress.niovs);
-    }
-
-    rc = mr_regv_all(st->domain, r->progress.iov, r->progress.niovs,
-        minsize(2, st->mr_maxsegs), FI_RECV, 0, &st->keys, 0,
-        r->progress.mr, r->progress.desc, r->progress.raddr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "mr_regv_all");
 
     rc = fi_endpoint(st->domain, st->info, &gst->listen_ep, NULL);
 
@@ -2106,47 +2151,16 @@ put(state_t *st)
     struct fid_av *av;
     worker_t *w;
     int rc;
-    const size_t txbuflen = strlen(txbuf);
 
     rc = fi_av_open(st->domain, &av_attr, &av, NULL); 
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_av_open");
 
-    xmtr_init(x, av);
+    xmtr_init(st, x, av);
 
     if (!session_init(&sess, &x->cxn, &s->terminal))
         errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
-
-    rc = fi_mr_reg(st->domain, &x->initial.msg, sizeof(x->initial.msg),
-        FI_SEND, 0, keysource_next(&st->keys), 0, &x->initial.mr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_mr_reg");
-
-    rc = fi_mr_reg(st->domain, &x->ack.msg, sizeof(x->ack.msg),
-        FI_SEND, 0, keysource_next(&st->keys), 0, &x->ack.mr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_mr_reg");
-
-    rc = fi_mr_reg(st->domain, &x->vector.msg, sizeof(x->vector.msg),
-        FI_RECV, 0, keysource_next(&st->keys), 0, &x->vector.mr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_mr_reg");
-
-    rc = fi_mr_reg(st->domain, &x->progress.msg, sizeof(x->progress.msg),
-        FI_SEND, 0, keysource_next(&st->keys), 0, &x->progress.mr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_mr_reg");
-
-    rc = fi_mr_reg(st->domain, txbuf, txbuflen,
-        FI_WRITE, 0, keysource_next(&st->keys), 0, x->payload.mr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_endpoint(st->domain, st->info, &x->ep, NULL);
 
