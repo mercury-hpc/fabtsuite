@@ -769,6 +769,34 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
     return (s->idx == s->txbuflen) ? 1 : 0;
 }
 
+#if 0
+typedef struct truncate_iov_params {
+    struct iovec *iov_out;
+    size_t *niovs_out;
+    const struct iovec *iov_in;
+    size_t niovs_in;
+    size_t bytelimit;
+} truncate_iov_params_t;
+
+static void
+truncate_iov(const truncate_iov_params_t p)
+{
+    size_t i, nremaining;
+
+    for (i = 0, nremaining = p.bytelimit;
+         i < p.niovs_in && nremaining > 0;
+         i++) {
+        size_t len = minsize(nremaining, p.iov_in[i].iov_len);
+
+        p.iov_out[i].iov_base = p.iov_in[i].iov_base;
+        p.iov_out[i].iov_len = len;
+        nremaining -= len;
+    }
+
+    *p.niovs_out = i;
+}
+#endif
+
 static session_t *
 rcvr_loop(worker_t *w, session_t *s)
 {
