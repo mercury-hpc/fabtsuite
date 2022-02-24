@@ -1013,7 +1013,7 @@ xmtr_start(session_t *s)
     }
 
     if (completion.len != sizeof(x->ack.msg))
-        errx(EXIT_SUCCESS, "%s: ack is incorrect size", __func__);
+        errx(EXIT_FAILURE, "%s: ack is incorrect size", __func__);
 
     fi_addr_t oaddr = x->cxn.peer_addr;
     rc = fi_av_insert(x->cxn.av, x->ack.msg.addr, 1, &x->cxn.peer_addr,
@@ -1198,13 +1198,13 @@ xmtr_loop(worker_t *w, session_t *s)
     }
 
     if (completion.len == least_vector_msglen) {
-        errx(EXIT_SUCCESS, "%s: peer sent 0 vectors, disconnecting...",
+        errx(EXIT_FAILURE, "%s: peer sent 0 vectors, disconnecting...",
             __func__);
     }
 
     if ((completion.len - least_vector_msglen) %
         sizeof(x->vector.msg.iov[0]) != 0) {
-        errx(EXIT_SUCCESS,
+        errx(EXIT_FAILURE,
             "%s: %zu-byte vector message did not end on vector boundary, "
             "disconnecting...", __func__, completion.len);
     }
@@ -1213,7 +1213,7 @@ xmtr_loop(worker_t *w, session_t *s)
         sizeof(x->vector.msg.iov[0]);
 
     if (niovs_space < x->vector.msg.niovs) {
-        errx(EXIT_SUCCESS, "%s: peer sent truncated vectors, disconnecting...",
+        errx(EXIT_FAILURE, "%s: peer sent truncated vectors, disconnecting...",
             __func__);
     }
 
