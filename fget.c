@@ -1254,6 +1254,7 @@ xmtr_loop(worker_t *w, session_t *s)
     size_t niovs = 1, niovs_out = 0, nriovs_out = 0;
 
     for (total = 0; total < txbuflen; total += nwritten, which = !which) {
+
         write_fully_params_t p = {.ep = x->ep,
             .iov_in = which ? x->payload.iov : x->payload.iov2,
             .desc_in = which ? x->payload.desc : x->payload.desc2,
