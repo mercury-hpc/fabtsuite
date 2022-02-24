@@ -1985,27 +1985,6 @@ get(state_t *st)
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
 
-#if 0
-    if ((rc = fi_accept(r->ep, NULL, 0)) < 0)
-        bailout_for_ofi_ret(rc, "fi_accept");
-
-    fi_freeinfo(cm_entry.info);
-
-    do {
-        rc = fi_eq_sread(r->eq, &event, &cm_entry, sizeof(cm_entry),
-            -1 /* wait forever */, 0 /* flags */ );
-    } while (rc == -FI_EAGAIN);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_eq_sread");
-
-    if (event != FI_CONNECTED) {
-        errx(EXIT_FAILURE,
-            "%s: expected connected event (%" PRIu32 "), received %" PRIu32,
-            __func__, FI_CONNECTED, event);
-    }
-#endif
-
     /* Await initial message. */
     do {
         ncompleted = fi_cq_sread(gst->listen_cq, &completion, 1, NULL, -1);
