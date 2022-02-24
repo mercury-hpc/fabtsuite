@@ -1157,26 +1157,17 @@ write_fully(const write_fully_params_t p)
     return len;
 }
 
-static session_t *
-xmtr_loop(worker_t *w, session_t *s)
+static xmtr_t *
+xmtr_vector_rx(xmtr_t *x)
 {
-    xmtr_t *x = (xmtr_t *)s->cxn;
-    struct fi_rma_iov riov[12], riov2[12];
     struct fi_cq_msg_entry completion;
-    const size_t txbuflen = strlen(txbuf);
-    size_t i, orig_nriovs;
-    ssize_t ncompleted, rc;
+    ssize_t ncompleted;
 
-    if (!x->started)
-        return xmtr_start(s);
-
-    /* Await reply to initial message: first vector message. */
-    do {
-        ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
+    if ((ncompleted = fi_cq_read(x->cxn.cq, &completion, 1)) == -FI_EAGAIN)
+        return x;
 
     if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+        bailout_for_ofi_ret(ncompleted, "fi_cq_read");
 
     if (ncompleted != 1) {
         errx(EXIT_FAILURE,
@@ -1217,10 +1208,30 @@ xmtr_loop(worker_t *w, session_t *s)
             __func__);
     }
 
-    if (x->vector.msg.niovs > arraycount(riov)) {
-        errx(EXIT_SUCCESS, "%s: peer sent too many vectors, disconnecting...",
+    if (x->vector.msg.niovs > arraycount(x->vector.msg.iov)) {
+        errx(EXIT_FAILURE, "%s: peer sent too many vectors, disconnecting...",
             __func__);
     }
+
+    return x;
+}
+
+static session_t *
+xmtr_loop(worker_t *w, session_t *s)
+{
+    struct fi_cq_msg_entry completion;
+    struct fi_rma_iov riov[12], riov2[12];
+    xmtr_t *x = (xmtr_t *)s->cxn;
+    const size_t txbuflen = strlen(txbuf);
+    size_t i, orig_nriovs;
+    ssize_t rc;
+    ssize_t ncompleted;
+
+    if (!x->started)
+        return xmtr_start(s);
+
+    if (xmtr_vector_rx(x) == NULL)
+        goto out;
 
     x->payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
     x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
