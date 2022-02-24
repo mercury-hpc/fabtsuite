@@ -873,6 +873,7 @@ rcvr_loop(worker_t *w, session_t *s)
 {
     rcvr_t *r = (rcvr_t *)s->cxn;
     terminal_t *t = s->terminal;
+    size_t nremaining;
     int rc;
 
     if (!r->started)
@@ -880,26 +881,26 @@ rcvr_loop(worker_t *w, session_t *s)
 
     /* Transmit vector. */
 
-    if (r->vector.msg.niovs == 0)
-        ; // nothing to do
-    else if ((rc = fi_sendmsg(r->ep, &(struct fi_msg){
+    if (r->vector.msg.niovs == 0) {
+        ; // no vectors to send the peer, do nothing
+    } else if ((rc = fi_sendmsg(r->ep, &(struct fi_msg){
           .msg_iov = r->vector.iov
         , .desc = r->vector.desc
         , .iov_count = r->vector.niovs
         , .addr = r->cxn.peer_addr
         , .context = NULL
         , .data = 0
-        }, 0)) == -FI_EAGAIN)
+        }, 0)) == -FI_EAGAIN) {
         return s;
-    else if (rc < 0)
+    } else if (rc < 0) {
         bailout_for_ofi_ret(rc, "fi_sendmsg");
-    else
+    } else {
+        // record that there are all vectors were sent to the peer
         r->vector.msg.niovs = 0;
+    }
 
     if (rcvr_progress_rx(r) == NULL)
         goto out;
-
-    size_t nremaining;
 
     for (nremaining = r->nfull;
          nremaining > 0 && !fifo_full(s->ready_for_terminal); ) {
