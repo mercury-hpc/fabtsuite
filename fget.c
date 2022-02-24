@@ -1345,8 +1345,9 @@ xmtr_loop(worker_t *w, session_t *s)
 
     /* Await transmission of progress message. */
     do {
-        warnx("%s: awaiting progress message transmission, context %p, len %zu", __func__,
-            (void *)&x->progress, iov.iov_len);
+        warnx("%s: awaiting progress message transmission, "
+            "context %p, len %zu", __func__, (void *)&x->progress.context,
+            iov.iov_len);
         ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
     } while (ncompleted == -FI_EAGAIN);
 
