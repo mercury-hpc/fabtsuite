@@ -1158,14 +1158,14 @@ write_fully(const write_fully_params_t p)
     return len;
 }
 
-static xmtr_t *
+static int
 xmtr_vector_rx(xmtr_t *x)
 {
     struct fi_cq_msg_entry completion;
     ssize_t ncompleted;
 
     if ((ncompleted = fi_cq_read(x->cxn.cq, &completion, 1)) == -FI_EAGAIN)
-        return x;
+        return 0;
 
     if (ncompleted < 0)
         bailout_for_ofi_ret(ncompleted, "fi_cq_read");
@@ -1214,7 +1214,7 @@ xmtr_vector_rx(xmtr_t *x)
             __func__);
     }
 
-    return x;
+    return 1;
 }
 
 static session_t *
@@ -1231,8 +1231,15 @@ xmtr_loop(worker_t *w, session_t *s)
     if (!x->started)
         return xmtr_start(s);
 
-    if (xmtr_vector_rx(x) == NULL)
+    switch (xmtr_vector_rx(x)) {
+    case 0:
+        return s;
+    case 1:
+        break;
+    case -1:
+    default:
         goto out;
+    }
 
     x->payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
     x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
