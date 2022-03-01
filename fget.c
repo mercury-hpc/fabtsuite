@@ -53,29 +53,47 @@ typedef struct progress_msg {
 
 /* Communication buffers */
 
-struct buf;
-typedef struct buf buf_t;
+typedef enum {
+  ct_rdma_write
+, ct_vector_rx
+} context_type_t;
 
-struct buf {
+typedef struct {
+    struct fi_context ctx;
+    context_type_t type;
+} xfer_context_t;
+
+typedef struct bufhdr {
+    uint64_t raddr;
     size_t nfull;
     size_t nallocated;
     struct fid_mr *mr;
     void *desc;
+    xfer_context_t xfc;
+} bufhdr_t;
+
+typedef struct bytebuf {
+    bufhdr_t hdr;
     char content[];
-};
+} bytebuf_t;
+
+typedef struct vecbuf {
+    bufhdr_t hdr;
+    vector_msg_t msg;
+} vecbuf_t;
 
 typedef struct fifo {
     uint64_t insertions;
     uint64_t removals;
     size_t index_mask;  // for some integer n > 0, 2^n - 1 == index_mask
-    buf_t *buf[];
+    bufhdr_t *hdr[];
 } fifo_t;
 
 typedef struct buflist {
     uint64_t access;
     size_t nfull;
     size_t nallocated;
-    buf_t *buf[];
+    bytebuf_t *buf[];
 } buflist_t;
 
 /* Communication terminals: sources and sinks */
@@ -179,6 +197,11 @@ typedef struct {
     bool started;
     struct fid_ep *ep;
     struct fid_eq *eq;
+    fifo_t *wrposted;  // posted RDMA writes in order of issuance
+    struct {
+        fifo_t *rxposted; // buffers posted for vector messages
+        fifo_t *rcvd;  // buffers holding received vector messages
+    } vec;
     struct {
         void *desc;
         struct fid_mr *mr;
@@ -189,11 +212,6 @@ typedef struct {
         struct fid_mr *mr;
         ack_msg_t msg;
     } ack;
-    struct {
-        void *desc;
-        struct fid_mr *mr;
-        vector_msg_t msg;
-    } vector;
     struct {
         void *desc;
         struct fid_mr *mr;
@@ -210,6 +228,7 @@ typedef struct {
         ssize_t niovs;
         struct fi_context context;
     } payload;
+    struct fi_rma_iov riov[12], riov2[12];
 } xmtr_t;
 
 /* On each loop, a worker checks its poll set for any completions.
@@ -384,7 +403,7 @@ fifo_create(size_t size)
     if (!size_is_power_of_2(size))
         return NULL;
 
-    fifo_t *f = malloc(offsetof(fifo_t, buf[0]) + sizeof(f->buf[0]) * size);
+    fifo_t *f = malloc(offsetof(fifo_t, hdr[0]) + sizeof(f->hdr[0]) * size);
 
     if (f == NULL)
         return NULL;
@@ -401,7 +420,7 @@ fifo_destroy(fifo_t *f)
     free(f);
 }
 
-static inline buf_t *
+static inline bufhdr_t *
 fifo_get(fifo_t *f)
 {
     assert(f->insertions >= f->removals);
@@ -409,13 +428,13 @@ fifo_get(fifo_t *f)
     if (f->insertions == f->removals)
         return NULL;
 
-    buf_t *b = f->buf[f->removals & (uint64_t)f->index_mask];
+    bufhdr_t *h = f->hdr[f->removals & (uint64_t)f->index_mask];
     f->removals++;
 
-    return b;
+    return h;
 }
 
-static inline buf_t *
+static inline bufhdr_t *
 fifo_peek(fifo_t *f)
 {
     assert(f->insertions >= f->removals);
@@ -423,7 +442,7 @@ fifo_peek(fifo_t *f)
     if (f->insertions == f->removals)
         return NULL;
 
-    return f->buf[f->removals & (uint64_t)f->index_mask];
+    return f->hdr[f->removals & (uint64_t)f->index_mask];
 }
 
 static inline bool
@@ -439,20 +458,20 @@ fifo_full(fifo_t *f)
 }
 
 static inline bool
-fifo_put(fifo_t *f, buf_t *b)
+fifo_put(fifo_t *f, bufhdr_t *h)
 {
     assert(f->insertions - f->removals <= f->index_mask + 1);
 
     if (f->insertions - f->removals > f->index_mask)
         return false;
 
-    f->buf[f->insertions & (uint64_t)f->index_mask] = b;
+    f->hdr[f->insertions & (uint64_t)f->index_mask] = h;
     f->insertions++;
 
     return true;
 }
 
-static buf_t *
+static bytebuf_t *
 buflist_get(buflist_t *bl)
 {
     if (bl->nfull == 0)
@@ -463,7 +482,7 @@ buflist_get(buflist_t *bl)
 
 #if 0
 static bool
-buflist_put(buflist_t *bl, buf_t *b)
+buflist_put(buflist_t *bl, bytebuf_t *b)
 {
     if (bl->nfull == bl->nallocated)
         return false;
@@ -509,10 +528,64 @@ keysource_next(keysource_t *s)
     return s->next_key++;
 }
 
+static bufhdr_t *
+buf_alloc(size_t paylen)
+{
+    bufhdr_t *h;
+
+    if ((h = malloc(offsetof(bytebuf_t, content[0]) + paylen)) == NULL)
+        return NULL;
+
+    h->nallocated = paylen;
+    h->nfull = 0;
+    h->raddr = 0;
+
+    return h;
+}
+
+static bytebuf_t *
+bytebuf_alloc(size_t paylen)
+{
+    return (bytebuf_t *)buf_alloc(paylen);
+}
+
+static vecbuf_t *
+vecbuf_alloc(void)
+{
+    bufhdr_t *h;
+    vecbuf_t *vb;
+
+    if ((h = buf_alloc(sizeof(*vb) - sizeof(bufhdr_t))) == NULL)
+        return NULL;
+
+    vb = (vecbuf_t *)h;
+    h->xfc.type = ct_vector_rx;
+
+    h->raddr = (char *)&vb->msg - (char *)&h[1];
+
+    return vb;
+}
+
+static int
+buf_mr_reg(struct fid_domain *dom, uint64_t access, uint64_t key,
+    bufhdr_t *h)
+{
+    int rc;
+
+    rc = fi_mr_reg(dom, &h[1], h->nallocated, access, 0, key, 0, &h->mr, NULL);
+
+    if (rc != 0)
+        return rc;
+
+    h->desc = fi_mr_desc(h->mr);
+
+    return 0;
+}
+
 static bool
 worker_buflist_replenish(worker_t *w, buflist_t *bl)
 {
-    size_t i, buflen;
+    size_t i, paylen;
     int rc;
 
     if (bl->nfull >= bl->nallocated / 2)
@@ -520,46 +593,43 @@ worker_buflist_replenish(worker_t *w, buflist_t *bl)
 
     size_t ntofill = bl->nallocated / 2 - bl->nfull;
 
-    for (buflen = 0, i = bl->nfull; i < ntofill; i++) {
-        buf_t *buf;
+    for (paylen = 0, i = bl->nfull; i < ntofill; i++) {
+        bytebuf_t *buf;
 
-        // buflen cycle: 7 -> 11 -> 13 -> 17 -> 19 -> 23 -> 29 -> 31 -> 7
-        switch (buflen) {
+        // paylen cycle: 7 -> 11 -> 13 -> 17 -> 19 -> 23 -> 29 -> 31 -> 7
+        switch (paylen) {
         case 0:
         default:
-            buflen = 7;
+            paylen = 7;
             break;
         case 7:
-            buflen = 11;
+            paylen = 11;
             break;
         case 11:
-            buflen = 13;
+            paylen = 13;
             break;
         case 13:
-            buflen = 17;
+            paylen = 17;
             break;
         case 17:
-            buflen = 19;
+            paylen = 19;
             break;
         case 23:
-            buflen = 29;
+            paylen = 29;
             break;
         case 29:
-            buflen = 31;
+            paylen = 31;
             break;
         case 31:
-            buflen = 7;
+            paylen = 7;
             break;
         }
-        buf = malloc(offsetof(buf_t, content[0]) + buflen);
+        buf = bytebuf_alloc(paylen);
         if (buf == NULL)
             err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
-        warnx("%s: pushing %zu-byte buffer", __func__, buflen);
-        buf->nallocated = buflen;
-        buf->nfull = 0;
 
-        rc = fi_mr_reg(w->dom, buf->content, buflen,
-            bl->access, 0, keysource_next(&w->keys), 0, &buf->mr, NULL);
+        rc = buf_mr_reg(w->dom, bl->access, keysource_next(&w->keys),
+            &buf->hdr);
 
         if (rc != 0) {
             warn_about_ofi_ret(rc, "fi_mr_reg");
@@ -567,7 +637,7 @@ worker_buflist_replenish(worker_t *w, buflist_t *bl)
             break;
         }
 
-        buf->desc = fi_mr_desc(buf->mr);
+        warnx("%s: pushing %zu-byte buffer", __func__, buf->hdr.nallocated);
         bl->buf[i] = buf;
     }
     bl->nfull = i;
@@ -575,17 +645,18 @@ worker_buflist_replenish(worker_t *w, buflist_t *bl)
     return bl->nfull > 0;
 }
 
-static buf_t *
+static bytebuf_t *
 worker_rxbuf_get(worker_t *w)
 {
-    buf_t *b;
+    bytebuf_t *b;
 
     while ((b = buflist_get(w->freebufs.rx)) == NULL &&
            worker_buflist_replenish(w, w->freebufs.rx))
         ;   // do nothing
 
     if (b != NULL)
-        warnx("%s: buf length %zu", __func__, b->nallocated);
+        warnx("%s: buf length %zu", __func__, b->hdr.nallocated);
+
     return b;
 }
 
@@ -675,34 +746,37 @@ rcvr_start(worker_t *w, session_t *s)
     rcvr_t *r = (rcvr_t *)s->cxn;
     size_t i, nleftover, nloaded;
     int rc;
-    buf_t *paybuf[16];
-    size_t npaybufs = 0;
+    bufhdr_t *payhdr[16];
+    size_t npayhdrs = 0;
 
     r->started = true;
 
     for (nleftover = sizeof(r->payload.rxbuf), nloaded = 0; nleftover > 0; ) {
-        buf_t *b = worker_rxbuf_get(w);
+        bytebuf_t *b = worker_rxbuf_get(w);
 
         if (b == NULL)
             errx(EXIT_FAILURE, "%s: could not get a buffer", __func__);
 
-        b->nfull = minsize(nleftover, b->nallocated);
-        nleftover -= b->nfull;
-        nloaded += b->nfull;
-        if (npaybufs == arraycount(paybuf))
+        b->hdr.nfull = minsize(nleftover, b->hdr.nallocated);
+        nleftover -= b->hdr.nfull;
+        nloaded += b->hdr.nfull;
+        if (npayhdrs == arraycount(payhdr))
             errx(EXIT_FAILURE, "%s: could not queue rx buffer", __func__);
-        paybuf[npaybufs++] = b;
+        payhdr[npayhdrs++] = &b->hdr;
     }
 
-    r->vector.msg.niovs = npaybufs;
-    for (i = 0; i < npaybufs; i++) {
-        buf_t *b = paybuf[i];
-        fprintf(stderr, "paybuf[%zu]->nfull = %zu\n", i, b->nfull);
-        if (!fifo_put(r->rxfifo, b))
+    r->vector.msg.niovs = npayhdrs;
+    for (i = 0; i < npayhdrs; i++) {
+        bufhdr_t *h = payhdr[i];
+
+        fprintf(stderr, "payhdr[%zu]->nfull = %zu\n", i, h->nfull);
+
+        if (!fifo_put(r->rxfifo, h))
             errx(EXIT_FAILURE, "%s: could not re-queue rx buffer", __func__);
+
         r->vector.msg.iov[i].addr = 0;
-        r->vector.msg.iov[i].len = b->nfull;
-        r->vector.msg.iov[i].key = fi_mr_key(b->mr);
+        r->vector.msg.iov[i].len = h->nfull;
+        r->vector.msg.iov[i].key = fi_mr_key(h->mr);
     }
 
     r->vector.niovs = fibonacci_iov_setup(&r->vector.msg,
@@ -759,19 +833,21 @@ static trade_result_t
 sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 {
     sink_t *s = (sink_t *)t;
-    buf_t *b;
+    bufhdr_t *h;
 
-    while ((b = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
-        if (b->nfull > s->txbuflen - s->idx)
+    while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
+        bytebuf_t *b = (bytebuf_t *)h;
+
+        if (h->nfull > s->txbuflen - s->idx)
             return -1;
 
-        if (memcmp(&txbuf[s->idx], b->content, b->nfull) != 0)
+        if (memcmp(&txbuf[s->idx], b->content, h->nfull) != 0)
             return -1;
 
         (void)fifo_get(ready);
-        (void)fifo_put(completed, b);
+        (void)fifo_put(completed, h);
 
-        s->idx += b->nfull;
+        s->idx += h->nfull;
     }
     return (s->idx == s->txbuflen) ? 1 : 0;
 }
@@ -904,18 +980,18 @@ rcvr_loop(worker_t *w, session_t *s)
 
     for (nremaining = r->nfull;
          nremaining > 0 && !fifo_full(s->ready_for_terminal); ) {
-        buf_t *b = fifo_peek(r->rxfifo);
+        bufhdr_t *h = fifo_peek(r->rxfifo);
 
         (void)fifo_get(r->rxfifo);
 
-        if (nremaining < b->nfull) {
-            b->nfull = nremaining;
+        if (nremaining < h->nfull) {
+            h->nfull = nremaining;
             nremaining = 0;
         } else {
-            nremaining -= b->nfull;
+            nremaining -= h->nfull;
         }
 
-        (void)fifo_put(s->ready_for_terminal, b);
+        (void)fifo_put(s->ready_for_terminal, h);
     }
 
 out:
@@ -944,8 +1020,8 @@ xmtr_start(session_t *s)
 
     x->started = true;
 
-    /* Post receive for first vector message. */
-    x->vector.desc = fi_mr_desc(x->vector.mr);
+    /* Post receive for connection acknowledgement. */
+    x->ack.desc = fi_mr_desc(x->ack.mr);
 
     rc = fi_recvmsg(x->ep, &(struct fi_msg){
           .msg_iov = &(struct iovec){.iov_base = &x->ack.msg,
@@ -1029,18 +1105,24 @@ xmtr_start(session_t *s)
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_av_remove old dest_addr");
 
-    rc = fi_recvmsg(x->ep, &(struct fi_msg){
-          .msg_iov = &(struct iovec){.iov_base = &x->vector.msg,
-                                     .iov_len = sizeof(x->vector.msg)}
-        , .desc = &x->vector.desc
-        , .iov_count = 1
-        , .addr = x->cxn.peer_addr
-        , .context = NULL
-        , .data = 0
-        }, FI_COMPLETION);
+    while (!fifo_full(x->vec.rxposted)) {
+        vecbuf_t *vb = vecbuf_alloc();
 
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_recvmsg");
+        rc = fi_recvmsg(x->ep, &(struct fi_msg){
+              .msg_iov = &(struct iovec){.iov_base = &vb->msg,
+                                         .iov_len = sizeof(vb->msg)}
+            , .desc = &vb->hdr.desc
+            , .iov_count = 1
+            , .addr = x->cxn.peer_addr
+            , .context = &vb->hdr.xfc.ctx
+            , .data = 0
+            }, FI_COMPLETION);
+
+        if (rc < 0)
+            bailout_for_ofi_ret(rc, "fi_recvmsg");
+
+        (void)fifo_put(x->vec.rxposted, &vb->hdr);
+    }
 
     return s;
 }
@@ -1163,6 +1245,11 @@ xmtr_vector_rx(xmtr_t *x)
 {
     struct fi_cq_msg_entry completion;
     ssize_t ncompleted;
+    int i;
+    vecbuf_t *vb;
+
+    if ((vb = (vecbuf_t *)fifo_peek(x->vec.rxposted)) == NULL)
+        return 0;
 
     if ((ncompleted = fi_cq_read(x->cxn.cq, &completion, 1)) == -FI_EAGAIN)
         return 0;
@@ -1175,6 +1262,14 @@ xmtr_vector_rx(xmtr_t *x)
             "%s: expected 1 completion, read %zd", __func__, ncompleted);
     }
 
+    if (completion.op_context != &vb->hdr.xfc.ctx) {
+        errx(EXIT_FAILURE,
+            "%s: expected context %p found %p",
+            __func__, (void *)&vb->hdr.xfc.ctx, completion.op_context);
+    }
+
+    (void)fifo_get(x->vec.rxposted);
+
     if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
         errx(EXIT_FAILURE,
             "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
@@ -1182,7 +1277,7 @@ xmtr_vector_rx(xmtr_t *x)
     }
 
     const ptrdiff_t least_vector_msglen =
-        (char *)&x->vector.msg.iov[0] - (char *)&x->vector.msg;
+        (char *)&vb->msg.iov[0] - (char *)&vb->msg;
 
     if (completion.len < least_vector_msglen) {
         errx(EXIT_FAILURE, "%s: expected >= %zu bytes, received %zu",
@@ -1194,72 +1289,73 @@ xmtr_vector_rx(xmtr_t *x)
             __func__);
     }
 
-    if ((completion.len - least_vector_msglen) %
-        sizeof(x->vector.msg.iov[0]) != 0) {
+    if ((completion.len - least_vector_msglen) % sizeof(vb->msg.iov[0]) != 0) {
         errx(EXIT_FAILURE,
             "%s: %zu-byte vector message did not end on vector boundary, "
             "disconnecting...", __func__, completion.len);
     }
 
     const size_t niovs_space = (completion.len - least_vector_msglen) /
-        sizeof(x->vector.msg.iov[0]);
+        sizeof(vb->msg.iov[0]);
 
-    if (niovs_space < x->vector.msg.niovs) {
+    if (niovs_space < vb->msg.niovs) {
         errx(EXIT_FAILURE, "%s: peer sent truncated vectors, disconnecting...",
             __func__);
     }
 
-    if (x->vector.msg.niovs > arraycount(x->vector.msg.iov)) {
+    if (vb->msg.niovs > arraycount(vb->msg.iov)) {
         errx(EXIT_FAILURE, "%s: peer sent too many vectors, disconnecting...",
             __func__);
     }
 
-    return 1;
+    for (i = 0; i < vb->msg.niovs; i++) {
+        warnx("%s: received vector %d "
+            "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
+            __func__, i, vb->msg.iov[i].addr, vb->msg.iov[i].len,
+            vb->msg.iov[i].key);
+
+        x->riov[i].len = vb->msg.iov[i].len;
+        x->riov[i].addr = vb->msg.iov[i].addr;
+        x->riov[i].key = vb->msg.iov[i].key;
+    }
+
+    return i;
 }
 
 static session_t *
 xmtr_loop(worker_t *w, session_t *s)
 {
     struct fi_cq_msg_entry completion;
-    struct fi_rma_iov riov[12], riov2[12];
     xmtr_t *x = (xmtr_t *)s->cxn;
     const size_t txbuflen = strlen(txbuf);
-    size_t i, orig_nriovs;
+    size_t orig_nriovs;
     ssize_t rc;
     ssize_t ncompleted;
+    int nvrx;
 
     if (!x->started)
         return xmtr_start(s);
 
-    switch (xmtr_vector_rx(x)) {
+    /* TBD Handle any completion, xmtr_cq_process()
+     * instead of xmtr_vector_rx()
+     */
+    switch ((nvrx = xmtr_vector_rx(x))) {
     case 0:
         return s;
-    case 1:
+    default:
+        orig_nriovs = (size_t)nvrx;
         break;
     case -1:
-    default:
         goto out;
     }
-
-    x->payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
-    x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
-
-    for (i = 0; i < x->vector.msg.niovs; i++) {
-        warnx("%s: received vector %zd "
-            "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
-            __func__, i, x->vector.msg.iov[i].addr, x->vector.msg.iov[i].len,
-            x->vector.msg.iov[i].key);
-        riov[i].len = x->vector.msg.iov[i].len;
-        riov[i].addr = x->vector.msg.iov[i].addr;
-        riov[i].key = x->vector.msg.iov[i].key;
-    }
-
-    orig_nriovs = i;
 
     bool phase = true;
     ssize_t nwritten, total;
     size_t nriovs = orig_nriovs;
     size_t niovs = 1, niovs_out = 0, nriovs_out = 0;
+
+    x->payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
+    x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
 
     for (total = 0; total < txbuflen; total += nwritten, phase = !phase) {
 
@@ -1270,12 +1366,12 @@ xmtr_loop(worker_t *w, session_t *s)
             .desc_out = phase ? x->payload.desc2 : x->payload.desc,
             .niovs = niovs,
             .niovs_out = &niovs_out,
-            .riov_in = phase ? riov : riov2,
-            .riov_out = phase ? riov2 : riov,
+            .riov_in = phase ? x->riov : x->riov2,
+            .riov_out = phase ? x->riov2 : x->riov,
             .nriovs = nriovs,
             .nriovs_out = &nriovs_out,
             .len = txbuflen - total,
-            .maxsegs = minsize(w->rma_maxsegs, x->vector.msg.niovs),
+            .maxsegs = minsize(w->rma_maxsegs, orig_nriovs),
             .flags = FI_COMPLETION | FI_DELIVERY_COMPLETE,
             .context = &x->payload.context,
             .addr = x->cxn.peer_addr};
@@ -1513,9 +1609,9 @@ worker_buflist_destroy(struct fid_domain *dom, buflist_t *bl)
     int rc;
 
     for (i = 0; i < bl->nfull; i++) {
-        buf_t *b = bl->buf[i];
+        bytebuf_t *b = bl->buf[i];
 
-        if ((rc = fi_close(&b->mr->fid)) != 0)
+        if ((rc = fi_close(&b->hdr.mr->fid)) != 0)
             warn_about_ofi_ret(rc, "fi_mr_reg");
 
         free(b);
@@ -1802,12 +1898,6 @@ xmtr_memory_init(state_t *st, xmtr_t *x)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
-    rc = fi_mr_reg(st->domain, &x->vector.msg, sizeof(x->vector.msg),
-        FI_RECV, 0, keysource_next(&st->keys), 0, &x->vector.mr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_mr_reg");
-
     rc = fi_mr_reg(st->domain, &x->progress.msg, sizeof(x->progress.msg),
         FI_SEND, 0, keysource_next(&st->keys), 0, &x->progress.mr, NULL);
 
@@ -1828,6 +1918,18 @@ xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
 
     cxn_init(&x->cxn, av, xmtr_loop);
     xmtr_memory_init(st, x);
+    if ((x->wrposted = fifo_create(64)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create posted RDMA writes FIFO", __func__);
+    }
+    if ((x->vec.rxposted = fifo_create(64)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create posted vectors FIFO", __func__);
+    }
+    if ((x->vec.rcvd = fifo_create(64)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create received vectors FIFO", __func__);
+    }
     x->started = false;
 }
 
@@ -1898,7 +2000,8 @@ rcvr_init(state_t *st, rcvr_t *r, struct fid_av *av)
 
     cxn_init(&r->cxn, av, rcvr_loop);
     rcvr_memory_init(st, r);
-    r->rxfifo = fifo_create(64);
+    if ((r->rxfifo = fifo_create(64)) == NULL)
+        errx(EXIT_FAILURE, "%s: could not create Rx FIFO", __func__);
     r->started = false;
 }
 
