@@ -58,9 +58,22 @@ typedef enum {
 , ct_vector_rx
 } context_type_t;
 
+typedef enum {
+    xfc_first = 0x1
+,   xfc_last = 0x2
+} xfc_place_t;
+
+typedef enum {
+    xfc_program = 0
+,   xfc_nic = 1
+} xfc_owner_t;
+
 typedef struct {
-    struct fi_context ctx;
-    context_type_t type;
+    struct fi_context ctx;  // this has to be the first member
+    uint32_t type:4;
+    uint32_t owner:1;
+    uint32_t place:2;
+    uint32_t unused:25;
 } xfer_context_t;
 
 typedef struct bufhdr {
@@ -229,6 +242,8 @@ typedef struct {
         struct fi_context context;
     } payload;
     struct fi_rma_iov riov[12], riov2[12];
+    size_t nriovs;
+    bool phase;
 } xmtr_t;
 
 /* On each loop, a worker checks its poll set for any completions.
@@ -1011,6 +1026,27 @@ out:
     }
 }
 
+static void
+xmtr_vecbuf_post(xmtr_t *x, vecbuf_t *vb)
+{
+    int rc;
+
+    rc = fi_recvmsg(x->ep, &(struct fi_msg){
+          .msg_iov = &(struct iovec){.iov_base = &vb->msg,
+                                     .iov_len = sizeof(vb->msg)}
+        , .desc = &vb->hdr.desc
+        , .iov_count = 1
+        , .addr = x->cxn.peer_addr
+        , .context = &vb->hdr.xfc.ctx
+        , .data = 0
+        }, FI_COMPLETION);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_recvmsg");
+
+    (void)fifo_put(x->vec.rxposted, &vb->hdr);
+}
+
 static session_t *
 xmtr_start(session_t *s)
 {
@@ -1109,20 +1145,7 @@ xmtr_start(session_t *s)
     while (!fifo_full(x->vec.rxposted)) {
         vecbuf_t *vb = vecbuf_alloc();
 
-        rc = fi_recvmsg(x->ep, &(struct fi_msg){
-              .msg_iov = &(struct iovec){.iov_base = &vb->msg,
-                                         .iov_len = sizeof(vb->msg)}
-            , .desc = &vb->hdr.desc
-            , .iov_count = 1
-            , .addr = x->cxn.peer_addr
-            , .context = &vb->hdr.xfc.ctx
-            , .data = 0
-            }, FI_COMPLETION);
-
-        if (rc < 0)
-            bailout_for_ofi_ret(rc, "fi_recvmsg");
-
-        (void)fifo_put(x->vec.rxposted, &vb->hdr);
+        xmtr_vecbuf_post(x, vb);
     }
 
     return s;
@@ -1231,7 +1254,7 @@ write_fully(const write_fully_params_t p)
         p.riov_out[j] = p.riov_in[i];
         if (nremaining > 0) {
             p.riov_out[j].len -= nremaining;
-            p.riov_out[j].addr = p.riov_out[j].addr + nremaining;
+            p.riov_out[j].addr += nremaining;
             nremaining = 0;
         }
         j++;
@@ -1241,12 +1264,61 @@ write_fully(const write_fully_params_t p)
     return len;
 }
 
+static bool
+vecbuf_is_wellformed(vecbuf_t *vb)
+{
+    size_t len = vb->hdr.nfull;
+
+    static const ptrdiff_t least_vector_msglen =
+        (char *)&vb->msg.iov[0] - (char *)&vb->msg;
+
+    const size_t niovs_space = (len - least_vector_msglen) /
+        sizeof(vb->msg.iov[0]);
+
+    if (len < least_vector_msglen) {
+        warnx("%s: expected >= %zu bytes, received %zu",
+            __func__, least_vector_msglen, len);
+    }
+    if (len <= least_vector_msglen) {
+        warnx("%s: peer sent 0 vectors or fewer, disconnecting...", __func__);
+    } else if ((len - least_vector_msglen) % sizeof(vb->msg.iov[0]) != 0) {
+        warnx("%s: %zu-byte vector message did not end on vector boundary, "
+            "disconnecting...", __func__, len);
+    } else if (niovs_space < vb->msg.niovs) {
+        warnx("%s: peer sent truncated vectors, disconnecting...", __func__);
+    } else if (vb->msg.niovs > arraycount(vb->msg.iov)) {
+        warnx("%s: peer sent too many vectors, disconnecting...", __func__);
+    } else
+        return true;
+
+    return false;
+}
+
+static void
+xmtr_vecbuf_unload(xmtr_t *x, vecbuf_t *vb)
+{
+    size_t i;
+
+    for (i = 0; i < vb->msg.niovs; i++) {
+        warnx("%s: received vector %zu "
+            "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
+            __func__, i, vb->msg.iov[i].addr, vb->msg.iov[i].len,
+            vb->msg.iov[i].key);
+
+        x->riov[i].len = vb->msg.iov[i].len;
+        x->riov[i].addr = vb->msg.iov[i].addr;
+        x->riov[i].key = vb->msg.iov[i].key;
+    }
+
+    x->phase = false;
+    x->nriovs = i;
+}
+
 static int
-xmtr_vector_rx(xmtr_t *x)
+xmtr_cq_process(xmtr_t *x)
 {
     struct fi_cq_msg_entry completion;
     ssize_t ncompleted;
-    int i;
     vecbuf_t *vb;
 
     if ((vb = (vecbuf_t *)fifo_peek(x->vec.rxposted)) == NULL)
@@ -1277,50 +1349,20 @@ xmtr_vector_rx(xmtr_t *x)
             __func__, desired_rx_flags, completion.flags & desired_rx_flags);
     }
 
-    const ptrdiff_t least_vector_msglen =
-        (char *)&vb->msg.iov[0] - (char *)&vb->msg;
+    vb->hdr.nfull = completion.len;
 
-    if (completion.len < least_vector_msglen) {
-        errx(EXIT_FAILURE, "%s: expected >= %zu bytes, received %zu",
-            __func__, least_vector_msglen, completion.len);
+    if (!vecbuf_is_wellformed(vb)) {
+        xmtr_vecbuf_post(x, vb);
+        return 0;
     }
 
-    if (completion.len == least_vector_msglen) {
-        errx(EXIT_FAILURE, "%s: peer sent 0 vectors, disconnecting...",
-            __func__);
-    }
+    if (x->nriovs == 0) {
+        xmtr_vecbuf_unload(x, vb);
+        xmtr_vecbuf_post(x, vb);
+    } else if (!fifo_put(x->vec.rcvd, &vb->hdr))
+        errx(EXIT_FAILURE, "%s: received vectors FIFO was full", __func__);
 
-    if ((completion.len - least_vector_msglen) % sizeof(vb->msg.iov[0]) != 0) {
-        errx(EXIT_FAILURE,
-            "%s: %zu-byte vector message did not end on vector boundary, "
-            "disconnecting...", __func__, completion.len);
-    }
-
-    const size_t niovs_space = (completion.len - least_vector_msglen) /
-        sizeof(vb->msg.iov[0]);
-
-    if (niovs_space < vb->msg.niovs) {
-        errx(EXIT_FAILURE, "%s: peer sent truncated vectors, disconnecting...",
-            __func__);
-    }
-
-    if (vb->msg.niovs > arraycount(vb->msg.iov)) {
-        errx(EXIT_FAILURE, "%s: peer sent too many vectors, disconnecting...",
-            __func__);
-    }
-
-    for (i = 0; i < vb->msg.niovs; i++) {
-        warnx("%s: received vector %d "
-            "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
-            __func__, i, vb->msg.iov[i].addr, vb->msg.iov[i].len,
-            vb->msg.iov[i].key);
-
-        x->riov[i].len = vb->msg.iov[i].len;
-        x->riov[i].addr = vb->msg.iov[i].addr;
-        x->riov[i].key = vb->msg.iov[i].key;
-    }
-
-    return i;
+    return 1;
 }
 
 static session_t *
@@ -1329,50 +1371,57 @@ xmtr_loop(worker_t *w, session_t *s)
     struct fi_cq_msg_entry completion;
     xmtr_t *x = (xmtr_t *)s->cxn;
     const size_t txbuflen = strlen(txbuf);
-    size_t orig_nriovs;
     ssize_t rc;
     ssize_t ncompleted;
-    int nvrx;
 
     if (!x->started)
         return xmtr_start(s);
 
-    /* TBD Handle any completion, xmtr_cq_process()
-     * instead of xmtr_vector_rx()
-     */
-    switch ((nvrx = xmtr_vector_rx(x))) {
+    switch (xmtr_cq_process(x)) {
     case 0:
         return s;
     default:
-        orig_nriovs = (size_t)nvrx;
         break;
     case -1:
         goto out;
     }
 
-    bool phase = true;
     ssize_t nwritten, total;
-    size_t nriovs = orig_nriovs;
     size_t niovs = 1, niovs_out = 0, nriovs_out = 0;
 
-    x->payload.iov[0] = (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
+    ((!x->phase) ? x->payload.iov : x->payload.iov2)[0] =
+        (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
     x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
 
-    for (total = 0; total < txbuflen; total += nwritten, phase = !phase) {
+    /* Take txbuffers off of our queue while their cumulative length
+     * is less than sum(0 <= i < min(rma_maxsegs, nriovs), riov[i].len).
+     * Flag the first txbuffer `xfc_first` and the last `xfc_last`
+     * (first and last may be the same buffer).  Clear flags on the rest
+     * of the txbuffers.  Set the owner of the first to `xfc_nic`.
+     *
+     * Perform one fi_writemsg using the context on the first txbuffer.
+     *
+     * When a completion arrives, set its context's owner to `xfc_program`.
+     * If the context matches the head of `wrposted`, then dequeue the
+     * txbuffers at the head through the one marked `xfc_last`.
+     * Repeat dequeueing through `xfc_last` while the head's owner is
+     * `xfc_program`.
+     */
+    for (total = 0; total < txbuflen; total += nwritten, x->phase = !x->phase) {
 
         write_fully_params_t p = {.ep = x->ep,
-            .iov_in = phase ? x->payload.iov : x->payload.iov2,
-            .desc_in = phase ? x->payload.desc : x->payload.desc2,
-            .iov_out = phase ? x->payload.iov2 : x->payload.iov,
-            .desc_out = phase ? x->payload.desc2 : x->payload.desc,
+            .iov_in = (!x->phase) ? x->payload.iov : x->payload.iov2,
+            .desc_in = (!x->phase) ? x->payload.desc : x->payload.desc2,
+            .iov_out = (!x->phase) ? x->payload.iov2 : x->payload.iov,
+            .desc_out = (!x->phase) ? x->payload.desc2 : x->payload.desc,
             .niovs = niovs,
             .niovs_out = &niovs_out,
-            .riov_in = phase ? x->riov : x->riov2,
-            .riov_out = phase ? x->riov2 : x->riov,
-            .nriovs = nriovs,
+            .riov_in = (!x->phase) ? x->riov : x->riov2,
+            .riov_out = (!x->phase) ? x->riov2 : x->riov,
+            .nriovs = x->nriovs,
             .nriovs_out = &nriovs_out,
             .len = txbuflen - total,
-            .maxsegs = minsize(w->rma_maxsegs, orig_nriovs),
+            .maxsegs = minsize(w->rma_maxsegs, x->nriovs),
             .flags = FI_COMPLETION | FI_DELIVERY_COMPLETE,
             .context = &x->payload.context,
             .addr = x->cxn.peer_addr};
@@ -1383,14 +1432,16 @@ xmtr_loop(worker_t *w, session_t *s)
             bailout_for_ofi_ret(nwritten, "write_fully");
 
         niovs = niovs_out;
-        nriovs = nriovs_out;
+
+        const size_t nriovs_written = x->nriovs - nriovs_out;
+        x->nriovs = nriovs_out;
 
         /* Await RDMA completion. Pass flags FI_COMPLETION |
          * FI_DELIVERY_COMPLETE to fi_writemsg, above.
          */
         do {
             warnx("%s: awaiting RMA completion, context %p, remote count %zu",
-                __func__, (void *)&x->payload, orig_nriovs);
+                __func__, (void *)&x->payload, nriovs_written);
             ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
         } while (ncompleted == -FI_EAGAIN);
 
