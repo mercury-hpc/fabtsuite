@@ -1000,7 +1000,8 @@ out:
         return s;
     case tr_error:
     default:
-        warnx("unexpected received message");
+        /* XXX exit for testing purposes; fallthrough will not occur. */
+        errx(EXIT_FAILURE, "unexpected received message");
         /* FALLTHROUGH */
     case tr_end:
         if ((rc = fi_close(&r->ep->fid)) < 0)
