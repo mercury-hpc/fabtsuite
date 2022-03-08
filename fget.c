@@ -995,9 +995,7 @@ rcvr_loop(worker_t *w, session_t *s)
 
     for (nremaining = r->nfull;
          nremaining > 0 && !fifo_full(s->ready_for_terminal); ) {
-        bufhdr_t *h = fifo_peek(r->rxfifo);
-
-        (void)fifo_get(r->rxfifo);
+        bufhdr_t *h = fifo_get(r->rxfifo);
 
         if (nremaining < h->nfull) {
             h->nfull = nremaining;
