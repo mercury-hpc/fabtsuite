@@ -814,35 +814,37 @@ rcvr_start(worker_t *w, session_t *s)
     return s;
 }
 
-#if 0
-/* Return 0 if the source is producing more bytes, 
- * 1 if the source will produce no more bytes.
+/* Return `tr_ready` if the source is producing more bytes, `tr_end` if
+ * the source will produce no more bytes.
  */
-static int
+static trade_result_t
 source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 {
-    sink_t *s = (sink_t *)t;
-    buf_t *b;
+    const size_t txbuflen = strlen(txbuf);
+    source_t *s = (source_t *)t;
+    bufhdr_t *h;
 
-    while ((b = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
-        if (s->idx == s->txbuflen)
-            return 1;
+    while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
+        bytebuf_t *b = (bytebuf_t *)h;
 
-        b->nfull = minsize(s->txbuflen - s->idx, b->nallocated);
-
-        memcpy(b->content, &txbuf[s->idx], b->nfull);
+        if (s->idx == txbuflen)
+            return tr_end;
 
         (void)fifo_get(ready);
-        (void)fifo_put(completed, b);
 
-        s->idx += b->nfull;
+        h->nfull = minsize(txbuflen - s->idx, h->nallocated);
+        memcpy(b->content, &txbuf[s->idx], h->nfull);
+
+        (void)fifo_put(completed, h);
+
+        s->idx += h->nfull;
     }
-    return (s->idx == s->txbuflen) ? 1 : 0;
+    return (s->idx == txbuflen) ? tr_end : tr_ready;
 }
-#endif
 
-/* Return 0 if the sink is accepting more bytes, -1 if unexpected
- * bytes are on `ready`, 1 if the sink expects no more bytes.
+/* Return `tr_ready` if the sink is accepting more bytes, `tr_error` if
+ * unexpected bytes are on `ready`, `tr_end` if the sink expects no more
+ * bytes.
  */
 static trade_result_t
 sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
@@ -854,17 +856,17 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
         bytebuf_t *b = (bytebuf_t *)h;
 
         if (h->nfull > s->txbuflen - s->idx)
-            return -1;
+            return tr_error;
 
         if (memcmp(&txbuf[s->idx], b->content, h->nfull) != 0)
-            return -1;
+            return tr_error;
 
         (void)fifo_get(ready);
         (void)fifo_put(completed, h);
 
         s->idx += h->nfull;
     }
-    return (s->idx == s->txbuflen) ? 1 : 0;
+    return (s->idx == s->txbuflen) ? tr_end : tr_ready;
 }
 
 #if 0
