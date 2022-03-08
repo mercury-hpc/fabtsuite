@@ -56,6 +56,7 @@ typedef struct progress_msg {
 typedef enum {
   ct_rdma_write
 , ct_vector_rx
+, ct_progress_tx
 } context_type_t;
 
 typedef enum {
@@ -123,6 +124,7 @@ typedef struct terminal terminal_t;
 struct terminal {
     /* trade(t, ready, completed) */
     trade_result_t (*trade)(terminal_t *, fifo_t *, fifo_t *);
+    bool eof;
 };
 
 typedef struct {
@@ -133,6 +135,7 @@ typedef struct {
 
 typedef struct {
     terminal_t terminal;
+    size_t idx;
 } source_t;
 
 /*
@@ -229,7 +232,8 @@ typedef struct {
         void *desc;
         struct fid_mr *mr;
         progress_msg_t msg;
-        struct fi_context context;
+        xfer_context_t xfc;
+        size_t nwritten;
     } progress;
     struct {
         struct iovec iov[12];
@@ -611,23 +615,11 @@ worker_buflist_replenish(worker_t *w, buflist_t *bl)
     for (paylen = 0, i = bl->nfull; i < ntofill; i++) {
         bytebuf_t *buf;
 
-        // paylen cycle: 7 -> 11 -> 13 -> 17 -> 19 -> 23 -> 29 -> 31 -> 7
+        // paylen cycle: -> 23 -> 29 -> 31 -> 37 -> 23
         switch (paylen) {
         case 0:
         default:
-            paylen = 7;
-            break;
-        case 7:
-            paylen = 11;
-            break;
-        case 11:
-            paylen = 13;
-            break;
-        case 13:
-            paylen = 17;
-            break;
-        case 17:
-            paylen = 19;
+            paylen = 23;
             break;
         case 23:
             paylen = 29;
@@ -636,7 +628,10 @@ worker_buflist_replenish(worker_t *w, buflist_t *bl)
             paylen = 31;
             break;
         case 31:
-            paylen = 7;
+            paylen = 37;
+            break;
+        case 37:
+            paylen = 23;
             break;
         }
         buf = bytebuf_alloc(paylen);
@@ -661,7 +656,22 @@ worker_buflist_replenish(worker_t *w, buflist_t *bl)
 }
 
 static bytebuf_t *
-worker_rxbuf_get(worker_t *w)
+worker_payload_txbuf_get(worker_t *w)
+{
+    bytebuf_t *b;
+
+    while ((b = buflist_get(w->freebufs.tx)) == NULL &&
+           worker_buflist_replenish(w, w->freebufs.tx))
+        ;   // do nothing
+
+    if (b != NULL)
+        warnx("%s: buf length %zu", __func__, b->hdr.nallocated);
+
+    return b;
+}
+
+static bytebuf_t *
+worker_payload_rxbuf_get(worker_t *w)
 {
     bytebuf_t *b;
 
@@ -767,7 +777,7 @@ rcvr_start(worker_t *w, session_t *s)
     r->started = true;
 
     for (nleftover = sizeof(r->payload.rxbuf), nloaded = 0; nleftover > 0; ) {
-        bytebuf_t *b = worker_rxbuf_get(w);
+        bytebuf_t *b = worker_payload_rxbuf_get(w);
 
         if (b == NULL)
             errx(EXIT_FAILURE, "%s: could not get a buffer", __func__);
@@ -1019,6 +1029,7 @@ out:
         errx(EXIT_FAILURE, "unexpected received message");
         /* FALLTHROUGH */
     case tr_end:
+        t->eof = true;
         if ((rc = fi_close(&r->ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
         warnx("%s: closed.", __func__);
@@ -1048,14 +1059,28 @@ xmtr_vecbuf_post(xmtr_t *x, vecbuf_t *vb)
 }
 
 static session_t *
-xmtr_start(session_t *s)
+xmtr_start(worker_t *w, session_t *s)
 {
     struct fi_cq_msg_entry completion;
     xmtr_t *x = (xmtr_t *)s->cxn;
+    const size_t txbuflen = strlen(txbuf);
+    size_t nleftover;
     ssize_t ncompleted;
     int rc;
 
     x->started = true;
+
+    for (nleftover = txbuflen; nleftover > 0; ) {
+        bytebuf_t *b = worker_payload_txbuf_get(w);
+
+        if (b == NULL)
+            errx(EXIT_FAILURE, "%s: could not get a buffer", __func__);
+
+        b->hdr.nfull = 0;
+        nleftover -= minsize(nleftover, b->hdr.nallocated);
+        if (!fifo_put(s->ready_for_terminal, &b->hdr))
+            errx(EXIT_FAILURE, "%s: could not enqueue tx buffer", __func__);
+    }
 
     /* Post receive for connection acknowledgement. */
     x->ack.desc = fi_mr_desc(x->ack.mr);
@@ -1314,15 +1339,15 @@ xmtr_vecbuf_unload(xmtr_t *x, vecbuf_t *vb)
     x->nriovs = i;
 }
 
+/* Process completions.  Return 0 if no completions occurred, 1 if
+ * any completion occurred, -1 on an irrecoverable error.
+ */
 static int
 xmtr_cq_process(xmtr_t *x)
 {
     struct fi_cq_msg_entry completion;
     ssize_t ncompleted;
     vecbuf_t *vb;
-
-    if ((vb = (vecbuf_t *)fifo_peek(x->vec.rxposted)) == NULL)
-        return 0;
 
     if ((ncompleted = fi_cq_read(x->cxn.cq, &completion, 1)) == -FI_EAGAIN)
         return 0;
@@ -1334,6 +1359,9 @@ xmtr_cq_process(xmtr_t *x)
         errx(EXIT_FAILURE,
             "%s: expected 1 completion, read %zd", __func__, ncompleted);
     }
+
+    if ((vb = (vecbuf_t *)fifo_peek(x->vec.rxposted)) == NULL)
+        return 0;
 
     if (completion.op_context != &vb->hdr.xfc.ctx) {
         errx(EXIT_FAILURE,
@@ -1371,11 +1399,12 @@ xmtr_loop(worker_t *w, session_t *s)
     struct fi_cq_msg_entry completion;
     xmtr_t *x = (xmtr_t *)s->cxn;
     const size_t txbuflen = strlen(txbuf);
+    size_t i;
     ssize_t rc;
     ssize_t ncompleted;
 
     if (!x->started)
-        return xmtr_start(s);
+        return xmtr_start(w, s);
 
     switch (xmtr_cq_process(x)) {
     case 0:
@@ -1387,11 +1416,57 @@ xmtr_loop(worker_t *w, session_t *s)
     }
 
     ssize_t nwritten, total;
-    size_t niovs = 1, niovs_out = 0, nriovs_out = 0;
+    size_t niovs, niovs_out = 0, nriovs_out = 0;
 
     ((!x->phase) ? x->payload.iov : x->payload.iov2)[0] =
         (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
     x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
+
+    const size_t most_riovs = minsize(w->rma_maxsegs, x->nriovs);
+    size_t most_bytes;
+    bufhdr_t *first_h, *h, *last_h = NULL;
+
+    switch (source_trade(s->terminal, s->ready_for_terminal, s->ready_for_cxn)){
+    case tr_ready:
+        break;
+    case tr_end:
+        s->terminal->eof = true;
+        break;
+    case tr_error:
+    default:
+        goto out;
+    }
+
+    for (most_bytes = 0, i = 0; i < most_riovs; i++) {
+        most_bytes += ((!x->phase) ? x->riov : x->riov2)[i].len;
+    }
+    for (i = 0, total = 0, first_h = last_h = NULL;
+         i < most_riovs && (h = fifo_peek(s->ready_for_cxn)) != NULL &&
+             h->nallocated + total <= most_bytes &&
+             !fifo_full(x->wrposted);
+         i++, last_h = h) {
+        bytebuf_t *b = (bytebuf_t *)h;
+
+        (void)fifo_get(s->ready_for_cxn);
+        (void)fifo_put(x->wrposted, h);
+
+        if (last_h == NULL)
+            first_h = h;
+
+        h->xfc.owner = xfc_program;
+        h->xfc.type = ct_rdma_write;
+        h->xfc.place = 0;
+
+        ((!x->phase) ? x->payload.iov : x->payload.iov2)[i] = (struct iovec){
+          .iov_len = h->nfull
+        , .iov_base = b->content
+        };
+        total += h->nfull;
+    }
+    niovs = i;
+    first_h->xfc.owner = xfc_nic;
+    first_h->xfc.place = xfc_first;
+    last_h->xfc.place |= xfc_last;
 
     /* Take txbuffers off of our queue while their cumulative length
      * is less than sum(0 <= i < min(rma_maxsegs, nriovs), riov[i].len).
@@ -1402,74 +1477,110 @@ xmtr_loop(worker_t *w, session_t *s)
      * Perform one fi_writemsg using the context on the first txbuffer.
      *
      * When a completion arrives, set its context's owner to `xfc_program`.
-     * If the context matches the head of `wrposted`, then dequeue the
-     * txbuffers at the head through the one marked `xfc_last`.
-     * Repeat dequeueing through `xfc_last` while the head's owner is
-     * `xfc_program`.
+     * Dequeue the txbuffers at the head of `wrposted` through the last
+     * one marked `xfc_program`.
      */
-    for (total = 0; total < txbuflen; total += nwritten, x->phase = !x->phase) {
 
-        write_fully_params_t p = {.ep = x->ep,
-            .iov_in = (!x->phase) ? x->payload.iov : x->payload.iov2,
-            .desc_in = (!x->phase) ? x->payload.desc : x->payload.desc2,
-            .iov_out = (!x->phase) ? x->payload.iov2 : x->payload.iov,
-            .desc_out = (!x->phase) ? x->payload.desc2 : x->payload.desc,
-            .niovs = niovs,
-            .niovs_out = &niovs_out,
-            .riov_in = (!x->phase) ? x->riov : x->riov2,
-            .riov_out = (!x->phase) ? x->riov2 : x->riov,
-            .nriovs = x->nriovs,
-            .nriovs_out = &nriovs_out,
-            .len = txbuflen - total,
-            .maxsegs = minsize(w->rma_maxsegs, x->nriovs),
-            .flags = FI_COMPLETION | FI_DELIVERY_COMPLETE,
-            .context = &x->payload.context,
-            .addr = x->cxn.peer_addr};
+    write_fully_params_t p = {.ep = x->ep,
+        .iov_in = (!x->phase) ? x->payload.iov : x->payload.iov2,
+        .desc_in = (!x->phase) ? x->payload.desc : x->payload.desc2,
+        .iov_out = (!x->phase) ? x->payload.iov2 : x->payload.iov,
+        .desc_out = (!x->phase) ? x->payload.desc2 : x->payload.desc,
+        .niovs = niovs,
+        .niovs_out = &niovs_out,
+        .riov_in = (!x->phase) ? x->riov : x->riov2,
+        .riov_out = (!x->phase) ? x->riov2 : x->riov,
+        .nriovs = x->nriovs,
+        .nriovs_out = &nriovs_out,
+        .len = total,
+        .maxsegs = minsize(w->rma_maxsegs, x->nriovs),
+        .flags = FI_COMPLETION | FI_DELIVERY_COMPLETE,
+        .context = &first_h->xfc.ctx,
+        .addr = x->cxn.peer_addr};
 
-        nwritten = write_fully(p);
+    nwritten = write_fully(p);
 
-        if (nwritten < 0)
-            bailout_for_ofi_ret(nwritten, "write_fully");
+    if (nwritten < 0)
+        bailout_for_ofi_ret(nwritten, "write_fully");
 
-        niovs = niovs_out;
+    if (niovs_out != 0) {
+        errx(EXIT_FAILURE, "%s: local I/O vectors were partially written",
+            __func__);
+    }
+    niovs = niovs_out;
 
-        const size_t nriovs_written = x->nriovs - nriovs_out;
-        x->nriovs = nriovs_out;
+    const size_t nriovs_written = x->nriovs - nriovs_out;
+    x->nriovs = nriovs_out;
 
-        /* Await RDMA completion. Pass flags FI_COMPLETION |
-         * FI_DELIVERY_COMPLETE to fi_writemsg, above.
-         */
-        do {
-            warnx("%s: awaiting RMA completion, context %p, remote count %zu",
-                __func__, (void *)&x->payload, nriovs_written);
-            ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
-        } while (ncompleted == -FI_EAGAIN);
+    /* Await RDMA delivery. */
+    do {
+        warnx("%s: awaiting RMA completion, context %p, remote count %zu",
+            __func__, (void *)&first_h->xfc.ctx, nriovs_written);
+        ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
+    } while (ncompleted == -FI_EAGAIN);
 
-        if (ncompleted == -FI_EAVAIL) {
-            struct fi_cq_err_entry e;
-            char errbuf[256];
-            ssize_t nfailed = fi_cq_readerr(x->cxn.cq, &e, 0);
+    if (ncompleted == -FI_EAVAIL) {
+        struct fi_cq_err_entry e;
+        char errbuf[256];
+        ssize_t nfailed = fi_cq_readerr(x->cxn.cq, &e, 0);
 
-            warnx("%s: read %zd errors, %s", __func__, nfailed,
-                fi_strerror(e.err));
-            warnx("%s: context %p", __func__, (void *)e.op_context);
-            warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
-                __func__, e.flags, desired_wr_flags);
-            warnx("%s: provider error %s", __func__,
-                fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
-                    sizeof(errbuf)));
-            goto out;
-        } else if (ncompleted < 0) {
-            bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
-        }
-
-        if (ncompleted != 1) {
-            errx(EXIT_FAILURE,
-                "%s: expected 1 completion, read %zd", __func__, ncompleted);
-        }
+        warnx("%s: read %zd errors, %s", __func__, nfailed,
+            fi_strerror(e.err));
+        warnx("%s: context %p", __func__, (void *)e.op_context);
+        warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
+            __func__, e.flags, desired_wr_flags);
+        warnx("%s: provider error %s", __func__,
+            fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
+                sizeof(errbuf)));
+        goto out;
+    } else if (ncompleted < 0) {
+        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
     }
 
-    x->progress.msg.nfilled = txbuflen;
+    if (ncompleted != 1) {
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
+    }
+
+    xfer_context_t *xfc = completion.op_context;
+
+    xfc->owner = xfc_program;
+
+    switch (xfc->type) {
+    case ct_rdma_write:
+        if ((h = fifo_peek(x->wrposted)) == NULL) {
+            errx(EXIT_FAILURE, "%s: no RDMA-write completions expected",
+                __func__);
+        }
+        if (xfc != &h->xfc) {
+            errx(EXIT_FAILURE, "%s: expected a different completion",
+                __func__);
+        }
+        if ((h->xfc.place & xfc_first) == 0) {
+            errx(EXIT_FAILURE, "%s: expected `first` context at head",
+                __func__);
+        }
+        while ((h = fifo_peek(x->wrposted)) != NULL &&
+               h->xfc.owner == xfc_program &&
+               !fifo_full(s->ready_for_terminal)) {
+            (void)fifo_get(x->wrposted);
+            (void)fifo_put(s->ready_for_terminal, h);
+        }
+        break;
+    default:
+        errx(EXIT_FAILURE, "%s: expected context type RDMA-write",
+            __func__);
+    }
+    x->phase = !x->phase;
+
+    x->progress.nwritten += total;
+
+    if (x->progress.xfc.owner != xfc_program)
+        goto out;
+
+    x->progress.xfc.owner = xfc_nic;
+
+    x->progress.msg.nfilled = x->progress.nwritten;
     x->progress.msg.nleftover = 0;
 
     x->progress.desc = fi_mr_desc(x->progress.mr);
@@ -1484,17 +1595,21 @@ xmtr_loop(worker_t *w, session_t *s)
         , .desc = &x->progress.desc
         , .iov_count = 1
         , .addr = x->cxn.peer_addr
-        , .context = &x->progress.context
+        , .context = &x->progress.xfc.ctx
         , .data = 0
         }, FI_COMPLETION);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_sendmsg");
 
+    x->progress.nwritten = 0;
+
+    warnx("sent %zu-byte progress message", sizeof(x->progress.msg));
+
     /* Await transmission of progress message. */
     do {
         warnx("%s: awaiting progress message transmission, "
-            "context %p, len %zu", __func__, (void *)&x->progress.context,
+            "context %p, len %zu", __func__, (void *)&x->progress.xfc.ctx,
             iov.iov_len);
         ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
     } while (ncompleted == -FI_EAGAIN);
@@ -1527,11 +1642,17 @@ xmtr_loop(worker_t *w, session_t *s)
             __func__, desired_tx_flags, completion.flags & desired_tx_flags);
     }
 
-    warnx("sent %zu-byte progress message", sizeof(x->progress.msg));
+    x->progress.xfc.owner = xfc_program;
 
 out:
 
-    return NULL;
+    if (s->terminal->eof && fifo_empty(s->ready_for_cxn) &&
+        fifo_empty(x->wrposted) && x->progress.nwritten == 0 &&
+        x->progress.xfc.owner == xfc_program) {
+        return NULL;
+    }
+
+    return s;
 }
 
 static session_t *
@@ -1968,6 +2089,13 @@ xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
 {
     memset(x, 0, sizeof(*x));
 
+    x->progress.nwritten = 0;
+    x->progress.xfc = (xfer_context_t){
+      .owner = xfc_program
+    , .place = xfc_first | xfc_last
+    , .type = ct_progress_tx
+    };
+
     cxn_init(&x->cxn, av, xmtr_loop);
     xmtr_memory_init(st, x);
     if ((x->wrposted = fifo_create(64)) == NULL) {
@@ -1986,11 +2114,27 @@ xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
 }
 
 static void
+terminal_init(terminal_t *t,
+    trade_result_t (*trade)(terminal_t *, fifo_t *, fifo_t *))
+{
+    t->trade = trade;
+    t->eof = false;
+}
+
+static void
 sink_init(sink_t *s)
 {
     memset(s, 0, sizeof(*s));
-    s->terminal.trade = sink_trade;
+    terminal_init(&s->terminal, sink_trade);
     s->txbuflen = strlen(txbuf);
+    s->idx = 0;
+}
+
+static void
+source_init(source_t *s)
+{
+    memset(s, 0, sizeof(*s));
+    terminal_init(&s->terminal, source_trade);
     s->idx = 0;
 }
 
@@ -2325,6 +2469,7 @@ put(state_t *st)
         bailout_for_ofi_ret(rc, "fi_av_open");
 
     xmtr_init(st, x, av);
+    source_init(s);
 
     if (!session_init(&sess, &x->cxn, &s->terminal))
         errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
