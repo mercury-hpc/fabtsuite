@@ -1462,7 +1462,6 @@ xmtr_cq_process(xmtr_t *x, session_t *s)
                 "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
                 __func__, desired_tx_flags, cmpl.flags & desired_tx_flags);
         }
-        x->progress.xfc.owner = xfc_program;
         return 1;
     default:
         warnx("%s: unexpected xfer context type", __func__);
