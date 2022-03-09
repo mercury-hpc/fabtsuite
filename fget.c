@@ -1339,45 +1339,35 @@ xmtr_vecbuf_unload(xmtr_t *x, vecbuf_t *vb)
     x->nriovs = i;
 }
 
-/* Process completions.  Return 0 if no completions occurred, 1 if
- * any completion occurred, -1 on an irrecoverable error.
+/* Process completion vector-message reception.  Return 0 if no
+ * completions occurred, 1 if any completion occurred, -1 on an
+ * irrecoverable error.
  */
 static int
-xmtr_cq_process(xmtr_t *x)
+xmtr_vector_rx_process(xmtr_t *x, const struct fi_cq_msg_entry *cmpl)
 {
-    struct fi_cq_msg_entry completion;
-    ssize_t ncompleted;
     vecbuf_t *vb;
 
-    if ((ncompleted = fi_cq_read(x->cxn.cq, &completion, 1)) == -FI_EAGAIN)
-        return 0;
-
-    if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_read");
-
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
-    }
-
-    if ((vb = (vecbuf_t *)fifo_peek(x->vec.rxposted)) == NULL)
-        return 0;
-
-    if (completion.op_context != &vb->hdr.xfc.ctx) {
-        errx(EXIT_FAILURE,
-            "%s: expected context %p found %p",
-            __func__, (void *)&vb->hdr.xfc.ctx, completion.op_context);
-    }
-
-    (void)fifo_get(x->vec.rxposted);
-
-    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
+    if ((cmpl->flags & desired_rx_flags) != desired_rx_flags) {
         errx(EXIT_FAILURE,
             "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+            __func__, desired_rx_flags,
+            cmpl->flags & desired_rx_flags);
     }
 
-    vb->hdr.nfull = completion.len;
+    if ((vb = (vecbuf_t *)fifo_get(x->vec.rxposted)) == NULL) {
+        warnx("%s: received a vector message, but no Rx was posted",
+            __func__);
+        return -1;
+    }
+
+    if (cmpl->op_context != &vb->hdr.xfc.ctx) {
+        errx(EXIT_FAILURE,
+            "%s: expected context %p received %p",
+            __func__, (void *)&vb->hdr.xfc.ctx, cmpl->op_context);
+    }
+
+    vb->hdr.nfull = cmpl->len;
 
     if (!vecbuf_is_wellformed(vb)) {
         xmtr_vecbuf_post(x, vb);
@@ -1393,38 +1383,111 @@ xmtr_cq_process(xmtr_t *x)
     return 1;
 }
 
+/* Process completions.  Return 0 if no completions occurred, 1 if
+ * any completion occurred, -1 on an irrecoverable error.
+ */
+static int
+xmtr_cq_process(xmtr_t *x, session_t *s)
+{
+    struct fi_cq_msg_entry cmpl;
+    bufhdr_t *h;
+    ssize_t ncompleted;
+
+    if ((ncompleted = fi_cq_read(x->cxn.cq, &cmpl, 1)) == -FI_EAGAIN)
+        return 0;
+
+    if (ncompleted == -FI_EAVAIL) {
+        struct fi_cq_err_entry e;
+        char errbuf[256];
+        ssize_t nfailed = fi_cq_readerr(x->cxn.cq, &e, 0);
+
+        warnx("%s: read %zd errors, %s", __func__, nfailed,
+            fi_strerror(e.err));
+        warnx("%s: context %p", __func__, (void *)e.op_context);
+        warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
+            __func__, e.flags, desired_wr_flags);
+        warnx("%s: provider error %s", __func__,
+            fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
+                sizeof(errbuf)));
+        return -1;
+    }
+
+    if (ncompleted < 0)
+        bailout_for_ofi_ret(ncompleted, "fi_cq_read");
+
+    if (ncompleted != 1) {
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
+    }
+
+    xfer_context_t *xfc = cmpl.op_context;
+
+    xfc->owner = xfc_program;
+
+    switch (xfc->type) {
+    case ct_vector_rx:
+        warnx("%s: read an vector rx completion", __func__);
+        return xmtr_vector_rx_process(x, &cmpl);
+    case ct_rdma_write:
+        warnx("%s: read an RDMA-write completion", __func__);
+        /* If the head of `wrposted` is marked `xfc_program`, then dequeue the
+         * txbuffers at the head of `wrposted` through the last one marked
+         * `xfc_program`.
+         */
+        if ((h = fifo_peek(x->wrposted)) == NULL) {
+            warnx("%s: no RDMA-write completions expected", __func__);
+            return -1;
+        }
+        /* XXX This can fail if `s->ready_for_terminal` ever fills
+         * to capacity, in the loop below.  That should not happen
+         * unless we accidentally put more buffers into circulation
+         * than there are slots in `s->ready_for_terminal`.  
+         */
+        if ((h->xfc.place & xfc_first) == 0) {
+            warnx("%s: expected `first` context at head", __func__);
+            return -1;
+        }
+        while ((h = fifo_peek(x->wrposted)) != NULL &&
+               h->xfc.owner == xfc_program &&
+               !fifo_full(s->ready_for_terminal)) {
+            (void)fifo_get(x->wrposted);
+            x->progress.nwritten += h->nfull;
+            (void)fifo_put(s->ready_for_terminal, h);
+        }
+        return 1;
+    case ct_progress_tx:
+        warnx("%s: read an progress tx completion", __func__);
+        if ((cmpl.flags & desired_tx_flags) != desired_tx_flags) {
+            errx(EXIT_FAILURE,
+                "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+                __func__, desired_tx_flags, cmpl.flags & desired_tx_flags);
+        }
+        x->progress.xfc.owner = xfc_program;
+        return 1;
+    default:
+        warnx("%s: unexpected xfer context type", __func__);
+        return -1;
+    }
+}
+
 static session_t *
 xmtr_loop(worker_t *w, session_t *s)
 {
-    struct fi_cq_msg_entry completion;
     xmtr_t *x = (xmtr_t *)s->cxn;
-    const size_t txbuflen = strlen(txbuf);
     size_t i;
     ssize_t rc;
-    ssize_t ncompleted;
 
     if (!x->started)
         return xmtr_start(w, s);
 
-    switch (xmtr_cq_process(x)) {
+    switch (xmtr_cq_process(x, s)) {
     case 0:
         return s;
     default:
         break;
     case -1:
-        goto out;
+        goto fail;
     }
-
-    ssize_t nwritten, total;
-    size_t niovs, niovs_out = 0, nriovs_out = 0;
-
-    ((!x->phase) ? x->payload.iov : x->payload.iov2)[0] =
-        (struct iovec){.iov_base = txbuf, .iov_len = txbuflen};
-    x->payload.desc[0] = fi_mr_desc(x->payload.mr[0]);
-
-    const size_t most_riovs = minsize(w->rma_maxsegs, x->nriovs);
-    size_t most_bytes;
-    bufhdr_t *first_h, *h, *last_h = NULL;
 
     switch (source_trade(s->terminal, s->ready_for_terminal, s->ready_for_cxn)){
     case tr_ready:
@@ -1434,17 +1497,22 @@ xmtr_loop(worker_t *w, session_t *s)
         break;
     case tr_error:
     default:
-        goto out;
+        goto fail;
     }
 
-    for (most_bytes = 0, i = 0; i < most_riovs; i++) {
-        most_bytes += ((!x->phase) ? x->riov : x->riov2)[i].len;
-    }
+    ssize_t nwritten, total;
+    const size_t maxriovs = minsize(w->rma_maxsegs, x->nriovs);
+    size_t maxbytes, niovs, niovs_out = 0, nriovs_out = 0;
+    bufhdr_t *first_h, *h, *last_h = NULL;
+
+    for (maxbytes = 0, i = 0; i < maxriovs; i++)
+        maxbytes += ((!x->phase) ? x->riov : x->riov2)[i].len;
+
     for (i = 0, total = 0, first_h = last_h = NULL;
-         i < most_riovs && (h = fifo_peek(s->ready_for_cxn)) != NULL &&
-             h->nallocated + total <= most_bytes &&
-             !fifo_full(x->wrposted);
-         i++, last_h = h) {
+         i < maxriovs &&
+             (h = fifo_peek(s->ready_for_cxn)) != NULL &&
+             h->nallocated + total <= maxbytes && !fifo_full(x->wrposted);
+         i++, last_h = h, total += h->nfull) {
         bytebuf_t *b = (bytebuf_t *)h;
 
         (void)fifo_get(s->ready_for_cxn);
@@ -1461,12 +1529,15 @@ xmtr_loop(worker_t *w, session_t *s)
           .iov_len = h->nfull
         , .iov_base = b->content
         };
-        total += h->nfull;
+        ((!x->phase) ? x->payload.desc : x->payload.desc2)[i] = h->desc;
     }
     niovs = i;
-    first_h->xfc.owner = xfc_nic;
-    first_h->xfc.place = xfc_first;
-    last_h->xfc.place |= xfc_last;
+
+    if (first_h != NULL) {
+        first_h->xfc.owner = xfc_nic;
+        first_h->xfc.place = xfc_first;
+        last_h->xfc.place |= xfc_last;
+    }
 
     /* Take txbuffers off of our queue while their cumulative length
      * is less than sum(0 <= i < min(rma_maxsegs, nriovs), riov[i].len).
@@ -1475,10 +1546,6 @@ xmtr_loop(worker_t *w, session_t *s)
      * of the txbuffers.  Set the owner of the first to `xfc_nic`.
      *
      * Perform one fi_writemsg using the context on the first txbuffer.
-     *
-     * When a completion arrives, set its context's owner to `xfc_program`.
-     * Dequeue the txbuffers at the head of `wrposted` through the last
-     * one marked `xfc_program`.
      */
 
     write_fully_params_t p = {.ep = x->ep,
@@ -1503,79 +1570,16 @@ xmtr_loop(worker_t *w, session_t *s)
     if (nwritten < 0)
         bailout_for_ofi_ret(nwritten, "write_fully");
 
-    if (niovs_out != 0) {
-        errx(EXIT_FAILURE, "%s: local I/O vectors were partially written",
-            __func__);
+    if (nwritten != total || niovs_out != 0) {
+        warnx("%s: local I/O vectors were partially written", __func__);
+        goto fail;
     }
-    niovs = niovs_out;
 
-    const size_t nriovs_written = x->nriovs - nriovs_out;
     x->nriovs = nriovs_out;
 
-    /* Await RDMA delivery. */
-    do {
-        warnx("%s: awaiting RMA completion, context %p, remote count %zu",
-            __func__, (void *)&first_h->xfc.ctx, nriovs_written);
-        ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
-
-    if (ncompleted == -FI_EAVAIL) {
-        struct fi_cq_err_entry e;
-        char errbuf[256];
-        ssize_t nfailed = fi_cq_readerr(x->cxn.cq, &e, 0);
-
-        warnx("%s: read %zd errors, %s", __func__, nfailed,
-            fi_strerror(e.err));
-        warnx("%s: context %p", __func__, (void *)e.op_context);
-        warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
-            __func__, e.flags, desired_wr_flags);
-        warnx("%s: provider error %s", __func__,
-            fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
-                sizeof(errbuf)));
-        goto out;
-    } else if (ncompleted < 0) {
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
-    }
-
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
-    }
-
-    xfer_context_t *xfc = completion.op_context;
-
-    xfc->owner = xfc_program;
-
-    switch (xfc->type) {
-    case ct_rdma_write:
-        if ((h = fifo_peek(x->wrposted)) == NULL) {
-            errx(EXIT_FAILURE, "%s: no RDMA-write completions expected",
-                __func__);
-        }
-        if (xfc != &h->xfc) {
-            errx(EXIT_FAILURE, "%s: expected a different completion",
-                __func__);
-        }
-        if ((h->xfc.place & xfc_first) == 0) {
-            errx(EXIT_FAILURE, "%s: expected `first` context at head",
-                __func__);
-        }
-        while ((h = fifo_peek(x->wrposted)) != NULL &&
-               h->xfc.owner == xfc_program &&
-               !fifo_full(s->ready_for_terminal)) {
-            (void)fifo_get(x->wrposted);
-            (void)fifo_put(s->ready_for_terminal, h);
-        }
-        break;
-    default:
-        errx(EXIT_FAILURE, "%s: expected context type RDMA-write",
-            __func__);
-    }
     x->phase = !x->phase;
 
-    x->progress.nwritten += total;
-
-    if (x->progress.xfc.owner != xfc_program)
+    if (x->progress.xfc.owner != xfc_program || x->progress.nwritten == 0)
         goto out;
 
     x->progress.xfc.owner = xfc_nic;
@@ -1606,49 +1610,12 @@ xmtr_loop(worker_t *w, session_t *s)
 
     warnx("sent %zu-byte progress message", sizeof(x->progress.msg));
 
-    /* Await transmission of progress message. */
-    do {
-        warnx("%s: awaiting progress message transmission, "
-            "context %p, len %zu", __func__, (void *)&x->progress.xfc.ctx,
-            iov.iov_len);
-        ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
-
-    if (ncompleted == -FI_EAVAIL) {
-        struct fi_cq_err_entry e;
-        char errbuf[256];
-        ssize_t nfailed = fi_cq_readerr(x->cxn.cq, &e, 0);
-
-        warnx("%s: read %zd errors, %s", __func__, nfailed,
-            fi_strerror(e.err));
-        warnx("%s: context %p", __func__, (void *)e.op_context);
-        warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
-            __func__, e.flags, desired_rx_flags);
-        warnx("%s: provider error %s", __func__,
-            fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
-                sizeof(errbuf)));
-        abort();
-    } else if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
-
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
-    }
-
-    if ((completion.flags & desired_tx_flags) != desired_tx_flags) {
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_tx_flags, completion.flags & desired_tx_flags);
-    }
-
-    x->progress.xfc.owner = xfc_program;
-
 out:
 
     if (s->terminal->eof && fifo_empty(s->ready_for_cxn) &&
         fifo_empty(x->wrposted) && x->progress.nwritten == 0 &&
         x->progress.xfc.owner == xfc_program) {
+fail:
         return NULL;
     }
 
