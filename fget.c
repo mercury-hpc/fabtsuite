@@ -54,19 +54,19 @@ typedef struct progress_msg {
 /* Communication buffers */
 
 typedef enum {
-  ct_rdma_write
-, ct_vector_rx
-, ct_progress_tx
-} context_type_t;
+  xft_rdma_write
+, xft_vector_rx
+, xft_progress_tx
+} xfc_type_t;
 
 typedef enum {
-    xfc_first = 0x1
-,   xfc_last = 0x2
+    xfp_first = 0x1
+,   xfp_last = 0x2
 } xfc_place_t;
 
 typedef enum {
-    xfc_program = 0
-,   xfc_nic = 1
+    xfo_program = 0
+,   xfo_nic = 1
 } xfc_owner_t;
 
 typedef struct {
@@ -79,7 +79,7 @@ typedef struct {
 
 typedef struct bufhdr {
     uint64_t raddr;
-    size_t nfull;
+    size_t nused;
     size_t nallocated;
     struct fid_mr *mr;
     void *desc;
@@ -107,23 +107,23 @@ typedef struct buflist {
     uint64_t access;
     size_t nfull;
     size_t nallocated;
-    bytebuf_t *buf[];
+    bufhdr_t *buf[];
 } buflist_t;
 
 /* Communication terminals: sources and sinks */
 
 typedef enum {
-    tr_ready
-,   tr_end
-,   tr_error
-} trade_result_t;
+    loop_continue
+,   loop_end
+,   loop_error
+} loop_control_t;
 
 struct terminal;
 typedef struct terminal terminal_t;
 
 struct terminal {
     /* trade(t, ready, completed) */
-    trade_result_t (*trade)(terminal_t *, fifo_t *, fifo_t *);
+    loop_control_t (*trade)(terminal_t *, fifo_t *, fifo_t *);
     bool eof;
 };
 
@@ -152,19 +152,20 @@ struct worker;
 typedef struct worker worker_t;
 
 struct cxn {
-    session_t *(*loop)(worker_t *, session_t *);
+    loop_control_t (*loop)(worker_t *, session_t *);
     fi_addr_t peer_addr;
     struct fid_cq *cq;
     struct fid_av *av;
+    bool started;
+    bool eof;
 };
 
 typedef struct {
     cxn_t cxn;
-    bool started;
     struct fid_ep *ep;
     struct fid_eq *eq;
     uint64_t nfull;
-    fifo_t *rxfifo;
+    fifo_t *tgtposted; // posted RDMA target buffers in order of issuance
     struct {
         struct iovec iov[12];
         void *desc[12];
@@ -182,13 +183,10 @@ typedef struct {
         initial_msg_t msg;
     } initial;
     struct {
-        struct iovec iov[12];
-        void *desc[12];
-        struct fid_mr *mr[12];
-        uint64_t raddr[12];
-        ssize_t niovs;
-        vector_msg_t msg;
-    } vector;
+        fifo_t *txready;    // vector-message buffers ready to transmit
+        fifo_t *txposted;   // buffers posted with vector messages
+        buflist_t *pool;    // buffers holding transmitted vector messages
+    } vec;
     struct {
         struct iovec iov[12];
         void *desc[12];
@@ -210,7 +208,6 @@ typedef struct {
 
 typedef struct {
     cxn_t cxn;
-    bool started;
     struct fid_ep *ep;
     struct fid_eq *eq;
     fifo_t *wrposted;  // posted RDMA writes in order of issuance
@@ -296,10 +293,11 @@ struct worker {
                              */
     pthread_cond_t sleep;   /* Used in conjunction with workers_mtx. */
     volatile atomic_bool cancelled;
+    bool failed;
     struct {
         buflist_t *tx;
         buflist_t *rx;
-    } freebufs;    /* Reservoirs for free buffers. */
+    } paybufs;    /* Reservoirs for free payload buffers. */
     keysource_t keys;
     size_t mr_maxsegs;
     size_t rma_maxsegs;
@@ -345,6 +343,9 @@ static size_t nworkers_allocated;
 static pthread_cond_t nworkers_cond = PTHREAD_COND_INITIALIZER;
 
 static bool workers_assignment_suspended = false;
+
+static const uint64_t rxaccess = FI_RECV | FI_REMOTE_WRITE;
+static const uint64_t txaccess = FI_SEND;
 
 static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
 static const uint64_t desired_tx_flags = FI_SEND | FI_MSG;
@@ -490,7 +491,7 @@ fifo_put(fifo_t *f, bufhdr_t *h)
     return true;
 }
 
-static bytebuf_t *
+static bufhdr_t *
 buflist_get(buflist_t *bl)
 {
     if (bl->nfull == 0)
@@ -499,17 +500,15 @@ buflist_get(buflist_t *bl)
     return bl->buf[--bl->nfull];
 }
 
-#if 0
 static bool
-buflist_put(buflist_t *bl, bytebuf_t *b)
+buflist_put(buflist_t *bl, bufhdr_t *h)
 {
     if (bl->nfull == bl->nallocated)
         return false;
 
-    bl->buf[bl->nfull++] = b;
+    bl->buf[bl->nfull++] = h;
     return true;
 }
-#endif
 
 static bool
 session_init(session_t *s, cxn_t *c, terminal_t *t)
@@ -556,7 +555,7 @@ buf_alloc(size_t paylen)
         return NULL;
 
     h->nallocated = paylen;
-    h->nfull = 0;
+    h->nused = 0;
     h->raddr = 0;
 
     return h;
@@ -578,7 +577,7 @@ vecbuf_alloc(void)
         return NULL;
 
     vb = (vecbuf_t *)h;
-    h->xfc.type = ct_vector_rx;
+    h->xfc.type = xft_vector_rx;
 
     h->raddr = (char *)&vb->msg - (char *)&h[1];
 
@@ -602,7 +601,7 @@ buf_mr_reg(struct fid_domain *dom, uint64_t access, uint64_t key,
 }
 
 static bool
-worker_buflist_replenish(worker_t *w, buflist_t *bl)
+worker_buflist_replenish(worker_t *w, uint64_t access, buflist_t *bl)
 {
     size_t i, paylen;
     int rc;
@@ -638,7 +637,7 @@ worker_buflist_replenish(worker_t *w, buflist_t *bl)
         if (buf == NULL)
             err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
 
-        rc = buf_mr_reg(w->dom, bl->access, keysource_next(&w->keys),
+        rc = buf_mr_reg(w->dom, access, keysource_next(&w->keys),
             &buf->hdr);
 
         if (rc != 0) {
@@ -648,7 +647,7 @@ worker_buflist_replenish(worker_t *w, buflist_t *bl)
         }
 
         warnx("%s: pushing %zu-byte buffer", __func__, buf->hdr.nallocated);
-        bl->buf[i] = buf;
+        bl->buf[i] = &buf->hdr;
     }
     bl->nfull = i;
 
@@ -660,8 +659,8 @@ worker_payload_txbuf_get(worker_t *w)
 {
     bytebuf_t *b;
 
-    while ((b = buflist_get(w->freebufs.tx)) == NULL &&
-           worker_buflist_replenish(w, w->freebufs.tx))
+    while ((b = (bytebuf_t *)buflist_get(w->paybufs.tx)) == NULL &&
+           worker_buflist_replenish(w, txaccess, w->paybufs.tx))
         ;   // do nothing
 
     if (b != NULL)
@@ -675,8 +674,8 @@ worker_payload_rxbuf_get(worker_t *w)
 {
     bytebuf_t *b;
 
-    while ((b = buflist_get(w->freebufs.rx)) == NULL &&
-           worker_buflist_replenish(w, w->freebufs.rx))
+    while ((b = (bytebuf_t *)buflist_get(w->paybufs.rx)) == NULL &&
+           worker_buflist_replenish(w, rxaccess, w->paybufs.rx))
         ;   // do nothing
 
     if (b != NULL)
@@ -765,118 +764,102 @@ err:
     return rc;
 }
 
-static session_t *
+static loop_control_t
 rcvr_start(worker_t *w, session_t *s)
 {
     rcvr_t *r = (rcvr_t *)s->cxn;
-    size_t i, nleftover, nloaded;
-    int rc;
-    bufhdr_t *payhdr[16];
-    size_t npayhdrs = 0;
+    size_t nleftover, nloaded;
 
-    r->started = true;
+    r->cxn.started = true;
 
-    for (nleftover = sizeof(r->payload.rxbuf), nloaded = 0; nleftover > 0; ) {
+    for (nleftover = sizeof(txbuf), nloaded = 0; nleftover > 0; ) {
         bytebuf_t *b = worker_payload_rxbuf_get(w);
 
-        if (b == NULL)
-            errx(EXIT_FAILURE, "%s: could not get a buffer", __func__);
+        if (b == NULL) {
+            warnx("%s: could not get a buffer", __func__);
+            return loop_error;
+        }
 
-        b->hdr.nfull = minsize(nleftover, b->hdr.nallocated);
-        nleftover -= b->hdr.nfull;
-        nloaded += b->hdr.nfull;
-        if (npayhdrs == arraycount(payhdr))
-            errx(EXIT_FAILURE, "%s: could not queue rx buffer", __func__);
-        payhdr[npayhdrs++] = &b->hdr;
+        b->hdr.nused = minsize(nleftover, b->hdr.nallocated);
+        nleftover -= b->hdr.nused;
+        nloaded += b->hdr.nused;
+        if (!fifo_put(s->ready_for_cxn, &b->hdr)) {
+            warnx("%s: could not enqueue tx buffer", __func__);
+            return loop_error;
+        }
     }
 
-    r->vector.msg.niovs = npayhdrs;
-    for (i = 0; i < npayhdrs; i++) {
-        bufhdr_t *h = payhdr[i];
-
-        fprintf(stderr, "payhdr[%zu]->nfull = %zu\n", i, h->nfull);
-
-        if (!fifo_put(r->rxfifo, h))
-            errx(EXIT_FAILURE, "%s: could not re-queue rx buffer", __func__);
-
-        r->vector.msg.iov[i].addr = 0;
-        r->vector.msg.iov[i].len = h->nfull;
-        r->vector.msg.iov[i].key = fi_mr_key(h->mr);
-    }
-
-    r->vector.niovs = fibonacci_iov_setup(&r->vector.msg,
-        (char *)&r->vector.msg.iov[r->vector.msg.niovs] -
-        (char *)&r->vector.msg,
-        r->vector.iov, w->rx_maxsegs);
-
-    if (r->vector.niovs < 1) {
-        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
-            __func__, r->vector.niovs);
-    }
-
-    rc = mr_regv_all(w->dom, r->vector.iov, r->vector.niovs,
-        minsize(2, w->mr_maxsegs), FI_SEND, 0, &w->keys, 0,
-        r->vector.mr, r->vector.desc, r->vector.raddr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "mr_regv_all");
-
-    return s;
+    return loop_continue;
 }
 
-/* Return `tr_ready` if the source is producing more bytes, `tr_end` if
+/* Return `loop_continue` if the source is producing more bytes, `loop_end` if
  * the source will produce no more bytes.
  */
-static trade_result_t
+static loop_control_t
 source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 {
     const size_t txbuflen = strlen(txbuf);
     source_t *s = (source_t *)t;
     bufhdr_t *h;
 
+    if (t->eof)
+        return loop_end;
+
     while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
         bytebuf_t *b = (bytebuf_t *)h;
 
         if (s->idx == txbuflen)
-            return tr_end;
+            return loop_end;
 
         (void)fifo_get(ready);
 
-        h->nfull = minsize(txbuflen - s->idx, h->nallocated);
-        memcpy(b->content, &txbuf[s->idx], h->nfull);
+        h->nused = minsize(txbuflen - s->idx, h->nallocated);
+        memcpy(b->content, &txbuf[s->idx], h->nused);
 
         (void)fifo_put(completed, h);
 
-        s->idx += h->nfull;
+        s->idx += h->nused;
     }
-    return (s->idx == txbuflen) ? tr_end : tr_ready;
+
+    if (s->idx != txbuflen)
+        return loop_continue;
+
+    t->eof = true;
+    return loop_end;
 }
 
-/* Return `tr_ready` if the sink is accepting more bytes, `tr_error` if
- * unexpected bytes are on `ready`, `tr_end` if the sink expects no more
+/* Return `loop_continue` if the sink is accepting more bytes, `loop_error` if
+ * unexpected bytes are on `ready`, `loop_end` if the sink expects no more
  * bytes.
  */
-static trade_result_t
+static loop_control_t
 sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 {
     sink_t *s = (sink_t *)t;
     bufhdr_t *h;
 
+    if (t->eof && !fifo_empty(ready))
+        return loop_error;
+
     while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
         bytebuf_t *b = (bytebuf_t *)h;
 
-        if (h->nfull > s->txbuflen - s->idx)
-            return tr_error;
+        if (h->nused > s->txbuflen - s->idx)
+            return loop_error;
 
-        if (memcmp(&txbuf[s->idx], b->content, h->nfull) != 0)
-            return tr_error;
+        if (memcmp(&txbuf[s->idx], b->content, h->nused) != 0)
+            return loop_error;
 
         (void)fifo_get(ready);
         (void)fifo_put(completed, h);
 
-        s->idx += h->nfull;
+        s->idx += h->nused;
     }
-    return (s->idx == s->txbuflen) ? tr_end : tr_ready;
+    if (s->idx != s->txbuflen)
+        return loop_continue;
+
+    t->eof = true;
+    return loop_end;
 }
 
 #if 0
@@ -956,90 +939,122 @@ rcvr_progress_rx(rcvr_t *r)
     }
 
     r->nfull += r->progress.msg.nfilled;
-    if (r->nfull != strlen(txbuf)) {
-        errx(EXIT_FAILURE,
-            "progress: %" PRIu64 " bytes filled, expected %" PRIu64 "\n",
-            r->progress.msg.nfilled,
-            strlen(txbuf));
-    }
 
-    if (r->progress.msg.nleftover != 0) {
-        errx(EXIT_FAILURE,
-            "progress: %" PRIu64 " bytes leftover, expected 0\n",
-            r->progress.msg.nleftover);
-    }
+    if (r->progress.msg.nleftover == 0)
+        r->cxn.eof = true;
 
     return r;
 }
 
-static session_t *
+static loop_control_t
 rcvr_loop(worker_t *w, session_t *s)
 {
+    bufhdr_t *h;
     rcvr_t *r = (rcvr_t *)s->cxn;
     terminal_t *t = s->terminal;
-    size_t nremaining;
+    vecbuf_t *vb;
+    size_t i;
     int rc;
+    loop_control_t ctl;
 
-    if (!r->started)
+    if (!r->cxn.started)
         return rcvr_start(w, s);
 
     /* Transmit vector. */
+ 
+    while (!fifo_full(r->vec.txready) && !fifo_empty(s->ready_for_cxn) &&
+           (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
 
-    if (r->vector.msg.niovs == 0) {
-        ; // no vectors to send the peer, do nothing
-    } else if ((rc = fi_sendmsg(r->ep, &(struct fi_msg){
-          .msg_iov = r->vector.iov
-        , .desc = r->vector.desc
-        , .iov_count = r->vector.niovs
-        , .addr = r->cxn.peer_addr
-        , .context = NULL
-        , .data = 0
-        }, 0)) == -FI_EAGAIN) {
-        return s;
-    } else if (rc < 0) {
-        bailout_for_ofi_ret(rc, "fi_sendmsg");
-    } else {
-        // record that there are all vectors were sent to the peer
-        r->vector.msg.niovs = 0;
+        for (i = 0;
+             i < arraycount(vb->msg.iov) &&
+                 (h = fifo_get(s->ready_for_cxn)) != NULL;
+             i++) {
+
+            h->nused = 0;
+
+            (void)fifo_put(r->tgtposted, h);
+
+            /* TBD use rx'd progress message to zip through and set h->nused */
+            vb->msg.iov[i].addr = 0;
+            vb->msg.iov[i].len = h->nallocated;
+            vb->msg.iov[i].key = fi_mr_key(h->mr);
+        }
+        vb->msg.niovs = i;
+
+        (void)fifo_put(r->vec.txready, &vb->hdr);
+
+    }
+
+    while ((vb = (vecbuf_t *)fifo_peek(r->vec.txready)) != NULL &&
+           !fifo_full(r->vec.txposted)) {
+        rc = fi_sendmsg(r->ep, &(struct fi_msg){
+              .msg_iov = &(struct iovec){
+                  .iov_base = &vb->msg
+                , .iov_len = (char *)&vb->msg.iov[vb->msg.niovs] -
+                             (char *)&vb->msg}
+            , .desc = vb->hdr.desc
+            , .iov_count = 1
+            , .addr = r->cxn.peer_addr
+            , .context = NULL
+            , .data = 0
+            }, 0);
+
+        if (rc == 0) {
+            (void)fifo_get(r->vec.txready);
+            (void)fifo_put(r->vec.txposted, &vb->hdr);
+        } else if (rc == -FI_EAGAIN) {
+            break;
+        } else if (rc < 0) {
+            bailout_for_ofi_ret(rc, "fi_sendmsg");
+        }
     }
 
     if (rcvr_progress_rx(r) == NULL)
         goto out;
 
-    for (nremaining = r->nfull;
-         nremaining > 0 && !fifo_full(s->ready_for_terminal); ) {
-        bufhdr_t *h = fifo_get(r->rxfifo);
-
-        if (nremaining < h->nfull) {
-            h->nfull = nremaining;
-            nremaining = 0;
+    while (r->nfull > 0 &&
+          (h = fifo_peek(r->tgtposted)) != NULL &&
+          !fifo_full(s->ready_for_terminal)) {
+        if (h->nused + r->nfull < h->nallocated) {
+            h->nused += r->nfull;
+            r->nfull = 0;
         } else {
-            nremaining -= h->nfull;
+            r->nfull -= (h->nallocated - h->nused);
+            h->nused = h->nallocated;
+            (void)fifo_get(r->tgtposted);
+            (void)fifo_put(s->ready_for_terminal, h);
         }
+    }
 
+    if (s->cxn->eof && (h = fifo_peek(r->tgtposted)) != NULL &&
+        h->nused != 0) {
+        (void)fifo_get(r->tgtposted);
         (void)fifo_put(s->ready_for_terminal, h);
     }
 
 out:
-    switch (sink_trade(t, s->ready_for_terminal, s->ready_for_cxn)) {
-    case tr_ready:
-        return s;
-    case tr_error:
+    ctl = sink_trade(t, s->ready_for_terminal, s->ready_for_cxn);
+    switch (ctl) {
+    case loop_error:
+        warnx("unexpected received message");
+        return loop_error;
+    case loop_end:
+        break;
     default:
-        /* XXX exit for testing purposes; fallthrough will not occur. */
-        errx(EXIT_FAILURE, "unexpected received message");
-        /* FALLTHROUGH */
-    case tr_end:
-        t->eof = true;
+        return ctl;
+    }
+
+    if (t->eof && fifo_empty(s->ready_for_terminal)) {
         if ((rc = fi_close(&r->ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
         warnx("%s: closed.", __func__);
-        return NULL;
+        return loop_end;
     }
+    return loop_continue;
 }
 
 static void
-xmtr_vecbuf_post(xmtr_t *x, vecbuf_t *vb)
+xmtr_vecbuf_rx_post(xmtr_t *x, vecbuf_t *vb)
 {
     int rc;
 
@@ -1059,7 +1074,7 @@ xmtr_vecbuf_post(xmtr_t *x, vecbuf_t *vb)
     (void)fifo_put(x->vec.rxposted, &vb->hdr);
 }
 
-static session_t *
+static loop_control_t
 xmtr_start(worker_t *w, session_t *s)
 {
     struct fi_cq_msg_entry completion;
@@ -1069,7 +1084,7 @@ xmtr_start(worker_t *w, session_t *s)
     ssize_t ncompleted;
     int rc;
 
-    x->started = true;
+    x->cxn.started = true;
 
     for (nleftover = txbuflen; nleftover > 0; ) {
         bytebuf_t *b = worker_payload_txbuf_get(w);
@@ -1077,7 +1092,7 @@ xmtr_start(worker_t *w, session_t *s)
         if (b == NULL)
             errx(EXIT_FAILURE, "%s: could not get a buffer", __func__);
 
-        b->hdr.nfull = 0;
+        b->hdr.nused = 0;
         nleftover -= minsize(nleftover, b->hdr.nallocated);
         if (!fifo_put(s->ready_for_terminal, &b->hdr))
             errx(EXIT_FAILURE, "%s: could not enqueue tx buffer", __func__);
@@ -1171,10 +1186,10 @@ xmtr_start(worker_t *w, session_t *s)
     while (!fifo_full(x->vec.rxposted)) {
         vecbuf_t *vb = vecbuf_alloc();
 
-        xmtr_vecbuf_post(x, vb);
+        xmtr_vecbuf_rx_post(x, vb);
     }
 
-    return s;
+    return loop_continue;
 }
 
 typedef struct write_fully_params {
@@ -1293,7 +1308,7 @@ write_fully(const write_fully_params_t p)
 static bool
 vecbuf_is_wellformed(vecbuf_t *vb)
 {
-    size_t len = vb->hdr.nfull;
+    size_t len = vb->hdr.nused;
 
     static const ptrdiff_t least_vector_msglen =
         (char *)&vb->msg.iov[0] - (char *)&vb->msg;
@@ -1368,16 +1383,16 @@ xmtr_vector_rx_process(xmtr_t *x, const struct fi_cq_msg_entry *cmpl)
             __func__, (void *)&vb->hdr.xfc.ctx, cmpl->op_context);
     }
 
-    vb->hdr.nfull = cmpl->len;
+    vb->hdr.nused = cmpl->len;
 
     if (!vecbuf_is_wellformed(vb)) {
-        xmtr_vecbuf_post(x, vb);
+        xmtr_vecbuf_rx_post(x, vb);
         return 0;
     }
 
     if (x->nriovs == 0) {
         xmtr_vecbuf_unload(x, vb);
-        xmtr_vecbuf_post(x, vb);
+        xmtr_vecbuf_rx_post(x, vb);
     } else if (!fifo_put(x->vec.rcvd, &vb->hdr))
         errx(EXIT_FAILURE, "%s: received vectors FIFO was full", __func__);
 
@@ -1423,17 +1438,17 @@ xmtr_cq_process(xmtr_t *x, session_t *s)
 
     xfer_context_t *xfc = cmpl.op_context;
 
-    xfc->owner = xfc_program;
+    xfc->owner = xfo_program;
 
     switch (xfc->type) {
-    case ct_vector_rx:
+    case xft_vector_rx:
         warnx("%s: read an vector rx completion", __func__);
         return xmtr_vector_rx_process(x, &cmpl);
-    case ct_rdma_write:
+    case xft_rdma_write:
         warnx("%s: read an RDMA-write completion", __func__);
-        /* If the head of `wrposted` is marked `xfc_program`, then dequeue the
+        /* If the head of `wrposted` is marked `xfo_program`, then dequeue the
          * txbuffers at the head of `wrposted` through the last one marked
-         * `xfc_program`.
+         * `xfo_program`.
          */
         if ((h = fifo_peek(x->wrposted)) == NULL) {
             warnx("%s: no RDMA-write completions expected", __func__);
@@ -1444,19 +1459,19 @@ xmtr_cq_process(xmtr_t *x, session_t *s)
          * unless we accidentally put more buffers into circulation
          * than there are slots in `s->ready_for_terminal`.  
          */
-        if ((h->xfc.place & xfc_first) == 0) {
+        if ((h->xfc.place & xfp_first) == 0) {
             warnx("%s: expected `first` context at head", __func__);
             return -1;
         }
         while ((h = fifo_peek(x->wrposted)) != NULL &&
-               h->xfc.owner == xfc_program &&
+               h->xfc.owner == xfo_program &&
                !fifo_full(s->ready_for_terminal)) {
             (void)fifo_get(x->wrposted);
-            x->progress.nwritten += h->nfull;
+            x->progress.nwritten += h->nused;
             (void)fifo_put(s->ready_for_terminal, h);
         }
         return 1;
-    case ct_progress_tx:
+    case xft_progress_tx:
         warnx("%s: read an progress tx completion", __func__);
         if ((cmpl.flags & desired_tx_flags) != desired_tx_flags) {
             errx(EXIT_FAILURE,
@@ -1470,19 +1485,19 @@ xmtr_cq_process(xmtr_t *x, session_t *s)
     }
 }
 
-static session_t *
+static loop_control_t
 xmtr_loop(worker_t *w, session_t *s)
 {
     xmtr_t *x = (xmtr_t *)s->cxn;
     size_t i;
     ssize_t rc;
 
-    if (!x->started)
+    if (!x->cxn.started)
         return xmtr_start(w, s);
 
     switch (xmtr_cq_process(x, s)) {
     case 0:
-        return s;
+        return loop_continue;
     default:
         break;
     case -1:
@@ -1490,12 +1505,11 @@ xmtr_loop(worker_t *w, session_t *s)
     }
 
     switch (source_trade(s->terminal, s->ready_for_terminal, s->ready_for_cxn)){
-    case tr_ready:
+    case loop_continue:
         break;
-    case tr_end:
-        s->terminal->eof = true;
+    case loop_end:
         break;
-    case tr_error:
+    case loop_error:
     default:
         goto fail;
     }
@@ -1512,7 +1526,7 @@ xmtr_loop(worker_t *w, session_t *s)
          i < maxriovs &&
              (h = fifo_peek(s->ready_for_cxn)) != NULL &&
              h->nallocated + total <= maxbytes && !fifo_full(x->wrposted);
-         i++, last_h = h, total += h->nfull) {
+         i++, last_h = h, total += h->nused) {
         bytebuf_t *b = (bytebuf_t *)h;
 
         (void)fifo_get(s->ready_for_cxn);
@@ -1521,12 +1535,12 @@ xmtr_loop(worker_t *w, session_t *s)
         if (last_h == NULL)
             first_h = h;
 
-        h->xfc.owner = xfc_program;
-        h->xfc.type = ct_rdma_write;
+        h->xfc.owner = xfo_program;
+        h->xfc.type = xft_rdma_write;
         h->xfc.place = 0;
 
         ((!x->phase) ? x->payload.iov : x->payload.iov2)[i] = (struct iovec){
-          .iov_len = h->nfull
+          .iov_len = h->nused
         , .iov_base = b->content
         };
         ((!x->phase) ? x->payload.desc : x->payload.desc2)[i] = h->desc;
@@ -1534,16 +1548,16 @@ xmtr_loop(worker_t *w, session_t *s)
     niovs = i;
 
     if (first_h != NULL) {
-        first_h->xfc.owner = xfc_nic;
-        first_h->xfc.place = xfc_first;
-        last_h->xfc.place |= xfc_last;
+        first_h->xfc.owner = xfo_nic;
+        first_h->xfc.place = xfp_first;
+        last_h->xfc.place |= xfp_last;
     }
 
     /* Take txbuffers off of our queue while their cumulative length
      * is less than sum(0 <= i < min(rma_maxsegs, nriovs), riov[i].len).
-     * Flag the first txbuffer `xfc_first` and the last `xfc_last`
+     * Flag the first txbuffer `xfp_first` and the last `xfp_last`
      * (first and last may be the same buffer).  Clear flags on the rest
-     * of the txbuffers.  Set the owner of the first to `xfc_nic`.
+     * of the txbuffers.  Set the owner of the first to `xfo_nic`.
      *
      * Perform one fi_writemsg using the context on the first txbuffer.
      */
@@ -1579,10 +1593,10 @@ xmtr_loop(worker_t *w, session_t *s)
 
     x->phase = !x->phase;
 
-    if (x->progress.xfc.owner != xfc_program || x->progress.nwritten == 0)
+    if (x->progress.xfc.owner != xfo_program || x->progress.nwritten == 0)
         goto out;
 
-    x->progress.xfc.owner = xfc_nic;
+    x->progress.xfc.owner = xfo_nic;
 
     x->progress.msg.nfilled = x->progress.nwritten;
     x->progress.msg.nleftover = 0;
@@ -1614,18 +1628,22 @@ out:
 
     if (s->terminal->eof && fifo_empty(s->ready_for_cxn) &&
         fifo_empty(x->wrposted) && x->progress.nwritten == 0 &&
-        x->progress.xfc.owner == xfc_program) {
-fail:
+        x->progress.xfc.owner == xfo_program) {
         if ((rc = fi_close(&x->ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
         warnx("%s: closed.", __func__);
-        return NULL;
+        return loop_end;
     }
 
-    return s;
+    return loop_continue;
+fail:
+    if ((rc = fi_close(&x->ep->fid)) < 0)
+        bailout_for_ofi_ret(rc, "fi_close");
+    warnx("%s: closed.", __func__);
+    return loop_error;
 }
 
-static session_t *
+static loop_control_t
 cxn_loop(worker_t *w, session_t *s)
 {
     warnx("%s: going around", __func__);
@@ -1665,8 +1683,15 @@ worker_run_loop(worker_t *self)
                 continue;
 
             // continue at next cxn_t if `c` did not exit
-            if (cxn_loop(self, s) != NULL)
+            switch (cxn_loop(self, s)) {
+            case loop_continue:
                 continue;
+            case loop_end:
+                break;
+            case loop_error:
+                self->failed = true;
+                break;
+            }
 
             *cp = NULL;
 
@@ -1752,30 +1777,40 @@ worker_buflist_destroy(struct fid_domain *dom, buflist_t *bl)
     int rc;
 
     for (i = 0; i < bl->nfull; i++) {
-        bytebuf_t *b = bl->buf[i];
+        bufhdr_t *h = bl->buf[i];
 
-        if ((rc = fi_close(&b->hdr.mr->fid)) != 0)
+        if ((rc = fi_close(&h->mr->fid)) != 0)
             warn_about_ofi_ret(rc, "fi_mr_reg");
 
-        free(b);
+        free(h);
     }
     bl->nfull = bl->nallocated = 0;
     free(bl);
 }
 
 static buflist_t *
-worker_buflist_create(worker_t *w, uint64_t access)
+buflist_create(size_t n)
 {
-    buflist_t *bl = malloc(offsetof(buflist_t, buf[256]));
+    buflist_t *bl = malloc(offsetof(buflist_t, buf) + sizeof(bl->buf[0]) * n);
 
     if (bl == NULL)
-        err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
+        return NULL;
 
-    bl->access = access;
-    bl->nallocated = 16;
+    bl->nallocated = n;
     bl->nfull = 0;
 
-    if (!worker_buflist_replenish(w, bl)) {
+    return bl;
+}
+
+static buflist_t *
+worker_buflist_create(worker_t *w, uint64_t access)
+{
+    buflist_t *bl = buflist_create(16);
+
+    if (bl == NULL)
+        return NULL;
+
+    if (!worker_buflist_replenish(w, access, bl)) {
         worker_buflist_destroy(w->dom, bl);
         return NULL;
     }
@@ -1791,6 +1826,7 @@ worker_init(worker_t *w, const state_t *st)
     size_t i;
 
     w->cancelled = false;
+    w->failed = false;
     w->dom = st->domain;
     w->mr_maxsegs = st->mr_maxsegs;
     w->rma_maxsegs = st->rma_maxsegs;
@@ -1813,8 +1849,8 @@ worker_init(worker_t *w, const state_t *st)
     for (i = 0; i < arraycount(w->session); i++)
         w->session[i] = (session_t){.cxn = NULL, .terminal = NULL};
 
-    w->freebufs.rx = worker_buflist_create(w, FI_RECV | FI_REMOTE_WRITE);
-    w->freebufs.tx = worker_buflist_create(w, FI_SEND);
+    w->paybufs.rx = worker_buflist_create(w, rxaccess);
+    w->paybufs.tx = worker_buflist_create(w, txaccess);
 }
 
 static void
@@ -1982,9 +2018,10 @@ workers_assign_session(state_t *st, session_t *s)
     return w;
 }
 
-static void
+static int
 workers_join_all(void)
 {
+    int code = EXIT_SUCCESS;
     size_t i;
 
     (void)pthread_mutex_lock(&workers_mtx);
@@ -2011,16 +2048,21 @@ workers_join_all(void)
                 errx(EXIT_FAILURE, "%s.%d: pthread_join: %s",
                     __func__, __LINE__, strerror(rc));
         }
+        if (w->failed)
+            code = EXIT_FAILURE;
     }
+    return code;
 }
 
 static void
 cxn_init(cxn_t *c, struct fid_av *av,
-    session_t *(*loop)(worker_t *, session_t *))
+    loop_control_t (*loop)(worker_t *, session_t *))
 {
     memset(c, 0, sizeof(*c));
     c->loop = loop;
     c->av = av;
+    c->started = false;
+    c->eof = false;
 }
 
 static void
@@ -2061,9 +2103,9 @@ xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
 
     x->progress.nwritten = 0;
     x->progress.xfc = (xfer_context_t){
-      .owner = xfc_program
-    , .place = xfc_first | xfc_last
-    , .type = ct_progress_tx
+      .owner = xfo_program
+    , .place = xfp_first | xfp_last
+    , .type = xft_progress_tx
     };
 
     cxn_init(&x->cxn, av, xmtr_loop);
@@ -2080,12 +2122,11 @@ xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
         errx(EXIT_FAILURE,
             "%s: could not create received vectors FIFO", __func__);
     }
-    x->started = false;
 }
 
 static void
 terminal_init(terminal_t *t,
-    trade_result_t (*trade)(terminal_t *, fifo_t *, fifo_t *))
+    loop_control_t (*trade)(terminal_t *, fifo_t *, fifo_t *))
 {
     t->trade = trade;
     t->eof = false;
@@ -2162,13 +2203,49 @@ rcvr_memory_init(state_t *st, rcvr_t *r)
 static void
 rcvr_init(state_t *st, rcvr_t *r, struct fid_av *av)
 {
+    const size_t nvecbufs = 16;
+    size_t i;
+
     memset(r, 0, sizeof(*r));
 
     cxn_init(&r->cxn, av, rcvr_loop);
     rcvr_memory_init(st, r);
-    if ((r->rxfifo = fifo_create(64)) == NULL)
-        errx(EXIT_FAILURE, "%s: could not create Rx FIFO", __func__);
-    r->started = false;
+
+    if ((r->tgtposted = fifo_create(64)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create RDMA targets FIFO", __func__);
+    }
+
+    if ((r->vec.txready = fifo_create(64)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create ready vectors FIFO", __func__);
+    }
+
+    if ((r->vec.txposted = fifo_create(64)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create posted vectors FIFO", __func__);
+    }
+
+    if ((r->vec.pool = buflist_create(nvecbufs)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create vector-message tx buffer pool", __func__);
+    }
+
+    for (i = 0; i < nvecbufs; i++) {
+        vecbuf_t *vb = vecbuf_alloc();
+        int rc;
+
+        rc = buf_mr_reg(st->domain, FI_SEND, keysource_next(&st->keys),
+            &vb->hdr);
+
+        if (rc != 0) {
+            warn_about_ofi_ret(rc, "fi_mr_reg");
+            free(vb);
+            break;
+        }
+        if (!buflist_put(r->vec.pool, &vb->hdr))
+            errx(EXIT_FAILURE, "%s: vector buffer pool full", __func__);
+    }
 }
 
 static int
@@ -2392,9 +2469,7 @@ get(state_t *st)
             __func__);
     }
 
-    workers_join_all();
-
-    return EXIT_SUCCESS;
+    return workers_join_all();
 }
 
 static int
@@ -2506,9 +2581,7 @@ put(state_t *st)
             __func__);
     }
 
-    workers_join_all();
-
-    return EXIT_SUCCESS;
+    return workers_join_all();
 }
 
 static int
