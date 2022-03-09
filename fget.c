@@ -917,6 +917,7 @@ rcvr_progress_rx(rcvr_t *r)
     warnx("%s: checking for progress message, context %p, "
         "last len %zu, count %zu", __func__, (void *)&r->progress,
         r->progress.iov[r->progress.niovs - 1].iov_len, r->progress.niovs);
+
     if ((ncompleted = fi_cq_read(r->cxn.cq, &completion, 1)) == -FI_EAGAIN)
         return r;
 
