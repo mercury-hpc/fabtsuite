@@ -1616,6 +1616,9 @@ out:
         fifo_empty(x->wrposted) && x->progress.nwritten == 0 &&
         x->progress.xfc.owner == xfc_program) {
 fail:
+        if ((rc = fi_close(&x->ep->fid)) < 0)
+            bailout_for_ofi_ret(rc, "fi_close");
+        warnx("%s: closed.", __func__);
         return NULL;
     }
 
