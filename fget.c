@@ -906,14 +906,14 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
     bufhdr_t *h;
 
     if (t->eof && !fifo_empty(ready))
-        return loop_error;
+        goto fail;
 
     while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
         bytebuf_t *b = (bytebuf_t *)h;
         size_t len, ofs;
 
         if (h->nused + s->idx > s->entirelen)
-            return loop_error;
+            goto fail;
 
         for (ofs = 0; ofs < h->nused; ofs += len) {
             size_t txbuf_ofs = (s->idx + ofs) % s->txbuflen;
@@ -921,7 +921,7 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
             printf("%.*s", (int)len, &b->payload[ofs]);
             fflush(stdout);
             if (memcmp(&b->payload[ofs], &txbuf[txbuf_ofs], len) != 0)
-                return loop_error;
+                goto fail;
         }
 
         (void)fifo_get(ready);
@@ -933,6 +933,9 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 
     t->eof = true;
     return loop_end;
+fail:
+    warnx("unexpected received message");
+    return loop_error;
 }
 
 static bufhdr_t *
@@ -1100,6 +1103,14 @@ rcvr_loop(worker_t *w, session_t *s)
     if (!r->cxn.started)
         return rcvr_start(w, s);
 
+    if (rcvr_cq_process(r) == -1)
+        goto fail;
+
+    ctl = sink_trade(t, s->ready_for_terminal, s->ready_for_cxn);
+
+    if (ctl == loop_error)
+        goto fail;
+
     /* Transmit vector. */
  
     if (r->cxn.eof.remote && !r->cxn.eof.local &&
@@ -1157,9 +1168,6 @@ rcvr_loop(worker_t *w, session_t *s)
         }
     }
 
-    if (rcvr_cq_process(r) == -1)
-        goto fail;
-
     while (r->nfull > 0 &&
           (h = fifo_peek(r->tgtposted)) != NULL &&
           !fifo_full(s->ready_for_terminal)) {
@@ -1182,17 +1190,6 @@ rcvr_loop(worker_t *w, session_t *s)
         h->nused != 0) {
         (void)fifo_get(r->tgtposted);
         (void)fifo_put(s->ready_for_terminal, h);
-    }
-
-    ctl = sink_trade(t, s->ready_for_terminal, s->ready_for_cxn);
-    switch (ctl) {
-    case loop_error:
-        warnx("unexpected received message");
-        return loop_error;
-    case loop_end:
-        break;
-    default:
-        return ctl;
     }
 
     if (t->eof && fifo_empty(s->ready_for_terminal) &&
@@ -1617,6 +1614,7 @@ xmtr_loop(worker_t *w, session_t *s)
     size_t i;
     size_t maxbytes, niovs, niovs_out = 0, nriovs_out = 0;
     ssize_t nwritten, rc, total;
+    loop_control_t ctl;
 
     if (!x->cxn.started)
         return xmtr_start(w, s);
@@ -1624,15 +1622,10 @@ xmtr_loop(worker_t *w, session_t *s)
     if (xmtr_cq_process(x, s) == -1)
         goto fail;
 
-    switch (source_trade(s->terminal, s->ready_for_terminal, s->ready_for_cxn)){
-    case loop_continue:
-        break;
-    case loop_end:
-        break;
-    case loop_error:
-    default:
+    ctl = source_trade(s->terminal, s->ready_for_terminal, s->ready_for_cxn);
+
+    if (ctl == loop_error)
         goto fail;
-    }
 
     for (maxbytes = 0, i = 0; i < maxriovs; i++)
         maxbytes += ((!x->phase) ? x->riov : x->riov2)[i].len;
