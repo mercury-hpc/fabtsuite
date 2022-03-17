@@ -797,6 +797,34 @@ err:
     return rc;
 }
 
+static bufhdr_t *
+rxctl_complete(rxctl_t *rc, const struct fi_cq_msg_entry *cmpl)
+{
+    bufhdr_t *h;
+
+    if ((cmpl->flags & desired_rx_flags) != desired_rx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags,
+            cmpl->flags & desired_rx_flags);
+    }
+
+    if ((h = fifo_get(rc->rxposted)) == NULL) {
+        warnx("%s: received a message, but no Rx was posted", __func__);
+        return NULL;
+    }
+
+    if (cmpl->op_context != &h->xfc.ctx) {
+        errx(EXIT_FAILURE,
+            "%s: expected context %p received %p",
+            __func__, (void *)&h->xfc.ctx, cmpl->op_context);
+    }
+
+    h->nused = cmpl->len;
+
+    return h;
+}
+
 static void
 rxctl_post(cxn_t *c, rxctl_t *ctl, bufhdr_t *h)
 {
@@ -816,6 +844,69 @@ rxctl_post(cxn_t *c, rxctl_t *ctl, bufhdr_t *h)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
 
     (void)fifo_put(ctl->rxposted, h);
+}
+
+/* Process completed progress-message transmission.  Return 0 if no
+ * completions occurred, 1 if any completion occurred, -1 on an
+ * irrecoverable error.
+ */
+static int
+txctl_complete(txctl_t *tc, const struct fi_cq_msg_entry *cmpl)
+{
+    bufhdr_t *h;
+
+    if ((cmpl->flags & desired_tx_flags) != desired_tx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags,
+            cmpl->flags & desired_rx_flags);
+    }
+
+    if ((h = fifo_get(tc->txposted)) == NULL) {
+        warnx("%s: message Tx completed, but no Tx was posted", __func__);
+        return -1;
+    }
+
+    if (cmpl->op_context != &h->xfc.ctx) {
+        errx(EXIT_FAILURE,
+            "%s: expected context %p received %p",
+            __func__, (void *)&h->xfc.ctx, cmpl->op_context);
+    }
+
+    if (!buflist_put(tc->pool, h))
+        errx(EXIT_FAILURE, "%s: buffer pool full", __func__);
+
+    return 1;
+}
+
+static void
+txctl_transmit(cxn_t *c, txctl_t *tc)
+{
+    bufhdr_t *h;
+    int rc;
+
+    while ((h = fifo_peek(tc->txready)) != NULL &&
+           !fifo_full(tc->txposted)) {
+        rc = fi_sendmsg(c->ep, &(struct fi_msg){
+              .msg_iov = &(struct iovec){
+                  .iov_base = ((bytebuf_t *)h)->payload
+                , .iov_len = h->nused}
+            , .desc = h->desc
+            , .iov_count = 1
+            , .addr = c->peer_addr
+            , .context = &h->xfc.ctx
+            , .data = 0
+            }, FI_COMPLETION);
+
+        if (rc == 0) {
+            (void)fifo_get(tc->txready);
+            (void)fifo_put(tc->txposted, h);
+        } else if (rc == -FI_EAGAIN) {
+            break;
+        } else if (rc < 0) {
+            bailout_for_ofi_ret(rc, "fi_sendmsg");
+        }
+    }
 }
 
 static loop_control_t
@@ -938,34 +1029,6 @@ fail:
     return loop_error;
 }
 
-static bufhdr_t *
-rxctl_complete(rxctl_t *rc, const struct fi_cq_msg_entry *cmpl)
-{
-    bufhdr_t *h;
-
-    if ((cmpl->flags & desired_rx_flags) != desired_rx_flags) {
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags,
-            cmpl->flags & desired_rx_flags);
-    }
-
-    if ((h = fifo_get(rc->rxposted)) == NULL) {
-        warnx("%s: received a message, but no Rx was posted", __func__);
-        return NULL;
-    }
-
-    if (cmpl->op_context != &h->xfc.ctx) {
-        errx(EXIT_FAILURE,
-            "%s: expected context %p received %p",
-            __func__, (void *)&h->xfc.ctx, cmpl->op_context);
-    }
-
-    h->nused = cmpl->len;
-
-    return h;
-}
-
 static bool
 progbuf_is_wellformed(progbuf_t *pb)
 {
@@ -1001,39 +1064,6 @@ rcvr_progress_rx_process(rcvr_t *r, const struct fi_cq_msg_entry *cmpl)
     }
 
     rxctl_post(&r->cxn, &r->progress, &pb->hdr);
-
-    return 1;
-}
-
-/* Process completed progress-message transmission.  Return 0 if no
- * completions occurred, 1 if any completion occurred, -1 on an
- * irrecoverable error.
- */
-static int
-txctl_complete(txctl_t *tc, const struct fi_cq_msg_entry *cmpl)
-{
-    bufhdr_t *h;
-
-    if ((cmpl->flags & desired_tx_flags) != desired_tx_flags) {
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags,
-            cmpl->flags & desired_rx_flags);
-    }
-
-    if ((h = fifo_get(tc->txposted)) == NULL) {
-        warnx("%s: message Tx completed, but no Tx was posted", __func__);
-        return -1;
-    }
-
-    if (cmpl->op_context != &h->xfc.ctx) {
-        errx(EXIT_FAILURE,
-            "%s: expected context %p received %p",
-            __func__, (void *)&h->xfc.ctx, cmpl->op_context);
-    }
-
-    if (!buflist_put(tc->pool, h))
-        errx(EXIT_FAILURE, "%s: buffer pool full", __func__);
 
     return 1;
 }
@@ -1138,35 +1168,12 @@ rcvr_loop(worker_t *w, session_t *s)
             vb->msg.iov[i].key = fi_mr_key(h->mr);
         }
         vb->msg.niovs = i;
+        vb->hdr.nused = (char *)&vb->msg.iov[i] - (char *)&vb->msg;
 
         (void)fifo_put(r->vec.txready, &vb->hdr);
     }
 
-    while ((vb = (vecbuf_t *)fifo_peek(r->vec.txready)) != NULL &&
-           !fifo_full(r->vec.txposted)) {
-        rc = fi_sendmsg(r->cxn.ep, &(struct fi_msg){
-              .msg_iov = &(struct iovec){
-                  .iov_base = &vb->msg
-                , .iov_len = (char *)&vb->msg.iov[vb->msg.niovs] -
-                             (char *)&vb->msg}
-            , .desc = vb->hdr.desc
-            , .iov_count = 1
-            , .addr = r->cxn.peer_addr
-            , .context = &vb->hdr.xfc.ctx
-            , .data = 0
-            }, FI_COMPLETION);
-
-        if (rc == 0) {
-            if (vb->msg.niovs == 0)
-                warnx("%s: transmitted local EOF", __func__);
-            (void)fifo_get(r->vec.txready);
-            (void)fifo_put(r->vec.txposted, &vb->hdr);
-        } else if (rc == -FI_EAGAIN) {
-            break;
-        } else if (rc < 0) {
-            bailout_for_ofi_ret(rc, "fi_sendmsg");
-        }
-    }
+    txctl_transmit(&r->cxn, &r->vec);
 
     while (r->nfull > 0 &&
           (h = fifo_peek(r->tgtposted)) != NULL &&
@@ -1718,6 +1725,7 @@ xmtr_loop(worker_t *w, session_t *s)
         goto out;
 
     pb->hdr.xfc.owner = xfo_nic;
+    pb->hdr.nused = pb->hdr.nallocated;
 
     pb->msg.nfilled = x->bytes_progress;
     pb->msg.nleftover = send_none_leftover ? 0 : 1;
@@ -1727,7 +1735,7 @@ xmtr_loop(worker_t *w, session_t *s)
         pb->msg.nfilled, pb->msg.nleftover);
 
     if (send_none_leftover) {
-        warnx("%s: enqueued 0 leftover", __func__);
+        warnx("%s: enqueued local EOF", __func__);
         x->cxn.eof.local = true;
     }
 
@@ -1737,30 +1745,7 @@ xmtr_loop(worker_t *w, session_t *s)
 
 out:
 
-    while ((pb = (progbuf_t *)fifo_peek(x->progress.txready)) != NULL &&
-           !fifo_full(x->progress.txposted)) {
-        rc = fi_sendmsg(x->cxn.ep, &(struct fi_msg){
-              .msg_iov = &(struct iovec){
-                  .iov_base = &pb->msg
-                , .iov_len = sizeof(pb->msg)}
-            , .desc = pb->hdr.desc
-            , .iov_count = 1
-            , .addr = x->cxn.peer_addr
-            , .context = &pb->hdr.xfc.ctx
-            , .data = 0
-            }, FI_COMPLETION);
-
-        if (rc == 0) {
-            if (pb->msg.nleftover == 0)
-                warnx("%s: transmitted local EOF", __func__);
-            (void)fifo_get(x->progress.txready);
-            (void)fifo_put(x->progress.txposted, &pb->hdr);
-        } else if (rc == -FI_EAGAIN) {
-            break;
-        } else if (rc < 0) {
-            bailout_for_ofi_ret(rc, "fi_sendmsg");
-        }
-    }
+    txctl_transmit(&x->cxn, &x->progress);
 
     if (!(s->terminal->eof && fifo_empty(s->ready_for_cxn) &&
         fifo_empty(x->wrposted) && x->bytes_progress == 0 &&
