@@ -4,6 +4,7 @@
 #include <limits.h> /* INT_MAX */
 #include <inttypes.h>   /* PRIu32 */
 #include <stdarg.h>
+#include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -88,7 +89,7 @@ typedef struct bufhdr {
 
 typedef struct bytebuf {
     bufhdr_t hdr;
-    char content[];
+    char alignas(max_align_t) payload[];
 } bytebuf_t;
 
 typedef struct progbuf {
@@ -548,7 +549,7 @@ buf_alloc(size_t paylen)
 {
     bufhdr_t *h;
 
-    if ((h = malloc(offsetof(bytebuf_t, content[0]) + paylen)) == NULL)
+    if ((h = malloc(offsetof(bytebuf_t, payload[0]) + paylen)) == NULL)
         return NULL;
 
     h->nallocated = paylen;
@@ -797,24 +798,24 @@ err:
 }
 
 static void
-rcvr_progbuf_rx_post(rcvr_t *r, progbuf_t *pb)
+rxctl_post(cxn_t *c, rxctl_t *ctl, bufhdr_t *h)
 {
     int rc;
 
-    rc = fi_recvmsg(r->cxn.ep, &(struct fi_msg){
-          .msg_iov = &(struct iovec){.iov_base = &pb->msg,
-                                     .iov_len = sizeof(pb->msg)}
-        , .desc = &pb->hdr.desc
+    rc = fi_recvmsg(c->ep, &(struct fi_msg){
+          .msg_iov = &(struct iovec){.iov_base = &((bytebuf_t *)h)->payload[0],
+                                     .iov_len = h->nallocated}
+        , .desc = &h->desc
         , .iov_count = 1
-        , .addr = r->cxn.peer_addr
-        , .context = &pb->hdr.xfc.ctx
+        , .addr = c->peer_addr
+        , .context = &h->xfc.ctx
         , .data = 0
         }, FI_COMPLETION);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
 
-    (void)fifo_put(r->progress.rxposted, &pb->hdr);
+    (void)fifo_put(ctl->rxposted, h);
 }
 
 static loop_control_t
@@ -828,7 +829,7 @@ rcvr_start(worker_t *w, session_t *s)
     while (!fifo_full(r->progress.rxposted)) {
         progbuf_t *pb = progbuf_alloc();
 
-        rcvr_progbuf_rx_post(r, pb);
+        rxctl_post(&r->cxn, &r->progress, &pb->hdr);
     }
 
     for (nleftover = sizeof(txbuf), nloaded = 0; nleftover > 0; ) {
@@ -876,8 +877,8 @@ source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
         for (ofs = 0; ofs < h->nused; ofs += len) {
             size_t txbuf_ofs = (s->idx + ofs) % s->txbuflen;
             len = minsize(h->nused - ofs, s->txbuflen - txbuf_ofs);
-            memcpy(&b->content[ofs], &txbuf[txbuf_ofs], len);
-            printf("%.*s", (int)len, &b->content[ofs]);
+            memcpy(&b->payload[ofs], &txbuf[txbuf_ofs], len);
+            printf("%.*s", (int)len, &b->payload[ofs]);
             fflush(stdout);
         }
 
@@ -917,9 +918,9 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
         for (ofs = 0; ofs < h->nused; ofs += len) {
             size_t txbuf_ofs = (s->idx + ofs) % s->txbuflen;
             len = minsize(h->nused - ofs, s->txbuflen - txbuf_ofs);
-            printf("%.*s", (int)len, &b->content[ofs]);
+            printf("%.*s", (int)len, &b->payload[ofs]);
             fflush(stdout);
-            if (memcmp(&b->content[ofs], &txbuf[txbuf_ofs], len) != 0)
+            if (memcmp(&b->payload[ofs], &txbuf[txbuf_ofs], len) != 0)
                 return loop_error;
         }
 
@@ -1009,7 +1010,7 @@ rcvr_progress_rx_process(rcvr_t *r, const struct fi_cq_msg_entry *cmpl)
         return -1;
 
     if (!progbuf_is_wellformed(pb)) {
-        rcvr_progbuf_rx_post(r, pb);
+        rxctl_post(&r->cxn, &r->progress, &pb->hdr);
         return 0;
     }
 
@@ -1024,7 +1025,7 @@ rcvr_progress_rx_process(rcvr_t *r, const struct fi_cq_msg_entry *cmpl)
         r->cxn.eof.remote = true;
     }
 
-    rcvr_progbuf_rx_post(r, pb);
+    rxctl_post(&r->cxn, &r->progress, &pb->hdr);
 
     return 1;
 }
@@ -1238,27 +1239,6 @@ fail:
     return loop_error;
 }
 
-static void
-xmtr_vecbuf_rx_post(xmtr_t *x, vecbuf_t *vb)
-{
-    int rc;
-
-    rc = fi_recvmsg(x->cxn.ep, &(struct fi_msg){
-          .msg_iov = &(struct iovec){.iov_base = &vb->msg,
-                                     .iov_len = sizeof(vb->msg)}
-        , .desc = &vb->hdr.desc
-        , .iov_count = 1
-        , .addr = x->cxn.peer_addr
-        , .context = &vb->hdr.xfc.ctx
-        , .data = 0
-        }, FI_COMPLETION);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_recvmsg");
-
-    (void)fifo_put(x->vec.rxposted, &vb->hdr);
-}
-
 static loop_control_t
 xmtr_start(worker_t *w, session_t *s)
 {
@@ -1376,7 +1356,7 @@ xmtr_start(worker_t *w, session_t *s)
         if (rc < 0)
             bailout_for_ofi_ret(rc, "buffer memory registration failed");
 
-        xmtr_vecbuf_rx_post(x, vb);
+        rxctl_post(&x->cxn, &x->vec, &vb->hdr);
     }
 
     return loop_continue;
@@ -1560,13 +1540,13 @@ xmtr_vector_rx_process(xmtr_t *x, const struct fi_cq_msg_entry *cmpl)
         return -1;
 
     if (!vecbuf_is_wellformed(vb)) {
-        xmtr_vecbuf_rx_post(x, vb);
+        rxctl_post(&x->cxn, &x->vec, &vb->hdr);
         return 0;
     }
 
     if (x->nriovs == 0) {
         xmtr_vecbuf_unload(x, vb);
-        xmtr_vecbuf_rx_post(x, vb);
+        rxctl_post(&x->cxn, &x->vec, &vb->hdr);
     } else if (!fifo_put(x->vec.rcvd, &vb->hdr))
         errx(EXIT_FAILURE, "%s: received vectors FIFO was full", __func__);
 
@@ -1704,7 +1684,7 @@ xmtr_loop(worker_t *w, session_t *s)
 
         ((!x->phase) ? x->payload.iov : x->payload.iov2)[i] = (struct iovec){
           .iov_len = h->nused
-        , .iov_base = b->content
+        , .iov_base = b->payload
         };
         ((!x->phase) ? x->payload.desc : x->payload.desc2)[i] = h->desc;
     }
