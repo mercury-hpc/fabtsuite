@@ -161,6 +161,8 @@ typedef struct worker worker_t;
 
 struct cxn {
     loop_control_t (*loop)(worker_t *, session_t *);
+    struct fid_ep *ep;
+    struct fid_eq *eq;
     fi_addr_t peer_addr;
     struct fid_cq *cq;
     struct fid_av *av;
@@ -189,8 +191,6 @@ typedef struct {
 
 typedef struct {
     cxn_t cxn;
-    struct fid_ep *ep;
-    struct fid_eq *eq;
     uint64_t nfull;
     fifo_t *tgtposted; // posted RDMA target buffers in order of issuance
     struct {
@@ -215,8 +215,6 @@ typedef struct {
 
 typedef struct {
     cxn_t cxn;
-    struct fid_ep *ep;
-    struct fid_eq *eq;
     fifo_t *wrposted;  // posted RDMA writes in order of issuance
     size_t bytes_progress;
     rxctl_t vec;
@@ -803,7 +801,7 @@ rcvr_progbuf_rx_post(rcvr_t *r, progbuf_t *pb)
 {
     int rc;
 
-    rc = fi_recvmsg(r->ep, &(struct fi_msg){
+    rc = fi_recvmsg(r->cxn.ep, &(struct fi_msg){
           .msg_iov = &(struct iovec){.iov_base = &pb->msg,
                                      .iov_len = sizeof(pb->msg)}
         , .desc = &pb->hdr.desc
@@ -1162,7 +1160,7 @@ rcvr_loop(worker_t *w, session_t *s)
 
     while ((vb = (vecbuf_t *)fifo_peek(r->vec.txready)) != NULL &&
            !fifo_full(r->vec.txposted)) {
-        rc = fi_sendmsg(r->ep, &(struct fi_msg){
+        rc = fi_sendmsg(r->cxn.ep, &(struct fi_msg){
               .msg_iov = &(struct iovec){
                   .iov_base = &vb->msg
                 , .iov_len = (char *)&vb->msg.iov[vb->msg.niovs] -
@@ -1227,14 +1225,14 @@ rcvr_loop(worker_t *w, session_t *s)
     if (t->eof && fifo_empty(s->ready_for_terminal) &&
         r->cxn.eof.remote && r->cxn.eof.local &&
         fifo_empty(r->vec.txposted)) {
-        if ((rc = fi_close(&r->ep->fid)) < 0)
+        if ((rc = fi_close(&r->cxn.ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
         warnx("%s: closed.", __func__);
         return loop_end;
     }
     return loop_continue;
 fail:
-    if ((rc = fi_close(&r->ep->fid)) < 0)
+    if ((rc = fi_close(&r->cxn.ep->fid)) < 0)
         bailout_for_ofi_ret(rc, "fi_close");
     warnx("%s: closed.", __func__);
     return loop_error;
@@ -1245,7 +1243,7 @@ xmtr_vecbuf_rx_post(xmtr_t *x, vecbuf_t *vb)
 {
     int rc;
 
-    rc = fi_recvmsg(x->ep, &(struct fi_msg){
+    rc = fi_recvmsg(x->cxn.ep, &(struct fi_msg){
           .msg_iov = &(struct iovec){.iov_base = &vb->msg,
                                      .iov_len = sizeof(vb->msg)}
         , .desc = &vb->hdr.desc
@@ -1288,7 +1286,7 @@ xmtr_start(worker_t *w, session_t *s)
     /* Post receive for connection acknowledgement. */
     x->ack.desc = fi_mr_desc(x->ack.mr);
 
-    rc = fi_recvmsg(x->ep, &(struct fi_msg){
+    rc = fi_recvmsg(x->cxn.ep, &(struct fi_msg){
           .msg_iov = &(struct iovec){.iov_base = &x->ack.msg,
                                      .iov_len = sizeof(x->ack.msg)}
         , .desc = &x->ack.desc
@@ -1302,7 +1300,7 @@ xmtr_start(worker_t *w, session_t *s)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
 
     /* Transmit initial message. */
-    while ((rc = fi_sendmsg(x->ep, &(struct fi_msg){
+    while ((rc = fi_sendmsg(x->cxn.ep, &(struct fi_msg){
           .msg_iov = &(struct iovec){.iov_base = &x->initial.msg,
                                      .iov_len = sizeof(x->initial.msg)}
         , .desc = &x->initial.desc
@@ -1726,7 +1724,7 @@ xmtr_loop(worker_t *w, session_t *s)
          * Perform one fi_writemsg using the context on the first txbuffer.
          */
 
-        write_fully_params_t p = {.ep = x->ep,
+        write_fully_params_t p = {.ep = x->cxn.ep,
             .iov_in = (!x->phase) ? x->payload.iov : x->payload.iov2,
             .desc_in = (!x->phase) ? x->payload.desc : x->payload.desc2,
             .iov_out = (!x->phase) ? x->payload.iov2 : x->payload.iov,
@@ -1796,7 +1794,7 @@ out:
 
     while ((pb = (progbuf_t *)fifo_peek(x->progress.txready)) != NULL &&
            !fifo_full(x->progress.txposted)) {
-        rc = fi_sendmsg(x->ep, &(struct fi_msg){
+        rc = fi_sendmsg(x->cxn.ep, &(struct fi_msg){
               .msg_iov = &(struct iovec){
                   .iov_base = &pb->msg
                 , .iov_len = sizeof(pb->msg)}
@@ -1834,7 +1832,7 @@ out:
     }
 
     if (x->cxn.eof.remote && fifo_empty(x->progress.txposted)) {
-        if ((rc = fi_close(&x->ep->fid)) < 0)
+        if ((rc = fi_close(&x->cxn.ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
         warnx("%s: closed.", __func__);
         return loop_end;
@@ -1842,7 +1840,7 @@ out:
 
     return loop_continue;
 fail:
-    if ((rc = fi_close(&x->ep->fid)) < 0)
+    if ((rc = fi_close(&x->cxn.ep->fid)) < 0)
         bailout_for_ofi_ret(rc, "fi_close");
     warnx("%s: closed.", __func__);
     return loop_error;
@@ -2543,7 +2541,7 @@ get(state_t *st)
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind (completion queue)");
 
-    if ((rc = fi_eq_open(st->fabric, &eq_attr, &r->eq, NULL)) != 0)
+    if ((rc = fi_eq_open(st->fabric, &eq_attr, &r->cxn.eq, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open (active)");
 
     if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_eq->fid, 0)) != 0)
@@ -2615,7 +2613,7 @@ get(state_t *st)
 
     rc = fi_getinfo(FI_VERSION(1, 13), NULL, NULL, 0, hints, &ep_info);
 
-    if ((rc = fi_endpoint(st->domain, ep_info, &r->ep, NULL)) < 0)
+    if ((rc = fi_endpoint(st->domain, ep_info, &r->cxn.ep, NULL)) < 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
     hints->dest_addr = NULL;    // fi_freeinfo wants to free(3) dest_addr
@@ -2624,32 +2622,32 @@ get(state_t *st)
 
     fi_freeinfo(ep_info);
 
-    if ((rc = fi_ep_bind(r->ep, &r->eq->fid, 0)) < 0)
+    if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.eq->fid, 0)) < 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
     if ((rc = fi_cq_open(st->domain, &cq_attr, &r->cxn.cq, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
-    if ((rc = fi_ep_bind(r->ep, &r->cxn.cq->fid,
+    if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.cq->fid,
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    if ((rc = fi_ep_bind(r->ep, &av->fid, 0)) != 0)
+    if ((rc = fi_ep_bind(r->cxn.ep, &av->fid, 0)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
 
-    if ((rc = fi_enable(r->ep)) != 0)
+    if ((rc = fi_enable(r->cxn.ep)) != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
 
     size_t addrlen = sizeof(r->ack.msg.addr);
 
-    rc = fi_getname(&r->ep->fid, r->ack.msg.addr, &addrlen);
+    rc = fi_getname(&r->cxn.ep->fid, r->ack.msg.addr, &addrlen);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_getname");
 
     r->ack.msg.addrlen = (uint32_t)addrlen;
 
-    while ((rc = fi_sendmsg(r->ep, &(struct fi_msg){
+    while ((rc = fi_sendmsg(r->cxn.ep, &(struct fi_msg){
           .msg_iov = r->ack.iov
         , .desc = r->ack.desc
         , .iov_count = r->ack.niovs
@@ -2734,7 +2732,7 @@ put(state_t *st)
     if (!session_init(&sess, &x->cxn, &s->terminal))
         errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
 
-    rc = fi_endpoint(st->domain, st->info, &x->ep, NULL);
+    rc = fi_endpoint(st->domain, st->info, &x->cxn.ep, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
@@ -2744,26 +2742,26 @@ put(state_t *st)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
-    rc = fi_eq_open(st->fabric, &eq_attr, &x->eq, NULL);
+    rc = fi_eq_open(st->fabric, &eq_attr, &x->cxn.eq, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open");
 
-    rc = fi_ep_bind(x->ep, &x->eq->fid, 0);
+    rc = fi_ep_bind(x->cxn.ep, &x->cxn.eq->fid, 0);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    rc = fi_ep_bind(x->ep, &x->cxn.cq->fid,
+    rc = fi_ep_bind(x->cxn.ep, &x->cxn.cq->fid,
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    if ((rc = fi_ep_bind(x->ep, &av->fid, 0)) != 0)
+    if ((rc = fi_ep_bind(x->cxn.ep, &av->fid, 0)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
 
-    rc = fi_enable(x->ep);
+    rc = fi_enable(x->cxn.ep);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
@@ -2784,7 +2782,7 @@ put(state_t *st)
 
     size_t addrlen = sizeof(x->initial.msg.addr);
 
-    rc = fi_getname(&x->ep->fid, x->initial.msg.addr, &addrlen);
+    rc = fi_getname(&x->cxn.ep->fid, x->initial.msg.addr, &addrlen);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_getname");
