@@ -54,8 +54,7 @@ typedef struct progress_msg {
 /* Communication buffers */
 
 typedef enum {
-  xft_progress_rx
-, xft_progress_tx
+  xft_progress
 , xft_rdma_write
 , xft_vector
 } xfc_type_t;
@@ -202,7 +201,7 @@ typedef struct {
     struct {
         fifo_t *txready;    // message buffers ready to transmit
         fifo_t *txposted;   // buffers posted with messages
-        buflist_t *pool;    // buffers holding transmitted messages
+        buflist_t *pool;    // unused buffers
     } vec;
     struct {
         fifo_t *rcvd;    // message buffers ready to transmit
@@ -220,6 +219,12 @@ typedef struct {
         fifo_t *rcvd;  // buffers holding received vector messages
     } vec;
     struct {
+        fifo_t *txready;    // message buffers ready to transmit
+        fifo_t *txposted;   // buffers posted with messages
+        buflist_t *pool;    // unused buffers
+        size_t nwritten;
+    } progress;
+    struct {
         void *desc;
         struct fid_mr *mr;
         initial_msg_t msg;
@@ -229,13 +234,6 @@ typedef struct {
         struct fid_mr *mr;
         ack_msg_t msg;
     } ack;
-    struct {
-        void *desc;
-        struct fid_mr *mr;
-        progress_msg_t msg;
-        xfer_context_t xfc;
-        size_t nwritten;
-    } progress;
     struct {
         struct iovec iov[12];
         void *desc[12];
@@ -587,7 +585,7 @@ progbuf_alloc(void)
         return NULL;
 
     pb = (progbuf_t *)h;
-    h->xfc.type = xft_progress_rx;
+    h->xfc.type = xft_progress;
 
     h->raddr = (char *)&pb->msg - (char *)&h[1];
 
@@ -1026,6 +1024,40 @@ rcvr_progress_rx_process(rcvr_t *r, const struct fi_cq_msg_entry *cmpl)
     return 1;
 }
 
+/* Process completed progress-message transmission.  Return 0 if no
+ * completions occurred, 1 if any completion occurred, -1 on an
+ * irrecoverable error.
+ */
+static int
+xmtr_progress_tx_process(xmtr_t *x, const struct fi_cq_msg_entry *cmpl)
+{
+    progbuf_t *pb;
+
+    if ((cmpl->flags & desired_tx_flags) != desired_tx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags,
+            cmpl->flags & desired_rx_flags);
+    }
+
+    if ((pb = (progbuf_t *)fifo_get(x->progress.txposted)) == NULL) {
+        warnx("%s: progress-message Tx completed, but no Tx was posted",
+            __func__);
+        return -1;
+    }
+
+    if (cmpl->op_context != &pb->hdr.xfc.ctx) {
+        errx(EXIT_FAILURE,
+            "%s: expected context %p received %p",
+            __func__, (void *)&pb->hdr.xfc.ctx, cmpl->op_context);
+    }
+
+    if (!buflist_put(x->progress.pool, &pb->hdr))
+        errx(EXIT_FAILURE, "%s: progress buffer pool full", __func__);
+
+    return 1;
+}
+
 /* Process completed vector-message transmission.  Return 0 if no
  * completions occurred, 1 if any completion occurred, -1 on an
  * irrecoverable error.
@@ -1043,7 +1075,7 @@ rcvr_vector_tx_process(rcvr_t *r, const struct fi_cq_msg_entry *cmpl)
     }
 
     if ((vb = (vecbuf_t *)fifo_get(r->vec.txposted)) == NULL) {
-        warnx("%s: transmitted a vector message, but no Tx was posted",
+        warnx("%s: vector-message Tx completed, but no Tx was posted",
             __func__);
         return -1;
     }
@@ -1099,7 +1131,7 @@ rcvr_cq_process(rcvr_t *r)
     xfer_context_t *xfc = cmpl.op_context;
 
     switch (xfc->type) {
-    case xft_progress_rx:
+    case xft_progress:
         warnx("%s: read a progress rx completion", __func__);
         return rcvr_progress_rx_process(r, &cmpl);
     case xft_vector:
@@ -1661,14 +1693,9 @@ xmtr_cq_process(xmtr_t *x, session_t *s)
             (void)fifo_put(s->ready_for_terminal, h);
         }
         return 1;
-    case xft_progress_tx:
+    case xft_progress:
         warnx("%s: read a progress tx completion", __func__);
-        if ((cmpl.flags & desired_tx_flags) != desired_tx_flags) {
-            errx(EXIT_FAILURE,
-                "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-                __func__, desired_tx_flags, cmpl.flags & desired_tx_flags);
-        }
-        return 1;
+        return xmtr_progress_tx_process(x, &cmpl);
     default:
         warnx("%s: unexpected xfer context type", __func__);
         return -1;
@@ -1678,6 +1705,8 @@ xmtr_cq_process(xmtr_t *x, session_t *s)
 static loop_control_t
 xmtr_loop(worker_t *w, session_t *s)
 {
+    progbuf_t *pb;
+    vecbuf_t *vb;
     bufhdr_t *first_h, *h, *last_h = NULL;
     xmtr_t *x = (xmtr_t *)s->cxn;
     const size_t maxriovs = minsize(w->rma_maxsegs, x->nriovs);
@@ -1775,9 +1804,6 @@ xmtr_loop(worker_t *w, session_t *s)
         x->phase = !x->phase;
     }
 
-    if (x->progress.xfc.owner != xfo_program)
-        goto out;
-
     /* If the terminal reached EOF, ready_for_cxn is empty, wrposted
      * is empty, and nleftover == 0 has not previously been sent
      * (!x->cxn.eof.local), then send nleftover == 0; on a successful
@@ -1790,50 +1816,59 @@ xmtr_loop(worker_t *w, session_t *s)
     if (x->progress.nwritten == 0 && !send_none_leftover)
         goto out;
 
-    x->progress.xfc.owner = xfo_nic;
+    if (fifo_full(x->progress.txready) ||
+        (pb = (progbuf_t *)buflist_get(x->progress.pool)) == NULL)
+        goto out;
 
-    x->progress.msg.nfilled = x->progress.nwritten;
-    x->progress.msg.nleftover = send_none_leftover ? 0 : 1;
+    pb->hdr.xfc.owner = xfo_nic;
+
+    pb->msg.nfilled = x->progress.nwritten;
+    pb->msg.nleftover = send_none_leftover ? 0 : 1;
 
     warnx("%s: sending progress message, %"
         PRIu64 " filled, %" PRIu64 " leftover", __func__,
-        x->progress.msg.nfilled, x->progress.msg.nleftover);
-
-    struct iovec iov = {
-      .iov_base = &x->progress.msg
-    , .iov_len = sizeof(x->progress.msg)
-    };
-
-    rc = fi_sendmsg(x->ep, &(struct fi_msg){
-          .msg_iov = &iov
-        , .desc = &x->progress.desc
-        , .iov_count = 1
-        , .addr = x->cxn.peer_addr
-        , .context = &x->progress.xfc.ctx
-        , .data = 0
-        }, FI_COMPLETION);
-
-    if (rc == -FI_EAGAIN)
-        goto out;
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_sendmsg");
+        pb->msg.nfilled, pb->msg.nleftover);
 
     if (send_none_leftover) {
-        warnx("%s: sent 0 leftover", __func__);
+        warnx("%s: enqueued 0 leftover", __func__);
         x->cxn.eof.local = true;
     }
 
     x->progress.nwritten = 0;
 
+    (void)fifo_put(x->progress.txready, &pb->hdr);
+
 out:
+
+    while ((pb = (progbuf_t *)fifo_peek(x->progress.txready)) != NULL &&
+           !fifo_full(x->progress.txposted)) {
+        rc = fi_sendmsg(x->ep, &(struct fi_msg){
+              .msg_iov = &(struct iovec){
+                  .iov_base = &pb->msg
+                , .iov_len = sizeof(pb->msg)}
+            , .desc = pb->hdr.desc
+            , .iov_count = 1
+            , .addr = x->cxn.peer_addr
+            , .context = &pb->hdr.xfc.ctx
+            , .data = 0
+            }, FI_COMPLETION);
+
+        if (rc == 0) {
+            if (pb->msg.nleftover == 0)
+                warnx("%s: transmitted local EOF", __func__);
+            (void)fifo_get(x->progress.txready);
+            (void)fifo_put(x->progress.txposted, &pb->hdr);
+        } else if (rc == -FI_EAGAIN) {
+            break;
+        } else if (rc < 0) {
+            bailout_for_ofi_ret(rc, "fi_sendmsg");
+        }
+    }
 
     if (!(s->terminal->eof && fifo_empty(s->ready_for_cxn) &&
         fifo_empty(x->wrposted) && x->progress.nwritten == 0 &&
         x->cxn.eof.local))
         return loop_continue;
-
-    vecbuf_t *vb;
 
     /* Hunt for remote EOF. */
     while (!x->cxn.eof.remote &&
@@ -1844,7 +1879,7 @@ out:
         vecbuf_free(vb);
     }
 
-    if (x->cxn.eof.remote && x->progress.xfc.owner == xfo_program) {
+    if (x->cxn.eof.remote && fifo_empty(x->progress.txposted)) {
         if ((rc = fi_close(&x->ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
         warnx("%s: closed.", __func__);
@@ -2301,14 +2336,6 @@ xmtr_memory_init(state_t *st, xmtr_t *x)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
-    rc = fi_mr_reg(st->domain, &x->progress.msg, sizeof(x->progress.msg),
-        FI_SEND, 0, keysource_next(&st->keys), 0, &x->progress.mr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_mr_reg");
-
-    x->progress.desc = fi_mr_desc(x->progress.mr);
-
     rc = fi_mr_reg(st->domain, txbuf, txbuflen,
         FI_WRITE, 0, keysource_next(&st->keys), 0, x->payload.mr, NULL);
 
@@ -2319,14 +2346,12 @@ xmtr_memory_init(state_t *st, xmtr_t *x)
 static void
 xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
 {
+    const size_t nbufs = 16;
+    size_t i;
+
     memset(x, 0, sizeof(*x));
 
     x->progress.nwritten = 0;
-    x->progress.xfc = (xfer_context_t){
-      .owner = xfo_program
-    , .place = xfp_first | xfp_last
-    , .type = xft_progress_tx
-    };
 
     cxn_init(&x->cxn, av, xmtr_loop);
     xmtr_memory_init(st, x);
@@ -2341,6 +2366,37 @@ xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
     if ((x->vec.rcvd = fifo_create(64)) == NULL) {
         errx(EXIT_FAILURE,
             "%s: could not create received vectors FIFO", __func__);
+    }
+
+    if ((x->progress.txready = fifo_create(64)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create ready progress-buffers FIFO", __func__);
+    }
+
+    if ((x->progress.txposted = fifo_create(64)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create posted progress-buffers FIFO", __func__);
+    }
+
+    if ((x->progress.pool = buflist_create(nbufs)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create progress-message tx buffer pool", __func__);
+    }
+
+    for (i = 0; i < nbufs; i++) {
+        progbuf_t *pb = progbuf_alloc();
+        int rc;
+
+        rc = buf_mr_reg(st->domain, FI_SEND, keysource_next(&st->keys),
+            &pb->hdr);
+
+        if (rc != 0) {
+            warn_about_ofi_ret(rc, "fi_mr_reg");
+            buf_free(&pb->hdr);
+            break;
+        }
+        if (!buflist_put(x->progress.pool, &pb->hdr))
+            errx(EXIT_FAILURE, "%s: progress buffer pool full", __func__);
     }
 }
 
@@ -2457,7 +2513,7 @@ rcvr_init(state_t *st, rcvr_t *r, struct fid_av *av)
 
         if (rc != 0) {
             warn_about_ofi_ret(rc, "fi_mr_reg");
-            free(vb);
+            vecbuf_free(vb);
             break;
         }
         if (!buflist_put(r->vec.pool, &vb->hdr))
