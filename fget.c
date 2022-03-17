@@ -54,9 +54,10 @@ typedef struct progress_msg {
 /* Communication buffers */
 
 typedef enum {
-  xft_rdma_write
-, xft_vector_rx
+  xft_progress_rx
 , xft_progress_tx
+, xft_rdma_write
+, xft_vector
 } xfc_type_t;
 
 typedef enum {
@@ -90,6 +91,11 @@ typedef struct bytebuf {
     bufhdr_t hdr;
     char content[];
 } bytebuf_t;
+
+typedef struct progbuf {
+    bufhdr_t hdr;
+    progress_msg_t msg;
+} progbuf_t;
 
 typedef struct vecbuf {
     bufhdr_t hdr;
@@ -131,11 +137,14 @@ typedef struct {
     terminal_t terminal;
     size_t idx;
     size_t txbuflen;
+    size_t entirelen;
 } sink_t;
 
 typedef struct {
     terminal_t terminal;
     size_t idx;
+    size_t txbuflen;
+    size_t entirelen;
 } source_t;
 
 /*
@@ -157,7 +166,15 @@ struct cxn {
     struct fid_cq *cq;
     struct fid_av *av;
     bool started;
-    bool eof;
+    /* TBD break this condition into remote_eof, local_eof: receiver
+     * needs to send an empty vector.msg.niovs == 0 to close, sender
+     * needs to send progress.msg.nleftover == 0, record having received the
+     * remote close in remote_eof and having completed sending it in
+     * local_eof.
+     */
+    struct {
+        bool local, remote;
+    } eof;
 };
 
 typedef struct {
@@ -183,27 +200,14 @@ typedef struct {
         initial_msg_t msg;
     } initial;
     struct {
-        fifo_t *txready;    // vector-message buffers ready to transmit
-        fifo_t *txposted;   // buffers posted with vector messages
-        buflist_t *pool;    // buffers holding transmitted vector messages
+        fifo_t *txready;    // message buffers ready to transmit
+        fifo_t *txposted;   // buffers posted with messages
+        buflist_t *pool;    // buffers holding transmitted messages
     } vec;
     struct {
-        struct iovec iov[12];
-        void *desc[12];
-        struct fid_mr *mr[12];
-        uint64_t raddr[12];
-        ssize_t niovs;
-        progress_msg_t msg;
-        struct fi_context context;
+        fifo_t *rcvd;    // message buffers ready to transmit
+        fifo_t *rxposted;   // buffers posted with messages
     } progress;
-    struct {
-        struct iovec iov[12];
-        void *desc[12];
-        struct fid_mr *mr[12];
-        uint64_t raddr[12];
-        ssize_t niovs;
-        char rxbuf[128];
-    } payload;
 } rcvr_t;
 
 typedef struct {
@@ -561,10 +565,33 @@ buf_alloc(size_t paylen)
     return h;
 }
 
+static void
+buf_free(bufhdr_t *h)
+{
+    free(h);
+}
+
 static bytebuf_t *
 bytebuf_alloc(size_t paylen)
 {
     return (bytebuf_t *)buf_alloc(paylen);
+}
+
+static progbuf_t *
+progbuf_alloc(void)
+{
+    bufhdr_t *h;
+    progbuf_t *pb;
+
+    if ((h = buf_alloc(sizeof(*pb) - sizeof(bufhdr_t))) == NULL)
+        return NULL;
+
+    pb = (progbuf_t *)h;
+    h->xfc.type = xft_progress_rx;
+
+    h->raddr = (char *)&pb->msg - (char *)&h[1];
+
+    return pb;
 }
 
 static vecbuf_t *
@@ -577,7 +604,7 @@ vecbuf_alloc(void)
         return NULL;
 
     vb = (vecbuf_t *)h;
-    h->xfc.type = xft_vector_rx;
+    h->xfc.type = xft_vector;
 
     h->raddr = (char *)&vb->msg - (char *)&h[1];
 
@@ -598,6 +625,18 @@ buf_mr_reg(struct fid_domain *dom, uint64_t access, uint64_t key,
     h->desc = fi_mr_desc(h->mr);
 
     return 0;
+}
+
+static int
+buf_mr_dereg(bufhdr_t *h)
+{
+    return fi_close(&h->mr->fid);
+}
+
+static void
+vecbuf_free(vecbuf_t *vb)
+{
+    buf_free(&vb->hdr);
 }
 
 static bool
@@ -764,6 +803,27 @@ err:
     return rc;
 }
 
+static void
+rcvr_progbuf_rx_post(rcvr_t *r, progbuf_t *pb)
+{
+    int rc;
+
+    rc = fi_recvmsg(r->ep, &(struct fi_msg){
+          .msg_iov = &(struct iovec){.iov_base = &pb->msg,
+                                     .iov_len = sizeof(pb->msg)}
+        , .desc = &pb->hdr.desc
+        , .iov_count = 1
+        , .addr = r->cxn.peer_addr
+        , .context = &pb->hdr.xfc.ctx
+        , .data = 0
+        }, FI_COMPLETION);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_recvmsg");
+
+    (void)fifo_put(r->progress.rxposted, &pb->hdr);
+}
+
 static loop_control_t
 rcvr_start(worker_t *w, session_t *s)
 {
@@ -771,6 +831,12 @@ rcvr_start(worker_t *w, session_t *s)
     size_t nleftover, nloaded;
 
     r->cxn.started = true;
+
+    while (!fifo_full(r->progress.rxposted)) {
+        progbuf_t *pb = progbuf_alloc();
+
+        rcvr_progbuf_rx_post(r, pb);
+    }
 
     for (nleftover = sizeof(txbuf), nloaded = 0; nleftover > 0; ) {
         bytebuf_t *b = worker_payload_rxbuf_get(w);
@@ -798,7 +864,6 @@ rcvr_start(worker_t *w, session_t *s)
 static loop_control_t
 source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 {
-    const size_t txbuflen = strlen(txbuf);
     source_t *s = (source_t *)t;
     bufhdr_t *h;
 
@@ -807,21 +872,29 @@ source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 
     while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
         bytebuf_t *b = (bytebuf_t *)h;
+        size_t len, ofs;
 
-        if (s->idx == txbuflen)
+        if (s->idx == s->entirelen) {
+            t->eof = true;
             return loop_end;
+        }
+
+        h->nused = minsize(s->entirelen - s->idx, h->nallocated);
+        for (ofs = 0; ofs < h->nused; ofs += len) {
+            size_t txbuf_ofs = (s->idx + ofs) % s->txbuflen;
+            len = minsize(h->nused - ofs, s->txbuflen - txbuf_ofs);
+            memcpy(&b->content[ofs], &txbuf[txbuf_ofs], len);
+            printf("%.*s", (int)len, &b->content[ofs]);
+            fflush(stdout);
+        }
 
         (void)fifo_get(ready);
-
-        h->nused = minsize(txbuflen - s->idx, h->nallocated);
-        memcpy(b->content, &txbuf[s->idx], h->nused);
-
         (void)fifo_put(completed, h);
 
         s->idx += h->nused;
     }
 
-    if (s->idx != txbuflen)
+    if (s->idx != s->entirelen)
         return loop_continue;
 
     t->eof = true;
@@ -843,19 +916,25 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 
     while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
         bytebuf_t *b = (bytebuf_t *)h;
+        size_t len, ofs;
 
-        if (h->nused > s->txbuflen - s->idx)
+        if (h->nused + s->idx > s->entirelen)
             return loop_error;
 
-        if (memcmp(&txbuf[s->idx], b->content, h->nused) != 0)
-            return loop_error;
+        for (ofs = 0; ofs < h->nused; ofs += len) {
+            size_t txbuf_ofs = (s->idx + ofs) % s->txbuflen;
+            len = minsize(h->nused - ofs, s->txbuflen - txbuf_ofs);
+            printf("%.*s", (int)len, &b->content[ofs]);
+            fflush(stdout);
+            if (memcmp(&b->content[ofs], &txbuf[txbuf_ofs], len) != 0)
+                return loop_error;
+        }
 
         (void)fifo_get(ready);
         (void)fifo_put(completed, h);
-
         s->idx += h->nused;
     }
-    if (s->idx != s->txbuflen)
+    if (s->idx != s->entirelen)
         return loop_continue;
 
     t->eof = true;
@@ -890,19 +969,108 @@ truncate_iov(const truncate_iov_params_t p)
 }
 #endif
 
-static rcvr_t *
-rcvr_progress_rx(rcvr_t *r)
+static bool
+progbuf_is_wellformed(progbuf_t *pb)
 {
-    struct fi_cq_msg_entry completion;
+    return pb->hdr.nused == sizeof(pb->msg);
+}
+
+/* Process completion vector-message reception.  Return 0 if no
+ * completions occurred, 1 if any completion occurred, -1 on an
+ * irrecoverable error.
+ */
+static int
+rcvr_progress_rx_process(rcvr_t *r, const struct fi_cq_msg_entry *cmpl)
+{
+    progbuf_t *pb;
+
+    if ((cmpl->flags & desired_rx_flags) != desired_rx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags,
+            cmpl->flags & desired_rx_flags);
+    }
+
+    if ((pb = (progbuf_t *)fifo_get(r->progress.rxposted)) == NULL) {
+        warnx("%s: received a vector message, but no Rx was posted",
+            __func__);
+        return -1;
+    }
+
+    if (cmpl->op_context != &pb->hdr.xfc.ctx) {
+        errx(EXIT_FAILURE,
+            "%s: expected context %p received %p",
+            __func__, (void *)&pb->hdr.xfc.ctx, cmpl->op_context);
+    }
+
+    pb->hdr.nused = cmpl->len;
+
+    if (!progbuf_is_wellformed(pb)) {
+        rcvr_progbuf_rx_post(r, pb);
+        return 0;
+    }
+
+    warnx("%s: received progress message, %"
+        PRIu64 " bytes filled, %" PRIu64 " bytes leftover.", __func__,
+        pb->msg.nfilled, pb->msg.nleftover);
+
+    r->nfull += pb->msg.nfilled;
+
+    if (pb->msg.nleftover == 0) {
+        warnx("%s: received remote EOF", __func__);
+        r->cxn.eof.remote = true;
+    }
+
+    rcvr_progbuf_rx_post(r, pb);
+
+    return 1;
+}
+
+/* Process completed vector-message transmission.  Return 0 if no
+ * completions occurred, 1 if any completion occurred, -1 on an
+ * irrecoverable error.
+ */
+static int
+rcvr_vector_tx_process(rcvr_t *r, const struct fi_cq_msg_entry *cmpl)
+{
+    vecbuf_t *vb;
+
+    if ((cmpl->flags & desired_tx_flags) != desired_tx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags,
+            cmpl->flags & desired_rx_flags);
+    }
+
+    if ((vb = (vecbuf_t *)fifo_get(r->vec.txposted)) == NULL) {
+        warnx("%s: transmitted a vector message, but no Tx was posted",
+            __func__);
+        return -1;
+    }
+
+    if (cmpl->op_context != &vb->hdr.xfc.ctx) {
+        errx(EXIT_FAILURE,
+            "%s: expected context %p received %p",
+            __func__, (void *)&vb->hdr.xfc.ctx, cmpl->op_context);
+    }
+
+    if (!buflist_put(r->vec.pool, &vb->hdr))
+        errx(EXIT_FAILURE, "%s: vector buffer pool full", __func__);
+
+    return 1;
+}
+
+/* Process completions.  Return 0 if no completions occurred, 1 if
+ * any completion occurred, -1 on an irrecoverable error.
+ */
+static int
+rcvr_cq_process(rcvr_t *r)
+{
+    struct fi_cq_msg_entry cmpl;
     ssize_t ncompleted;
 
-    /* Check for progress message arrival. */
-    warnx("%s: checking for progress message, context %p, "
-        "last len %zu, count %zu", __func__, (void *)&r->progress,
-        r->progress.iov[r->progress.niovs - 1].iov_len, r->progress.niovs);
-
-    if ((ncompleted = fi_cq_read(r->cxn.cq, &completion, 1)) == -FI_EAGAIN)
-        return r;
+    if ((ncompleted = fi_cq_read(r->cxn.cq, &cmpl, 1)) == -FI_EAGAIN)
+        return 0;
 
     if (ncompleted == -FI_EAVAIL) {
         struct fi_cq_err_entry e;
@@ -917,8 +1085,10 @@ rcvr_progress_rx(rcvr_t *r)
         warnx("%s: provider error %s", __func__,
             fi_cq_strerror(r->cxn.cq, e.prov_errno, e.err_data, errbuf,
                 sizeof(errbuf)));
-        return NULL;
-    } else if (ncompleted < 0)
+        return -1;
+    }
+    
+    if (ncompleted < 0)
         bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
 
     if (ncompleted != 1) {
@@ -926,24 +1096,19 @@ rcvr_progress_rx(rcvr_t *r)
             "%s: expected 1 completion, read %zd", __func__, ncompleted);
     }
 
-    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+    xfer_context_t *xfc = cmpl.op_context;
+
+    switch (xfc->type) {
+    case xft_progress_rx:
+        warnx("%s: read a progress rx completion", __func__);
+        return rcvr_progress_rx_process(r, &cmpl);
+    case xft_vector:
+        warnx("%s: read a vector tx completion", __func__);
+        return rcvr_vector_tx_process(r, &cmpl);
+    default:
+        warnx("%s: unexpected xfer context type", __func__);
+        return -1;
     }
-
-    if (completion.len != sizeof(r->progress.msg)) {
-        errx(EXIT_FAILURE,
-            "received %zu bytes, expected %zu-byte progress\n", completion.len,
-            sizeof(r->progress.msg));
-    }
-
-    r->nfull += r->progress.msg.nfilled;
-
-    if (r->progress.msg.nleftover == 0)
-        r->cxn.eof = true;
-
-    return r;
 }
 
 static loop_control_t
@@ -962,7 +1127,15 @@ rcvr_loop(worker_t *w, session_t *s)
 
     /* Transmit vector. */
  
-    while (!fifo_full(r->vec.txready) && !fifo_empty(s->ready_for_cxn) &&
+    if (r->cxn.eof.remote && !r->cxn.eof.local &&
+        !fifo_full(r->vec.txready) &&
+        (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
+        memset(vb->msg.iov, 0, sizeof(vb->msg.iov));
+        vb->msg.niovs = 0;
+        (void)fifo_put(r->vec.txready, &vb->hdr);
+        r->cxn.eof.local = true;
+        warnx("%s: enqueued local EOF", __func__);
+    } else while (!fifo_full(r->vec.txready) && !fifo_empty(s->ready_for_cxn) &&
            (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
 
         for (i = 0;
@@ -974,7 +1147,6 @@ rcvr_loop(worker_t *w, session_t *s)
 
             (void)fifo_put(r->tgtposted, h);
 
-            /* TBD use rx'd progress message to zip through and set h->nused */
             vb->msg.iov[i].addr = 0;
             vb->msg.iov[i].len = h->nallocated;
             vb->msg.iov[i].key = fi_mr_key(h->mr);
@@ -982,7 +1154,6 @@ rcvr_loop(worker_t *w, session_t *s)
         vb->msg.niovs = i;
 
         (void)fifo_put(r->vec.txready, &vb->hdr);
-
     }
 
     while ((vb = (vecbuf_t *)fifo_peek(r->vec.txready)) != NULL &&
@@ -995,11 +1166,13 @@ rcvr_loop(worker_t *w, session_t *s)
             , .desc = vb->hdr.desc
             , .iov_count = 1
             , .addr = r->cxn.peer_addr
-            , .context = NULL
+            , .context = &vb->hdr.xfc.ctx
             , .data = 0
-            }, 0);
+            }, FI_COMPLETION);
 
         if (rc == 0) {
+            if (vb->msg.niovs == 0)
+                warnx("%s: transmitted local EOF", __func__);
             (void)fifo_get(r->vec.txready);
             (void)fifo_put(r->vec.txposted, &vb->hdr);
         } else if (rc == -FI_EAGAIN) {
@@ -1009,8 +1182,8 @@ rcvr_loop(worker_t *w, session_t *s)
         }
     }
 
-    if (rcvr_progress_rx(r) == NULL)
-        goto out;
+    if (rcvr_cq_process(r) == -1)
+        goto fail;
 
     while (r->nfull > 0 &&
           (h = fifo_peek(r->tgtposted)) != NULL &&
@@ -1026,13 +1199,16 @@ rcvr_loop(worker_t *w, session_t *s)
         }
     }
 
-    if (s->cxn->eof && (h = fifo_peek(r->tgtposted)) != NULL &&
+    /* The remote does not necessarily indicate EOF on an RDMA target
+     * buffer boundary.  On EOF, take any partially-full (looking on the
+     * bright side) RDMA buffer off of the queue of RDMA target buffers.
+     */
+    if (r->cxn.eof.remote && (h = fifo_peek(r->tgtposted)) != NULL &&
         h->nused != 0) {
         (void)fifo_get(r->tgtposted);
         (void)fifo_put(s->ready_for_terminal, h);
     }
 
-out:
     ctl = sink_trade(t, s->ready_for_terminal, s->ready_for_cxn);
     switch (ctl) {
     case loop_error:
@@ -1044,13 +1220,20 @@ out:
         return ctl;
     }
 
-    if (t->eof && fifo_empty(s->ready_for_terminal)) {
+    if (t->eof && fifo_empty(s->ready_for_terminal) &&
+        r->cxn.eof.remote && r->cxn.eof.local &&
+        fifo_empty(r->vec.txposted)) {
         if ((rc = fi_close(&r->ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
         warnx("%s: closed.", __func__);
         return loop_end;
     }
     return loop_continue;
+fail:
+    if ((rc = fi_close(&r->ep->fid)) < 0)
+        bailout_for_ofi_ret(rc, "fi_close");
+    warnx("%s: closed.", __func__);
+    return loop_error;
 }
 
 static void
@@ -1186,6 +1369,11 @@ xmtr_start(worker_t *w, session_t *s)
     while (!fifo_full(x->vec.rxposted)) {
         vecbuf_t *vb = vecbuf_alloc();
 
+        rc = buf_mr_reg(w->dom, FI_RECV, keysource_next(&w->keys), &vb->hdr);
+
+        if (rc < 0)
+            bailout_for_ofi_ret(rc, "buffer memory registration failed");
+
         xmtr_vecbuf_rx_post(x, vb);
     }
 
@@ -1319,9 +1507,6 @@ vecbuf_is_wellformed(vecbuf_t *vb)
     if (len < least_vector_msglen) {
         warnx("%s: expected >= %zu bytes, received %zu",
             __func__, least_vector_msglen, len);
-    }
-    if (len <= least_vector_msglen) {
-        warnx("%s: peer sent 0 vectors or fewer, disconnecting...", __func__);
     } else if ((len - least_vector_msglen) % sizeof(vb->msg.iov[0]) != 0) {
         warnx("%s: %zu-byte vector message did not end on vector boundary, "
             "disconnecting...", __func__, len);
@@ -1351,11 +1536,16 @@ xmtr_vecbuf_unload(xmtr_t *x, vecbuf_t *vb)
         x->riov[i].key = vb->msg.iov[i].key;
     }
 
+    if (vb->msg.niovs == 0) {
+        warnx("%s: received remote EOF", __func__);
+        x->cxn.eof.remote = true;
+    }
+
     x->phase = false;
     x->nriovs = i;
 }
 
-/* Process completion vector-message reception.  Return 0 if no
+/* Process completed vector-message reception.  Return 0 if no
  * completions occurred, 1 if any completion occurred, -1 on an
  * irrecoverable error.
  */
@@ -1441,8 +1631,8 @@ xmtr_cq_process(xmtr_t *x, session_t *s)
     xfc->owner = xfo_program;
 
     switch (xfc->type) {
-    case xft_vector_rx:
-        warnx("%s: read an vector rx completion", __func__);
+    case xft_vector:
+        warnx("%s: read a vector rx completion", __func__);
         return xmtr_vector_rx_process(x, &cmpl);
     case xft_rdma_write:
         warnx("%s: read an RDMA-write completion", __func__);
@@ -1472,7 +1662,7 @@ xmtr_cq_process(xmtr_t *x, session_t *s)
         }
         return 1;
     case xft_progress_tx:
-        warnx("%s: read an progress tx completion", __func__);
+        warnx("%s: read a progress tx completion", __func__);
         if ((cmpl.flags & desired_tx_flags) != desired_tx_flags) {
             errx(EXIT_FAILURE,
                 "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
@@ -1488,21 +1678,18 @@ xmtr_cq_process(xmtr_t *x, session_t *s)
 static loop_control_t
 xmtr_loop(worker_t *w, session_t *s)
 {
+    bufhdr_t *first_h, *h, *last_h = NULL;
     xmtr_t *x = (xmtr_t *)s->cxn;
+    const size_t maxriovs = minsize(w->rma_maxsegs, x->nriovs);
     size_t i;
-    ssize_t rc;
+    size_t maxbytes, niovs, niovs_out = 0, nriovs_out = 0;
+    ssize_t nwritten, rc, total;
 
     if (!x->cxn.started)
         return xmtr_start(w, s);
 
-    switch (xmtr_cq_process(x, s)) {
-    case 0:
-        return loop_continue;
-    default:
-        break;
-    case -1:
+    if (xmtr_cq_process(x, s) == -1)
         goto fail;
-    }
 
     switch (source_trade(s->terminal, s->ready_for_terminal, s->ready_for_cxn)){
     case loop_continue:
@@ -1513,11 +1700,6 @@ xmtr_loop(worker_t *w, session_t *s)
     default:
         goto fail;
     }
-
-    ssize_t nwritten, total;
-    const size_t maxriovs = minsize(w->rma_maxsegs, x->nriovs);
-    size_t maxbytes, niovs, niovs_out = 0, nriovs_out = 0;
-    bufhdr_t *first_h, *h, *last_h = NULL;
 
     for (maxbytes = 0, i = 0; i < maxriovs; i++)
         maxbytes += ((!x->phase) ? x->riov : x->riov2)[i].len;
@@ -1551,57 +1733,71 @@ xmtr_loop(worker_t *w, session_t *s)
         first_h->xfc.owner = xfo_nic;
         first_h->xfc.place = xfp_first;
         last_h->xfc.place |= xfp_last;
+
+        /* Take txbuffers off of our queue while their cumulative length
+         * is less than sum(0 <= i < min(rma_maxsegs, nriovs), riov[i].len).
+         * Flag the first txbuffer `xfp_first` and the last `xfp_last`
+         * (first and last may be the same buffer).  Clear flags on the rest
+         * of the txbuffers.  Set the owner of the first to `xfo_nic`.
+         *
+         * Perform one fi_writemsg using the context on the first txbuffer.
+         */
+
+        write_fully_params_t p = {.ep = x->ep,
+            .iov_in = (!x->phase) ? x->payload.iov : x->payload.iov2,
+            .desc_in = (!x->phase) ? x->payload.desc : x->payload.desc2,
+            .iov_out = (!x->phase) ? x->payload.iov2 : x->payload.iov,
+            .desc_out = (!x->phase) ? x->payload.desc2 : x->payload.desc,
+            .niovs = niovs,
+            .niovs_out = &niovs_out,
+            .riov_in = (!x->phase) ? x->riov : x->riov2,
+            .riov_out = (!x->phase) ? x->riov2 : x->riov,
+            .nriovs = x->nriovs,
+            .nriovs_out = &nriovs_out,
+            .len = total,
+            .maxsegs = minsize(w->rma_maxsegs, x->nriovs),
+            .flags = FI_COMPLETION | FI_DELIVERY_COMPLETE,
+            .context = &first_h->xfc.ctx,
+            .addr = x->cxn.peer_addr};
+
+        nwritten = write_fully(p);
+
+        if (nwritten < 0)
+            bailout_for_ofi_ret(nwritten, "write_fully");
+
+        if (nwritten != total || niovs_out != 0) {
+            warnx("%s: local I/O vectors were partially written", __func__);
+            goto fail;
+        }
+
+        x->nriovs = nriovs_out;
+
+        x->phase = !x->phase;
     }
 
-    /* Take txbuffers off of our queue while their cumulative length
-     * is less than sum(0 <= i < min(rma_maxsegs, nriovs), riov[i].len).
-     * Flag the first txbuffer `xfp_first` and the last `xfp_last`
-     * (first and last may be the same buffer).  Clear flags on the rest
-     * of the txbuffers.  Set the owner of the first to `xfo_nic`.
-     *
-     * Perform one fi_writemsg using the context on the first txbuffer.
+    if (x->progress.xfc.owner != xfo_program)
+        goto out;
+
+    /* If the terminal reached EOF, ready_for_cxn is empty, wrposted
+     * is empty, and nleftover == 0 has not previously been sent
+     * (!x->cxn.eof.local), then send nleftover == 0; on a successful
+     * transmission, set x->cxn.eof.local to true.
      */
+    bool send_none_leftover = (s->terminal->eof &&
+        fifo_empty(s->ready_for_cxn) && fifo_empty(x->wrposted) &&
+        !x->cxn.eof.local);
 
-    write_fully_params_t p = {.ep = x->ep,
-        .iov_in = (!x->phase) ? x->payload.iov : x->payload.iov2,
-        .desc_in = (!x->phase) ? x->payload.desc : x->payload.desc2,
-        .iov_out = (!x->phase) ? x->payload.iov2 : x->payload.iov,
-        .desc_out = (!x->phase) ? x->payload.desc2 : x->payload.desc,
-        .niovs = niovs,
-        .niovs_out = &niovs_out,
-        .riov_in = (!x->phase) ? x->riov : x->riov2,
-        .riov_out = (!x->phase) ? x->riov2 : x->riov,
-        .nriovs = x->nriovs,
-        .nriovs_out = &nriovs_out,
-        .len = total,
-        .maxsegs = minsize(w->rma_maxsegs, x->nriovs),
-        .flags = FI_COMPLETION | FI_DELIVERY_COMPLETE,
-        .context = &first_h->xfc.ctx,
-        .addr = x->cxn.peer_addr};
-
-    nwritten = write_fully(p);
-
-    if (nwritten < 0)
-        bailout_for_ofi_ret(nwritten, "write_fully");
-
-    if (nwritten != total || niovs_out != 0) {
-        warnx("%s: local I/O vectors were partially written", __func__);
-        goto fail;
-    }
-
-    x->nriovs = nriovs_out;
-
-    x->phase = !x->phase;
-
-    if (x->progress.xfc.owner != xfo_program || x->progress.nwritten == 0)
+    if (x->progress.nwritten == 0 && !send_none_leftover)
         goto out;
 
     x->progress.xfc.owner = xfo_nic;
 
     x->progress.msg.nfilled = x->progress.nwritten;
-    x->progress.msg.nleftover = 0;
+    x->progress.msg.nleftover = send_none_leftover ? 0 : 1;
 
-    x->progress.desc = fi_mr_desc(x->progress.mr);
+    warnx("%s: sending progress message, %"
+        PRIu64 " filled, %" PRIu64 " leftover", __func__,
+        x->progress.msg.nfilled, x->progress.msg.nleftover);
 
     struct iovec iov = {
       .iov_base = &x->progress.msg
@@ -1617,18 +1813,38 @@ xmtr_loop(worker_t *w, session_t *s)
         , .data = 0
         }, FI_COMPLETION);
 
+    if (rc == -FI_EAGAIN)
+        goto out;
+
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_sendmsg");
 
-    x->progress.nwritten = 0;
+    if (send_none_leftover) {
+        warnx("%s: sent 0 leftover", __func__);
+        x->cxn.eof.local = true;
+    }
 
-    warnx("sent %zu-byte progress message", sizeof(x->progress.msg));
+    x->progress.nwritten = 0;
 
 out:
 
-    if (s->terminal->eof && fifo_empty(s->ready_for_cxn) &&
+    if (!(s->terminal->eof && fifo_empty(s->ready_for_cxn) &&
         fifo_empty(x->wrposted) && x->progress.nwritten == 0 &&
-        x->progress.xfc.owner == xfo_program) {
+        x->cxn.eof.local))
+        return loop_continue;
+
+    vecbuf_t *vb;
+
+    /* Hunt for remote EOF. */
+    while (!x->cxn.eof.remote &&
+           (vb = (vecbuf_t *)fifo_get(x->vec.rcvd)) != NULL) {
+        if (vb->msg.niovs == 0)
+            x->cxn.eof.remote = true;
+        buf_mr_dereg(&vb->hdr);
+        vecbuf_free(vb);
+    }
+
+    if (x->cxn.eof.remote && x->progress.xfc.owner == xfo_program) {
         if ((rc = fi_close(&x->ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
         warnx("%s: closed.", __func__);
@@ -1646,7 +1862,9 @@ fail:
 static loop_control_t
 cxn_loop(worker_t *w, session_t *s)
 {
+#if 0
     warnx("%s: going around", __func__);
+#endif
     return s->cxn->loop(w, s);
 }
 
@@ -2062,7 +2280,7 @@ cxn_init(cxn_t *c, struct fid_av *av,
     c->loop = loop;
     c->av = av;
     c->started = false;
-    c->eof = false;
+    c->eof.local = c->eof.remote = false;
 }
 
 static void
@@ -2088,6 +2306,8 @@ xmtr_memory_init(state_t *st, xmtr_t *x)
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
+
+    x->progress.desc = fi_mr_desc(x->progress.mr);
 
     rc = fi_mr_reg(st->domain, txbuf, txbuflen,
         FI_WRITE, 0, keysource_next(&st->keys), 0, x->payload.mr, NULL);
@@ -2138,6 +2358,7 @@ sink_init(sink_t *s)
     memset(s, 0, sizeof(*s));
     terminal_init(&s->terminal, sink_trade);
     s->txbuflen = strlen(txbuf);
+    s->entirelen = s->txbuflen * (size_t)10000;
     s->idx = 0;
 }
 
@@ -2146,6 +2367,8 @@ source_init(source_t *s)
 {
     memset(s, 0, sizeof(*s));
     terminal_init(&s->terminal, source_trade);
+    s->txbuflen = strlen(txbuf);
+    s->entirelen = s->txbuflen * (size_t)10000;
     s->idx = 0;
 }
 
@@ -2183,27 +2406,12 @@ rcvr_memory_init(state_t *st, rcvr_t *r)
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "mr_regv_all");
-
-    r->progress.niovs = fibonacci_iov_setup(&r->progress.msg,
-        sizeof(r->progress.msg), r->progress.iov, st->rx_maxsegs);
-
-    if (r->progress.niovs < 1) {
-        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
-            __func__, r->progress.niovs);
-    }
-
-    rc = mr_regv_all(st->domain, r->progress.iov, r->progress.niovs,
-        minsize(2, st->mr_maxsegs), FI_RECV, 0, &st->keys, 0,
-        r->progress.mr, r->progress.desc, r->progress.raddr, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "mr_regv_all");
 }
 
 static void
 rcvr_init(state_t *st, rcvr_t *r, struct fid_av *av)
 {
-    const size_t nvecbufs = 16;
+    const size_t nbufs = 16;
     size_t i;
 
     memset(r, 0, sizeof(*r));
@@ -2216,6 +2424,15 @@ rcvr_init(state_t *st, rcvr_t *r, struct fid_av *av)
             "%s: could not create RDMA targets FIFO", __func__);
     }
 
+    if ((r->progress.rxposted = fifo_create(64)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create posted vectors FIFO", __func__);
+    }
+    if ((r->progress.rcvd = fifo_create(64)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create received vectors FIFO", __func__);
+    }
+
     if ((r->vec.txready = fifo_create(64)) == NULL) {
         errx(EXIT_FAILURE,
             "%s: could not create ready vectors FIFO", __func__);
@@ -2226,12 +2443,12 @@ rcvr_init(state_t *st, rcvr_t *r, struct fid_av *av)
             "%s: could not create posted vectors FIFO", __func__);
     }
 
-    if ((r->vec.pool = buflist_create(nvecbufs)) == NULL) {
+    if ((r->vec.pool = buflist_create(nbufs)) == NULL) {
         errx(EXIT_FAILURE,
             "%s: could not create vector-message tx buffer pool", __func__);
     }
 
-    for (i = 0; i < nvecbufs; i++) {
+    for (i = 0; i < nbufs; i++) {
         vecbuf_t *vb = vecbuf_alloc();
         int rc;
 
@@ -2412,18 +2629,6 @@ get(state_t *st)
 
     if ((rc = fi_enable(r->ep)) != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
-
-    rc = fi_recvmsg(r->ep, &(struct fi_msg){
-          .msg_iov = r->progress.iov
-        , .desc = r->progress.desc
-        , .iov_count = r->progress.niovs
-        , .addr = r->cxn.peer_addr
-        , .context = &r->progress.context
-        , .data = 0
-        }, FI_COMPLETION);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_recvmsg");
 
     size_t addrlen = sizeof(r->ack.msg.addr);
 
