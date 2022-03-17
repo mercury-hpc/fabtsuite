@@ -805,8 +805,7 @@ rxctl_complete(rxctl_t *rc, const struct fi_cq_msg_entry *cmpl)
     if ((cmpl->flags & desired_rx_flags) != desired_rx_flags) {
         errx(EXIT_FAILURE,
             "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags,
-            cmpl->flags & desired_rx_flags);
+            __func__, desired_rx_flags, cmpl->flags & desired_rx_flags);
     }
 
     if ((h = fifo_get(rc->rxposted)) == NULL) {
@@ -815,8 +814,7 @@ rxctl_complete(rxctl_t *rc, const struct fi_cq_msg_entry *cmpl)
     }
 
     if (cmpl->op_context != &h->xfc.ctx) {
-        errx(EXIT_FAILURE,
-            "%s: expected context %p received %p",
+        errx(EXIT_FAILURE, "%s: expected context %p received %p",
             __func__, (void *)&h->xfc.ctx, cmpl->op_context);
     }
 
@@ -858,8 +856,7 @@ txctl_complete(txctl_t *tc, const struct fi_cq_msg_entry *cmpl)
     if ((cmpl->flags & desired_tx_flags) != desired_tx_flags) {
         errx(EXIT_FAILURE,
             "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags,
-            cmpl->flags & desired_rx_flags);
+            __func__, desired_rx_flags, cmpl->flags & desired_rx_flags);
     }
 
     if ((h = fifo_get(tc->txposted)) == NULL) {
@@ -868,8 +865,7 @@ txctl_complete(txctl_t *tc, const struct fi_cq_msg_entry *cmpl)
     }
 
     if (cmpl->op_context != &h->xfc.ctx) {
-        errx(EXIT_FAILURE,
-            "%s: expected context %p received %p",
+        errx(EXIT_FAILURE, "%s: expected context %p received %p",
             __func__, (void *)&h->xfc.ctx, cmpl->op_context);
     }
 
