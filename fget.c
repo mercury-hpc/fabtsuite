@@ -1636,7 +1636,7 @@ xmtr_loop(worker_t *w, session_t *s)
     for (i = 0, total = 0, first_h = last_h = NULL;
          i < maxriovs &&
              (h = fifo_peek(s->ready_for_cxn)) != NULL &&
-             h->nallocated + total <= maxbytes && !fifo_full(x->wrposted);
+             h->nused + total <= maxbytes && !fifo_full(x->wrposted);
          i++, last_h = h, total += h->nused) {
         bytebuf_t *b = (bytebuf_t *)h;
 
