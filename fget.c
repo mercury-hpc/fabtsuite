@@ -1695,7 +1695,9 @@ xmtr_loop(worker_t *w, session_t *s)
             bailout_for_ofi_ret(nwritten, "write_fully");
 
         if (nwritten != total || niovs_out != 0) {
-            warnx("%s: local I/O vectors were partially written", __func__);
+            warnx("%s: local I/O vectors were partially written, "
+                "nwritten %zu total %zu niovs_out %zu", __func__, nwritten,
+                total, niovs_out);
             goto fail;
         }
 
