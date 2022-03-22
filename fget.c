@@ -242,6 +242,7 @@ typedef struct {
     } payload;
     struct fi_rma_iov riov[12], riov2[12];
     size_t nriovs;
+    size_t next_riov;
     bool phase;
 } xmtr_t;
 
@@ -1214,21 +1215,18 @@ xmtr_start(worker_t *w, session_t *s)
 {
     struct fi_cq_msg_entry completion;
     xmtr_t *x = (xmtr_t *)s->cxn;
-    const size_t txbuflen = strlen(txbuf);
-    size_t nleftover;
     ssize_t ncompleted;
     int rc;
 
     x->cxn.started = true;
 
-    for (nleftover = txbuflen; nleftover > 0; ) {
+    while (!fifo_full(s->ready_for_terminal)) {
         bytebuf_t *b = worker_payload_txbuf_get(w);
 
         if (b == NULL)
             errx(EXIT_FAILURE, "%s: could not get a buffer", __func__);
 
         b->hdr.nused = 0;
-        nleftover -= minsize(nleftover, b->hdr.nallocated);
         if (!fifo_put(s->ready_for_terminal, &b->hdr))
             errx(EXIT_FAILURE, "%s: could not enqueue tx buffer", __func__);
     }
@@ -1359,18 +1357,20 @@ write_fully(const write_fully_params_t p)
     struct {
         size_t local;
         size_t remote;
-    } sumlen = {.local = 0, .remote = 0}, nsegs = {.local = 0, .remote = 0};
-    size_t maxsegs = minsize(p.maxsegs, minsize(p.nriovs, p.niovs));
+    } maxsegs = {.local = minsize(p.maxsegs, p.niovs),
+                 .remote = minsize(p.maxsegs, p.nriovs)},
+      nsegs = {.local = 0, .remote = 0}, sumlen = {.local = 0, .remote = 0};
 
-    for (i = 0; i < maxsegs; i++) {
+    for (i = 0; i < maxsegs.local; i++)
         sumlen.local += p.iov_in[i].iov_len;
+
+    for (i = 0; i < maxsegs.remote; i++)
         sumlen.remote += p.riov_in[i].len;
-    }
 
     const size_t len = minsize(minsize(sumlen.local, sumlen.remote),
                                minsize(p.len, SSIZE_MAX));
 
-    for (i = 0, nremaining = len; 0 < nremaining && i < maxsegs; i++) {
+    for (i = 0, nremaining = len; 0 < nremaining && i < maxsegs.local; i++) {
         p.iov_out[i] = p.iov_in[i];
         p.desc_out[i] = p.desc_in[i];
         if (p.iov_in[i].iov_len > nremaining) {
@@ -1383,7 +1383,7 @@ write_fully(const write_fully_params_t p)
 
     nsegs.local = i;
 
-    for (i = 0, nremaining = len; 0 < nremaining && i < maxsegs; i++) {
+    for (i = 0, nremaining = len; 0 < nremaining && i < maxsegs.remote; i++) {
         p.riov_out[i] = p.riov_in[i];
         if (p.riov_in[i].len > nremaining) {
             p.riov_out[i].len = nremaining;
@@ -1473,28 +1473,43 @@ vecbuf_is_wellformed(vecbuf_t *vb)
 }
 
 static void
-xmtr_vecbuf_unload(xmtr_t *x, vecbuf_t *vb)
+xmtr_vecbuf_unload(xmtr_t *x)
 {
+    vecbuf_t *vb;
+    struct fi_rma_iov *riov;
     size_t i;
 
-    for (i = 0; i < vb->msg.niovs; i++) {
+    riov = (!x->phase) ? x->riov : x->riov2;
+
+    if ((vb = (vecbuf_t *)fifo_peek(x->vec.rcvd)) == NULL)
+        return;
+
+    if (!x->cxn.eof.remote && vb->msg.niovs == 0) {
+        warnx("%s: received remote EOF", __func__);
+        x->cxn.eof.remote = true;
+    }
+
+    for (i = x->next_riov;
+         i < vb->msg.niovs && x->nriovs < arraycount(x->riov);
+         i++) {
         warnx("%s: received vector %zu "
             "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
             __func__, i, vb->msg.iov[i].addr, vb->msg.iov[i].len,
             vb->msg.iov[i].key);
 
-        x->riov[i].len = vb->msg.iov[i].len;
-        x->riov[i].addr = vb->msg.iov[i].addr;
-        x->riov[i].key = vb->msg.iov[i].key;
+        riov[x->nriovs++] = (struct fi_rma_iov){
+          .len = vb->msg.iov[i].len
+        , .addr = vb->msg.iov[i].addr
+        , .key = vb->msg.iov[i].key
+        };
     }
 
-    if (vb->msg.niovs == 0) {
-        warnx("%s: received remote EOF", __func__);
-        x->cxn.eof.remote = true;
-    }
-
-    x->phase = false;
-    x->nriovs = i;
+    if (i == vb->msg.niovs) {
+        (void)fifo_get(x->vec.rcvd);
+        rxctl_post(&x->cxn, &x->vec, &vb->hdr);
+        x->next_riov = 0;
+    } else
+        x->next_riov = i;
 }
 
 /* Process completed vector-message reception.  Return 0 if no
@@ -1513,12 +1528,11 @@ xmtr_vector_rx_process(xmtr_t *x, const struct fi_cq_msg_entry *cmpl)
         rxctl_post(&x->cxn, &x->vec, &vb->hdr);
         return 0;
     }
-
-    if (x->nriovs == 0) {
-        xmtr_vecbuf_unload(x, vb);
-        rxctl_post(&x->cxn, &x->vec, &vb->hdr);
-    } else if (!fifo_put(x->vec.rcvd, &vb->hdr))
+    
+    if (!fifo_put(x->vec.rcvd, &vb->hdr))
         errx(EXIT_FAILURE, "%s: received vectors FIFO was full", __func__);
+
+    xmtr_vecbuf_unload(x);
 
     return 1;
 }
@@ -2229,6 +2243,8 @@ xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
 
     memset(x, 0, sizeof(*x));
 
+    x->next_riov = 0;
+    x->phase = false;
     x->bytes_progress = 0;
 
     cxn_init(&x->cxn, av, xmtr_loop);
