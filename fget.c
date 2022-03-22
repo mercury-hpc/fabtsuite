@@ -879,11 +879,9 @@ static void
 txctl_transmit(cxn_t *c, txctl_t *tc)
 {
     bufhdr_t *h;
-    int rc;
 
-    while ((h = fifo_peek(tc->txready)) != NULL &&
-           !fifo_full(tc->txposted)) {
-        rc = fi_sendmsg(c->ep, &(struct fi_msg){
+    while ((h = fifo_peek(tc->txready)) != NULL && !fifo_full(tc->txposted)) {
+        const int rc = fi_sendmsg(c->ep, &(struct fi_msg){
               .msg_iov = &(struct iovec){
                   .iov_base = ((bytebuf_t *)h)->payload
                 , .iov_len = h->nused}
