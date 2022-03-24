@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h> /* strcmp(3), strdup(3) */
-#include <unistd.h> /* sysconf(3) */
+#include <unistd.h> /* getopt(3), sysconf(3) */
 
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>     /* fi_listen, fi_getname */
@@ -301,6 +301,7 @@ struct worker {
     size_t mr_maxsegs;
     size_t rma_maxsegs;
     size_t rx_maxsegs;
+    bool reregister;
 };
 
 typedef struct {
@@ -329,6 +330,7 @@ typedef struct {
     size_t tx_maxsegs;
     size_t rma_maxsegs;
     keysource_t keys;
+    bool reregister;
 } state_t;
 
 typedef int (*personality_t)(state_t *);
@@ -343,8 +345,10 @@ static pthread_cond_t nworkers_cond = PTHREAD_COND_INITIALIZER;
 
 static bool workers_assignment_suspended = false;
 
-static const uint64_t rxaccess = FI_RECV | FI_REMOTE_WRITE;
-static const uint64_t txaccess = FI_SEND;
+static const struct {
+    uint64_t rx;
+    uint64_t tx;
+} payload_access = {.rx = FI_RECV | FI_REMOTE_WRITE, .tx = FI_SEND};
 
 static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
 static const uint64_t desired_tx_flags = FI_SEND | FI_MSG;
@@ -635,7 +639,7 @@ vecbuf_free(vecbuf_t *vb)
 }
 
 static bool
-worker_buflist_replenish(worker_t *w, uint64_t access, buflist_t *bl)
+worker_paybuflist_replenish(worker_t *w, uint64_t access, buflist_t *bl)
 {
     size_t i, paylen;
     int rc;
@@ -671,10 +675,9 @@ worker_buflist_replenish(worker_t *w, uint64_t access, buflist_t *bl)
         if (buf == NULL)
             err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
 
-        rc = buf_mr_reg(w->dom, access, keysource_next(&w->keys),
-            &buf->hdr);
-
-        if (rc != 0) {
+        if (!w->reregister &&
+            (rc = buf_mr_reg(w->dom, access, keysource_next(&w->keys),
+                             &buf->hdr)) != 0) {
             warn_about_ofi_ret(rc, "fi_mr_reg");
             free(buf);
             break;
@@ -694,7 +697,7 @@ worker_payload_txbuf_get(worker_t *w)
     bytebuf_t *b;
 
     while ((b = (bytebuf_t *)buflist_get(w->paybufs.tx)) == NULL &&
-           worker_buflist_replenish(w, txaccess, w->paybufs.tx))
+           worker_paybuflist_replenish(w, payload_access.tx, w->paybufs.tx))
         ;   // do nothing
 
     if (b != NULL)
@@ -709,7 +712,7 @@ worker_payload_rxbuf_get(worker_t *w)
     bytebuf_t *b;
 
     while ((b = (bytebuf_t *)buflist_get(w->paybufs.rx)) == NULL &&
-           worker_buflist_replenish(w, rxaccess, w->paybufs.rx))
+           worker_paybuflist_replenish(w, payload_access.rx, w->paybufs.rx))
         ;   // do nothing
 
     if (b != NULL)
@@ -1156,6 +1159,10 @@ rcvr_loop(worker_t *w, session_t *s)
 
             h->nused = 0;
 
+            if (w->reregister && (rc = buf_mr_reg(w->dom, payload_access.rx,
+                                 keysource_next(&w->keys), h)) < 0)
+                bailout_for_ofi_ret(rc, "payload memory registration failed");
+
             (void)fifo_put(r->tgtposted, h);
 
             vb->msg.iov[i].addr = 0;
@@ -1180,6 +1187,10 @@ rcvr_loop(worker_t *w, session_t *s)
             r->nfull -= (h->nallocated - h->nused);
             h->nused = h->nallocated;
             (void)fifo_get(r->tgtposted);
+
+            if (w->reregister && (rc = fi_close(&h->mr->fid)) != 0)
+                warn_about_ofi_ret(rc, "fi_close");
+
             (void)fifo_put(s->ready_for_terminal, h);
         }
     }
@@ -1191,6 +1202,10 @@ rcvr_loop(worker_t *w, session_t *s)
     if (r->cxn.eof.remote && (h = fifo_peek(r->tgtposted)) != NULL &&
         h->nused != 0) {
         (void)fifo_get(r->tgtposted);
+
+        if (w->reregister && (rc = fi_close(&h->mr->fid)) != 0)
+            warn_about_ofi_ret(rc, "fi_close");
+
         (void)fifo_put(s->ready_for_terminal, h);
     }
 
@@ -1541,7 +1556,7 @@ xmtr_vector_rx_process(xmtr_t *x, const struct fi_cq_msg_entry *cmpl)
  * any completion occurred, -1 on an irrecoverable error.
  */
 static int
-xmtr_cq_process(xmtr_t *x, session_t *s)
+xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
 {
     struct fi_cq_msg_entry cmpl;
     bufhdr_t *h;
@@ -1604,7 +1619,13 @@ xmtr_cq_process(xmtr_t *x, session_t *s)
         while ((h = fifo_peek(x->wrposted)) != NULL &&
                h->xfc.owner == xfo_program &&
                !fifo_full(s->ready_for_terminal)) {
+            int rc;
+
             (void)fifo_get(x->wrposted);
+
+            if (reregister && (rc = fi_close(&h->mr->fid)) != 0)
+                warn_about_ofi_ret(rc, "fi_close");
+
             x->bytes_progress += h->nused;
             (void)fifo_put(s->ready_for_terminal, h);
         }
@@ -1634,7 +1655,7 @@ xmtr_loop(worker_t *w, session_t *s)
     if (!x->cxn.started)
         return xmtr_start(w, s);
 
-    if (xmtr_cq_process(x, s) == -1)
+    if (xmtr_cq_process(x, s, w->reregister) == -1)
         goto fail;
 
     ctl = source_trade(s->terminal, s->ready_for_terminal, s->ready_for_cxn);
@@ -1651,6 +1672,10 @@ xmtr_loop(worker_t *w, session_t *s)
              h->nused + total <= maxbytes && !fifo_full(x->wrposted);
          i++, last_h = h, total += h->nused) {
         bytebuf_t *b = (bytebuf_t *)h;
+
+        if (w->reregister && (rc = buf_mr_reg(w->dom, payload_access.tx,
+                             keysource_next(&w->keys), h)) < 0)
+            bailout_for_ofi_ret(rc, "payload memory registration failed");
 
         (void)fifo_get(s->ready_for_cxn);
         (void)fifo_put(x->wrposted, h);
@@ -1916,7 +1941,7 @@ worker_outer_loop(void *arg)
 }
 
 static void
-worker_buflist_destroy(struct fid_domain *dom, buflist_t *bl)
+worker_paybuflist_destroy(worker_t *w, buflist_t *bl)
 {
     size_t i;
     int rc;
@@ -1924,8 +1949,8 @@ worker_buflist_destroy(struct fid_domain *dom, buflist_t *bl)
     for (i = 0; i < bl->nfull; i++) {
         bufhdr_t *h = bl->buf[i];
 
-        if ((rc = fi_close(&h->mr->fid)) != 0)
-            warn_about_ofi_ret(rc, "fi_mr_reg");
+        if (!w->reregister && (rc = fi_close(&h->mr->fid)) != 0)
+            warn_about_ofi_ret(rc, "fi_close");
 
         free(h);
     }
@@ -1948,15 +1973,15 @@ buflist_create(size_t n)
 }
 
 static buflist_t *
-worker_buflist_create(worker_t *w, uint64_t access)
+worker_paybuflist_create(worker_t *w, uint64_t access)
 {
     buflist_t *bl = buflist_create(16);
 
     if (bl == NULL)
         return NULL;
 
-    if (!worker_buflist_replenish(w, access, bl)) {
-        worker_buflist_destroy(w->dom, bl);
+    if (!worker_paybuflist_replenish(w, access, bl)) {
+        worker_paybuflist_destroy(w, bl);
         return NULL;
     }
 
@@ -1976,6 +2001,7 @@ worker_init(worker_t *w, const state_t *st)
     w->mr_maxsegs = st->mr_maxsegs;
     w->rma_maxsegs = st->rma_maxsegs;
     w->rx_maxsegs = st->rx_maxsegs;
+    w->reregister = st->reregister;
     keysource_init(&w->keys);
 
     if ((rc = pthread_cond_init(&w->sleep, NULL)) != 0) {
@@ -1994,8 +2020,8 @@ worker_init(worker_t *w, const state_t *st)
     for (i = 0; i < arraycount(w->session); i++)
         w->session[i] = (session_t){.cxn = NULL, .terminal = NULL};
 
-    w->paybufs.rx = worker_buflist_create(w, rxaccess);
-    w->paybufs.tx = worker_buflist_create(w, txaccess);
+    w->paybufs.rx = worker_paybuflist_create(w, payload_access.rx);
+    w->paybufs.tx = worker_paybuflist_create(w, payload_access.tx);
 }
 
 static void
@@ -2739,26 +2765,47 @@ personality_to_name(personality_t p)
         return "unknown";
 }
 
+static void
+usage(const char *progname)
+{
+    fprintf(stderr, "usage: %s [-r]\n", progname);
+    exit(EXIT_FAILURE);
+}
+
 int
 main(int argc, char **argv)
 {
     struct fi_info *hints;
     personality_t personality;
-    char *prog, *tmp;
+    char *progname, *tmp;
     state_t st;
-    int rc;
+    int opt, rc;
+
+    memset(&st, 0, sizeof(st));
 
     if ((tmp = strdup(argv[0])) == NULL)
         err(EXIT_FAILURE, "%s: strdup", __func__);
 
-    prog = basename(tmp);
+    progname = basename(tmp);
 
-    if (strcmp(prog, "fget") == 0)
+    if (strcmp(progname, "fget") == 0) {
         personality = get;
-    else if (strcmp(prog, "fput") == 0)
+    } else if (strcmp(progname, "fput") == 0) {
         personality = put;
-    else
-        errx(EXIT_FAILURE, "program personality '%s' is not implemented", prog);
+    } else {
+        errx(EXIT_FAILURE, "program personality '%s' is not implemented",
+           progname);
+    }
+
+    while ((opt = getopt(argc, argv, "r")) != -1) {
+        switch (opt) {
+        case 'r':
+            st.reregister = true;
+            break;
+        default:
+            usage(progname);
+        }
+    }
 
     workers_initialize();
 
