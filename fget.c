@@ -2589,7 +2589,6 @@ get(state_t *st)
         , .context = NULL
         , .data = 0
         }, 0)) == -FI_EAGAIN) {
-        /* Await reply to initial message: first vector message. */
         ncompleted = fi_cq_read(r->cxn.cq, &completion, 1);
 
         if (ncompleted == -FI_EAGAIN)
