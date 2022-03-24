@@ -2464,19 +2464,13 @@ get(state_t *st)
     if (!session_init(&sess, &r->cxn, &s->terminal))
         errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
 
-    rc = fi_endpoint(st->domain, st->info, &gst->listen_ep, NULL);
-
-    if (rc != 0)
+    if ((rc = fi_endpoint(st->domain, st->info, &gst->listen_ep, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
-    rc = fi_eq_open(st->fabric, &eq_attr, &gst->listen_eq, NULL);
-
-    if (rc != 0)
+    if ((rc = fi_eq_open(st->fabric, &eq_attr, &gst->listen_eq, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open (listen)");
 
-    rc = fi_cq_open(st->domain, &cq_attr, &gst->listen_cq, NULL);
-
-    if (rc != 0)
+    if ((rc = fi_cq_open(st->domain, &cq_attr, &gst->listen_cq, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
     if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_cq->fid,
@@ -2582,9 +2576,7 @@ get(state_t *st)
 
     size_t addrlen = sizeof(r->ack.msg.addr);
 
-    rc = fi_getname(&r->cxn.ep->fid, r->ack.msg.addr, &addrlen);
-
-    if (rc != 0)
+    if ((rc = fi_getname(&r->cxn.ep->fid, r->ack.msg.addr, &addrlen)) != 0)
         bailout_for_ofi_ret(rc, "fi_getname");
 
     r->ack.msg.addrlen = (uint32_t)addrlen;
@@ -2674,38 +2666,26 @@ put(state_t *st)
     if (!session_init(&sess, &x->cxn, &s->terminal))
         errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
 
-    rc = fi_endpoint(st->domain, st->info, &x->cxn.ep, NULL);
-
-    if (rc != 0)
+    if ((rc = fi_endpoint(st->domain, st->info, &x->cxn.ep, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
-    rc = fi_cq_open(st->domain, &cq_attr, &x->cxn.cq, NULL);
-
-    if (rc != 0)
+    if ((rc = fi_cq_open(st->domain, &cq_attr, &x->cxn.cq, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
-    rc = fi_eq_open(st->fabric, &eq_attr, &x->cxn.eq, NULL);
-
-    if (rc != 0)
+    if ((rc = fi_eq_open(st->fabric, &eq_attr, &x->cxn.eq, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open");
 
-    rc = fi_ep_bind(x->cxn.ep, &x->cxn.eq->fid, 0);
-
-    if (rc != 0)
+    if ((rc = fi_ep_bind(x->cxn.ep, &x->cxn.eq->fid, 0)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    rc = fi_ep_bind(x->cxn.ep, &x->cxn.cq->fid,
-        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT);
-
-    if (rc != 0)
+    if ((rc = fi_ep_bind(x->cxn.ep, &x->cxn.cq->fid,
+        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
     if ((rc = fi_ep_bind(x->cxn.ep, &av->fid, 0)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
 
-    rc = fi_enable(x->cxn.ep);
-
-    if (rc != 0)
+    if ((rc = fi_enable(x->cxn.ep)) != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
 
     rc = fi_av_insert(av, st->info->dest_addr, 1, &x->cxn.peer_addr, 0, NULL);
@@ -2724,9 +2704,7 @@ put(state_t *st)
 
     size_t addrlen = sizeof(x->initial.msg.addr);
 
-    rc = fi_getname(&x->cxn.ep->fid, x->initial.msg.addr, &addrlen);
-
-    if (rc != 0)
+    if ((rc = fi_getname(&x->cxn.ep->fid, x->initial.msg.addr, &addrlen)) != 0)
         bailout_for_ofi_ret(rc, "fi_getname");
 
     x->initial.msg.addrlen = (uint32_t)addrlen;
