@@ -1701,7 +1701,7 @@ xmtr_loop(worker_t *w, session_t *s)
         last_h->xfc.place |= xfp_last;
 
         /* Take txbuffers off of our queue while their cumulative length
-         * is less than sum(0 <= i < min(rma_maxsegs, nriovs), riov[i].len).
+         * is less than sum(0 <= i < maxriovs, riov[i].len).
          * Flag the first txbuffer `xfp_first` and the last `xfp_last`
          * (first and last may be the same buffer).  Clear flags on the rest
          * of the txbuffers.  Set the owner of the first to `xfo_nic`.
@@ -1721,7 +1721,7 @@ xmtr_loop(worker_t *w, session_t *s)
             .nriovs = x->nriovs,
             .nriovs_out = &nriovs_out,
             .len = total,
-            .maxsegs = minsize(w->rma_maxsegs, x->nriovs),
+            .maxsegs = maxriovs,
             .flags = FI_COMPLETION | FI_DELIVERY_COMPLETE,
             .context = &first_h->xfc.ctx,
             .addr = x->cxn.peer_addr};
