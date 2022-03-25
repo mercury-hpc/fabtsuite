@@ -1674,7 +1674,7 @@ xmtr_loop(worker_t *w, session_t *s)
         bytebuf_t *b = (bytebuf_t *)h;
 
         if (w->reregister && (rc = buf_mr_reg(w->dom, payload_access.tx,
-                             keysource_next(&w->keys), h)) < 0)
+                                              keysource_next(&w->keys), h)) < 0)
             bailout_for_ofi_ret(rc, "payload memory registration failed");
 
         (void)fifo_get(s->ready_for_cxn);
