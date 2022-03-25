@@ -330,6 +330,7 @@ typedef struct {
     size_t tx_maxsegs;
     size_t rma_maxsegs;
     keysource_t keys;
+    bool contiguous;
     bool reregister;
 } state_t;
 
@@ -2768,7 +2769,7 @@ personality_to_name(personality_t p)
 static void
 usage(const char *progname)
 {
-    fprintf(stderr, "usage: %s [-r]\n", progname);
+    fprintf(stderr, "usage: %s [-r] [-g]\n", progname);
     exit(EXIT_FAILURE);
 }
 
@@ -2797,8 +2798,11 @@ main(int argc, char **argv)
            progname);
     }
 
-    while ((opt = getopt(argc, argv, "r")) != -1) {
+    while ((opt = getopt(argc, argv, "gr")) != -1) {
         switch (opt) {
+        case 'g':
+            st.contiguous = true;
+            break;
         case 'r':
             st.reregister = true;
             break;
@@ -2879,7 +2883,7 @@ main(int argc, char **argv)
     st.mr_maxsegs = 1; // st.info->domain_attr->mr_iov_limit;
     st.rx_maxsegs = 1;
     st.tx_maxsegs = 1;
-    st.rma_maxsegs = st.info->tx_attr->rma_iov_limit;
+    st.rma_maxsegs = st.contiguous ? 1 : st.info->tx_attr->rma_iov_limit;
 
 #if 0
     warnx("maximum endpoint message size (RMA limit) %zu",
