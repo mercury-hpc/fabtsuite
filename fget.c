@@ -1540,6 +1540,7 @@ xmtr_vector_rx_process(xmtr_t *x, const struct fi_cq_msg_entry *cmpl)
         return -1;
 
     if (!vecbuf_is_wellformed(vb)) {
+        warnx("%s: rx'd malformed vector message", __func__);
         rxctl_post(&x->cxn, &x->vec, &vb->hdr);
         return 0;
     }
