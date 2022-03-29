@@ -2265,6 +2265,7 @@ static void
 xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
 {
     const size_t nbufs = 16;
+    const size_t maxposted = 64;
     size_t i;
 
     memset(x, 0, sizeof(*x));
@@ -2275,7 +2276,7 @@ xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
 
     cxn_init(&x->cxn, av, xmtr_loop);
     xmtr_memory_init(st, x);
-    if ((x->wrposted = fifo_create(64)) == NULL) {
+    if ((x->wrposted = fifo_create(maxposted)) == NULL) {
         errx(EXIT_FAILURE,
             "%s: could not create posted RDMA writes FIFO", __func__);
     }
