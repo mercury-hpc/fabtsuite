@@ -58,6 +58,7 @@ typedef enum {
   xft_progress
 , xft_rdma_write
 , xft_vector
+, xft_fragment
 } xfc_type_t;
 
 typedef enum {
@@ -75,7 +76,8 @@ typedef struct {
     uint32_t type:4;
     uint32_t owner:1;
     uint32_t place:2;
-    uint32_t unused:25;
+    uint32_t nchildren:8;
+    uint32_t unused:17;
 } xfer_context_t;
 
 typedef struct bufhdr {
@@ -86,6 +88,11 @@ typedef struct bufhdr {
     void *desc;
     xfer_context_t xfc;
 } bufhdr_t;
+
+typedef struct fragment {
+    bufhdr_t hdr;
+    bufhdr_t alignas(max_align_t) * parent;
+} fragment_t;
 
 typedef struct bytebuf {
     bufhdr_t hdr;
@@ -240,6 +247,10 @@ typedef struct {
         ssize_t niovs;
         struct fi_context context;
     } payload;
+    struct {
+        buflist_t *pool;    // unused fragment headers
+        size_t offset;      // offset into buffer at head of ready_for_cxn
+    } fragment;
     struct fi_rma_iov riov[12], riov2[12];
     size_t nriovs;
     size_t next_riov;
@@ -575,6 +586,21 @@ static bytebuf_t *
 bytebuf_alloc(size_t paylen)
 {
     return (bytebuf_t *)buf_alloc(paylen);
+}
+
+static fragment_t *
+fragment_alloc(void)
+{
+    bufhdr_t *h;
+    fragment_t *f;
+
+    if ((h = buf_alloc(sizeof(*f) - sizeof(bufhdr_t))) == NULL)
+        return NULL;
+
+    f = (fragment_t *)h;
+    h->xfc.type = xft_fragment;
+
+    return f;
 }
 
 static progbuf_t *
@@ -1596,6 +1622,7 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
     case xft_vector:
         warnx("%s: read a vector rx completion", __func__);
         return xmtr_vector_rx_process(x, &cmpl);
+    case xft_fragment:
     case xft_rdma_write:
         warnx("%s: read an RDMA-write completion", __func__);
         /* If the head of `wrposted` is marked `xfo_program`, then dequeue the
@@ -1617,6 +1644,19 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
         }
         while ((h = fifo_peek(x->wrposted)) != NULL &&
                h->xfc.owner == xfo_program &&
+               h->xfc.type == xft_fragment) {
+            fragment_t *f = (fragment_t *)h;
+            (void)fifo_get(x->wrposted);
+
+            assert(f->parent->xfc.nchildren > 0);
+            f->parent->xfc.nchildren--;
+
+            (void)buflist_put(x->fragment.pool, h);
+        }
+        while ((h = fifo_peek(x->wrposted)) != NULL &&
+               h->xfc.owner == xfo_program &&
+               h->xfc.type == xft_rdma_write &&
+               h->xfc.nchildren == 0 &&
                !fifo_full(s->ready_for_terminal)) {
             int rc;
 
@@ -1638,16 +1678,41 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
     }
 }
 
+static bufhdr_t *
+xmtr_buf_split(xmtr_t *x, bufhdr_t *parent, size_t len)
+{
+    bufhdr_t *h;
+    fragment_t *f;
+
+    assert(x->fragment.offset < parent->nused);
+    assert(len < parent->nused - x->fragment.offset);
+
+    if ((h = buflist_get(x->fragment.pool)) == NULL)
+        errx(EXIT_FAILURE, "%s: out of fragment headers", __func__);
+
+    f = (fragment_t *)h;
+
+    h->raddr = x->fragment.offset;
+    h->nused = len;
+    h->nallocated = 0;
+    h->mr = parent->mr;
+    h->desc = parent->desc;
+    f->parent = parent;
+
+    parent->xfc.nchildren++;
+
+    return h;
+}
+
 static loop_control_t
 xmtr_loop(worker_t *w, session_t *s)
 {
     progbuf_t *pb;
     vecbuf_t *vb;
-    bufhdr_t *first_h, *h, *last_h = NULL;
+    bufhdr_t *first_h, *h, *head, *last_h = NULL;
     xmtr_t *x = (xmtr_t *)s->cxn;
     const size_t maxriovs = minsize(w->rma_maxsegs, x->nriovs);
-    size_t i;
-    size_t maxbytes, niovs, niovs_out = 0, nriovs_out = 0;
+    size_t i, len, maxbytes, niovs, niovs_out = 0, nriovs_out = 0;
     ssize_t nwritten, rc, total;
     loop_control_t ctl;
 
@@ -1667,18 +1732,48 @@ xmtr_loop(worker_t *w, session_t *s)
     for (maxbytes = 0, i = 0; i < maxriovs; i++)
         maxbytes += ((!x->phase) ? x->riov : x->riov2)[i].len;
 
+    /* If x->nriovs < w->rma_maxsegs, then more RDMA vectors will
+     * arrive, so there is no need to fragment.
+     */
+    const bool riovs_maxed_out = x->nriovs >= w->rma_maxsegs;
+
     for (i = 0, total = 0, first_h = last_h = NULL;
          i < maxriovs &&
-             (h = fifo_peek(s->ready_for_cxn)) != NULL &&
-             h->nused + total <= maxbytes && !fifo_full(x->wrposted);
-         i++, last_h = h, total += h->nused) {
-        bytebuf_t *b = (bytebuf_t *)h;
+             (head = fifo_peek(s->ready_for_cxn)) != NULL &&
+             total < maxbytes && !fifo_full(x->wrposted);
+         i++, last_h = h, total += len) {
+        const bool oversize_load =
+            head->nused - x->fragment.offset > maxbytes - total;
 
-        if (w->reregister && (rc = buf_mr_reg(w->dom, payload_access.tx,
-                                              keysource_next(&w->keys), h)) < 0)
+        warnx("%s: head %p nchildren %" PRIu32 " offset %zu nused %zu total %zu maxbytes %zu "
+            "nriovs %zu maxsegs %zu", __func__, (void *)head,
+            head->xfc.nchildren,
+            x->fragment.offset, head->nused, total, maxbytes,
+            x->nriovs, w->rma_maxsegs);
+
+        if (oversize_load && !riovs_maxed_out)
+            break;
+
+        if (oversize_load)
+            len = maxbytes - total;
+        else
+            len = head->nused - x->fragment.offset;
+
+        if (x->fragment.offset == 0)
+            head->xfc.nchildren = 0;
+
+        if (w->reregister && x->fragment.offset == 0 &&
+            (rc = buf_mr_reg(w->dom, payload_access.tx,
+                             keysource_next(&w->keys), head)) < 0)
             bailout_for_ofi_ret(rc, "payload memory registration failed");
 
-        (void)fifo_get(s->ready_for_cxn);
+        if (oversize_load) {
+            h = xmtr_buf_split(x, head, len);
+        } else {
+            (void)fifo_get(s->ready_for_cxn);
+            h = head;
+        }
+
         (void)fifo_put(x->wrposted, h);
 
         if (last_h == NULL)
@@ -1687,11 +1782,19 @@ xmtr_loop(worker_t *w, session_t *s)
         h->xfc.owner = xfo_program;
         h->xfc.place = 0;
 
+        bytebuf_t *b = (bytebuf_t *)head;
+
         ((!x->phase) ? x->payload.iov : x->payload.iov2)[i] = (struct iovec){
-          .iov_len = h->nused
-        , .iov_base = b->payload
+          .iov_len = len
+        , .iov_base = &b->payload[x->fragment.offset]
         };
         ((!x->phase) ? x->payload.desc : x->payload.desc2)[i] = h->desc;
+        if (oversize_load) {
+            x->fragment.offset += len;
+            assert(x->fragment.offset < head->nused);
+        } else {
+            x->fragment.offset = 0;
+        }
     }
     niovs = i;
 
@@ -2271,6 +2374,7 @@ xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
     memset(x, 0, sizeof(*x));
 
     x->next_riov = 0;
+    x->fragment.offset = 0;
     x->phase = false;
     x->bytes_progress = 0;
 
@@ -2302,6 +2406,18 @@ xmtr_init(state_t *st, xmtr_t *x, struct fid_av *av)
     if ((x->progress.pool = buflist_create(nbufs)) == NULL) {
         errx(EXIT_FAILURE,
             "%s: could not create progress-message tx buffer pool", __func__);
+    }
+
+    if ((x->fragment.pool = buflist_create(maxposted)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create fragment header pool", __func__);
+    }
+
+    for (i = 0; i < maxposted; i++) {
+        fragment_t *f = fragment_alloc();
+
+        if (!buflist_put(x->fragment.pool, &f->hdr))
+            errx(EXIT_FAILURE, "%s: fragment pool full", __func__);
     }
 
     for (i = 0; i < nbufs; i++) {
