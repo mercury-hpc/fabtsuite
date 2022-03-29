@@ -1685,7 +1685,6 @@ xmtr_loop(worker_t *w, session_t *s)
             first_h = h;
 
         h->xfc.owner = xfo_program;
-        h->xfc.type = xft_rdma_write;
         h->xfc.place = 0;
 
         ((!x->phase) ? x->payload.iov : x->payload.iov2)[i] = (struct iovec){
