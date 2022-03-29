@@ -673,6 +673,8 @@ worker_paybuflist_replenish(worker_t *w, uint64_t access, buflist_t *bl)
         if (buf == NULL)
             err(EXIT_FAILURE, "%s.%d: malloc", __func__, __LINE__);
 
+        buf->hdr.xfc.type = xft_rdma_write;
+
         if (!w->reregister &&
             (rc = buf_mr_reg(w->dom, access, keysource_next(&w->keys),
                              &buf->hdr)) != 0) {
