@@ -1492,10 +1492,10 @@ xmtr_vecbuf_unload(xmtr_t *x)
     struct fi_rma_iov *riov;
     size_t i;
 
-    riov = (!x->phase) ? x->riov : x->riov2;
-
     if ((vb = (vecbuf_t *)fifo_peek(x->vec.rcvd)) == NULL)
         return;
+
+    riov = (!x->phase) ? x->riov : x->riov2;
 
     if (!x->cxn.eof.remote && vb->msg.niovs == 0) {
         warnx("%s: received remote EOF", __func__);
