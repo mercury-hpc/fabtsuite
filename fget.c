@@ -1545,8 +1545,6 @@ xmtr_vector_rx_process(xmtr_t *x, const struct fi_cq_msg_entry *cmpl)
     if (!fifo_put(x->vec.rcvd, &vb->hdr))
         errx(EXIT_FAILURE, "%s: received vectors FIFO was full", __func__);
 
-    xmtr_vecbuf_unload(x);
-
     return 1;
 }
 
@@ -1655,6 +1653,8 @@ xmtr_loop(worker_t *w, session_t *s)
 
     if (xmtr_cq_process(x, s, w->reregister) == -1)
         goto fail;
+
+    xmtr_vecbuf_unload(x);
 
     ctl = source_trade(s->terminal, s->ready_for_terminal, s->ready_for_cxn);
 
