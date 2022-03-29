@@ -94,12 +94,12 @@ typedef struct bytebuf {
 
 typedef struct progbuf {
     bufhdr_t hdr;
-    progress_msg_t msg;
+    progress_msg_t alignas(max_align_t) msg;
 } progbuf_t;
 
 typedef struct vecbuf {
     bufhdr_t hdr;
-    vector_msg_t msg;
+    vector_msg_t alignas(max_align_t) msg;
 } vecbuf_t;
 
 typedef struct fifo {
@@ -589,8 +589,6 @@ progbuf_alloc(void)
     pb = (progbuf_t *)h;
     h->xfc.type = xft_progress;
 
-    h->raddr = (char *)&pb->msg - (char *)&h[1];
-
     return pb;
 }
 
@@ -606,8 +604,6 @@ vecbuf_alloc(void)
     vb = (vecbuf_t *)h;
     h->xfc.type = xft_vector;
 
-    h->raddr = (char *)&vb->msg - (char *)&h[1];
-
     return vb;
 }
 
@@ -616,8 +612,9 @@ buf_mr_reg(struct fid_domain *dom, uint64_t access, uint64_t key,
     bufhdr_t *h)
 {
     int rc;
+    bytebuf_t *b = (bytebuf_t *)h;
 
-    rc = fi_mr_reg(dom, &h[1], h->nallocated, access, 0, key, 0, &h->mr, NULL);
+    rc = fi_mr_reg(dom, b->payload, h->nallocated, access, 0, key, 0, &h->mr, NULL);
 
     if (rc != 0)
         return rc;
