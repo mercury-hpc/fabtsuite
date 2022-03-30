@@ -3,6 +3,7 @@
 #include <libgen.h> /* basename(3) */
 #include <limits.h> /* INT_MAX */
 #include <inttypes.h>   /* PRIu32 */
+#include <signal.h>
 #include <stdarg.h>
 #include <stdalign.h>
 #include <stdatomic.h>
@@ -357,6 +358,16 @@ static pthread_cond_t nworkers_cond = PTHREAD_COND_INITIALIZER;
 
 static bool workers_assignment_suspended = false;
 
+static struct {
+    int signum;
+    struct sigaction saved_action;
+} siglist[] = {
+  {.signum = SIGHUP}
+, {.signum = SIGINT}
+, {.signum = SIGQUIT}
+, {.signum = SIGTERM}
+};
+
 static const struct {
     uint64_t rx;
     uint64_t tx;
@@ -368,6 +379,8 @@ static const uint64_t desired_wr_flags =
     FI_RMA | FI_WRITE | FI_COMPLETION | FI_DELIVERY_COMPLETE;
 
 static uint64_t _Atomic next_key_pool = 512;
+
+static volatile sig_atomic_t cancelled = 0;
 
 static char txbuf[] =
     "If this message was received in error then please "
@@ -1920,7 +1933,7 @@ cxn_loop(worker_t *w, session_t *s)
 #if 0
     warnx("%s: going around", __func__);
 #endif
-    return s->cxn->loop(w, s);
+    return cancelled ? loop_error : s->cxn->loop(w, s);
 }
 
 static void
@@ -2130,11 +2143,31 @@ worker_init(worker_t *w, const state_t *st)
 static void
 worker_launch(worker_t *w)
 {
-    int rc;
+    int i, rc;
+    sigset_t oldset, blockset;
+
+    if ((rc = sigemptyset(&blockset)) == -1) {
+        err(EXIT_FAILURE, "%s.%d: sigfillset", __func__, __LINE__);
+    }
+
+    for (i = 0; i < arraycount(siglist); i++) {
+        if (sigaddset(&blockset, siglist[i].signum) == -1)
+            err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+    }
+
+    if ((rc = pthread_sigmask(SIG_BLOCK, &blockset, &oldset)) != 0) {
+        errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
+            strerror(rc));
+    }
 
     if ((rc = pthread_create(&w->thd, NULL, worker_outer_loop, w)) != 0) {
             errx(EXIT_FAILURE, "%s.%d: pthread_create: %s",
                 __func__, __LINE__, strerror(rc));
+    }
+
+    if ((rc = pthread_sigmask(SIG_SETMASK, &oldset, NULL)) != 0) {
+        errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
+            strerror(rc));
     }
 }
 
@@ -2889,14 +2922,21 @@ usage(const char *progname)
     exit(EXIT_FAILURE);
 }
 
+static void
+handler(int signum, siginfo_t *info, void *ucontext)
+{
+    cancelled = 1;
+}
+
 int
 main(int argc, char **argv)
 {
+    sigset_t oldset, blockset;
     struct fi_info *hints;
     personality_t personality;
     char *progname, *tmp;
     state_t st;
-    int opt, rc;
+    int ecode, i, opt, rc;
 
     memset(&st, 0, sizeof(st));
 
@@ -3011,5 +3051,41 @@ main(int argc, char **argv)
 
     warnx("starting personality '%s'", personality_to_name(personality));
 
-    return (*personality)(&st);
+    if (sigemptyset(&blockset) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigemptyset", __func__, __LINE__);
+
+    for (i = 0; i < arraycount(siglist); i++) {
+        if (sigaddset(&blockset, siglist[i].signum) == -1)
+            err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+    }
+
+    if ((rc = pthread_sigmask(SIG_BLOCK, &blockset, &oldset)) != 0) {
+        errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
+            strerror(rc));
+    }
+
+    struct sigaction action = {.sa_sigaction = handler, .sa_flags = SA_SIGINFO};
+
+    if (sigemptyset(&action.sa_mask) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+
+    for (i = 0; i < arraycount(siglist); i++) {
+        if (sigaction(siglist[i].signum, &action,
+                      &siglist[i].saved_action) == -1)
+            err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+    }
+
+    if ((rc = pthread_sigmask(SIG_UNBLOCK, &blockset, NULL)) != 0) {
+        errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
+            strerror(rc));
+    }
+
+    ecode = (*personality)(&st);
+
+    if ((rc = pthread_sigmask(SIG_SETMASK, &oldset, NULL)) != 0) {
+        errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
+            strerror(rc));
+    }
+
+    return ecode;
 }
