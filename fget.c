@@ -1742,6 +1742,21 @@ xmtr_loop(worker_t *w, session_t *s)
     if (ctl == loop_error)
         goto fail;
 
+    /* Take Tx buffers off of our queue while their cumulative length
+     * is less than the sum length of RDMA targets that we can write
+     * in one scatter-gather I/O, sum(0 <= i < maxriovs, riov[i].len).
+     *
+     * If the first Tx buffer is longer than the RDMA targets, and no more
+     * RDMA buffers are expected to arrive, then fragment the Tx buffer
+     * and write the fragments independently.
+     *
+     * Flag the first Tx buffer `xfp_first` and the last `xfp_last`
+     * (first and last may be the same buffer).  Clear flags on the rest
+     * of the Tx buffers.  Set the owner of the first to `xfo_nic`.
+     *
+     * Finally, perform one fi_writemsg using the context on the first
+     * Tx buffer.
+     */
     for (maxbytes = 0, i = 0; i < maxriovs; i++)
         maxbytes += ((!x->phase) ? x->riov : x->riov2)[i].len;
 
@@ -1764,6 +1779,7 @@ xmtr_loop(worker_t *w, session_t *s)
             x->fragment.offset, head->nused, total, maxbytes,
             x->nriovs, w->rma_maxsegs);
 
+        /* Fragment oversize loads unless more RDMA vectors will arrive. */
         if (oversize_load && !riovs_maxed_out)
             break;
 
@@ -1815,15 +1831,6 @@ xmtr_loop(worker_t *w, session_t *s)
         first_h->xfc.owner = xfo_nic;
         first_h->xfc.place = xfp_first;
         last_h->xfc.place |= xfp_last;
-
-        /* Take txbuffers off of our queue while their cumulative length
-         * is less than sum(0 <= i < maxriovs, riov[i].len).
-         * Flag the first txbuffer `xfp_first` and the last `xfp_last`
-         * (first and last may be the same buffer).  Clear flags on the rest
-         * of the txbuffers.  Set the owner of the first to `xfo_nic`.
-         *
-         * Perform one fi_writemsg using the context on the first txbuffer.
-         */
 
         write_fully_params_t p = {.ep = x->cxn.ep,
             .iov_in = (!x->phase) ? x->payload.iov : x->payload.iov2,
