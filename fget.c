@@ -1153,27 +1153,13 @@ rcvr_cq_process(rcvr_t *r)
     }
 }
 
-static loop_control_t
-rcvr_loop(worker_t *w, session_t *s)
+static void
+rcvr_vector_update(session_t *s, rcvr_t *r)
 {
     bufhdr_t *h;
-    rcvr_t *r = (rcvr_t *)s->cxn;
-    terminal_t *t = s->terminal;
     vecbuf_t *vb;
     size_t i;
     int rc;
-    loop_control_t ctl;
-
-    if (!r->cxn.started)
-        return rcvr_start(w, s);
-
-    if (rcvr_cq_process(r) == -1)
-        goto fail;
-
-    ctl = sink_trade(t, s->ready_for_terminal, s->ready_for_cxn);
-
-    if (ctl == loop_error)
-        goto fail;
 
     /* Transmit vector. */
  
@@ -1211,8 +1197,13 @@ rcvr_loop(worker_t *w, session_t *s)
 
         (void)fifo_put(r->vec.txready, &vb->hdr);
     }
+}
 
-    txctl_transmit(&r->cxn, &r->vec);
+static void
+rcvr_targets_read(session_t *s, rcvr_t *r)
+{
+    bufhdr_t *h;
+    int rc;
 
     while (r->nfull > 0 &&
           (h = fifo_peek(r->tgtposted)) != NULL &&
@@ -1245,6 +1236,32 @@ rcvr_loop(worker_t *w, session_t *s)
 
         (void)fifo_put(s->ready_for_terminal, h);
     }
+}
+
+static loop_control_t
+rcvr_loop(worker_t *w, session_t *s)
+{
+    rcvr_t *r = (rcvr_t *)s->cxn;
+    terminal_t *t = s->terminal;
+    int rc;
+    loop_control_t ctl;
+
+    if (!r->cxn.started)
+        return rcvr_start(w, s);
+
+    if (rcvr_cq_process(r) == -1)
+        goto fail;
+
+    ctl = sink_trade(t, s->ready_for_terminal, s->ready_for_cxn);
+
+    if (ctl == loop_error)
+        goto fail;
+
+    rcvr_vector_update(s, r);
+
+    txctl_transmit(&r->cxn, &r->vec);
+
+    rcvr_targets_read(s, r);
 
     if (t->eof && fifo_empty(s->ready_for_terminal) &&
         r->cxn.eof.remote && r->cxn.eof.local &&
@@ -1732,7 +1749,7 @@ xmtr_buf_split(xmtr_t *x, bufhdr_t *parent, size_t len)
  * Tx buffer.
  */
 static loop_control_t
-xmtr_write(session_t *s, xmtr_t *x)
+xmtr_targets_write(session_t *s, xmtr_t *x)
 {
     bufhdr_t *first_h, *h, *head, *last_h = NULL;
     const size_t maxriovs = minsize(global_state.rma_maxsegs, x->nriovs);
@@ -1912,7 +1929,7 @@ xmtr_loop(worker_t *w, session_t *s)
         loop_error)
         goto fail;
 
-    if (xmtr_write(s, x) == loop_error)
+    if (xmtr_targets_write(s, x) == loop_error)
         goto fail;
 
     xmtr_progress_update(s, x);
