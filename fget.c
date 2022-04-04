@@ -1758,9 +1758,9 @@ xmtr_loop(worker_t *w, session_t *s)
         const bool oversize_load =
             head->nused - x->fragment.offset > maxbytes - total;
 
-        warnx("%s: head %p nchildren %" PRIu32 " offset %zu nused %zu total %zu maxbytes %zu "
-            "nriovs %zu maxsegs %zu", __func__, (void *)head,
-            head->xfc.nchildren,
+        warnx("%s: head %p nchildren %" PRIu32 " offset %zu nused %zu "
+            "total %zu maxbytes %zu nriovs %zu maxsegs %zu",
+            __func__, (void *)head, head->xfc.nchildren,
             x->fragment.offset, head->nused, total, maxbytes,
             x->nriovs, w->rma_maxsegs);
 
