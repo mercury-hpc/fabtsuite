@@ -19,6 +19,8 @@
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>    /* struct fi_msg_rma */
 
+#include "hlog.h"
+
 #define arraycount(a)   (sizeof(a) / sizeof(a[0]))
 
 /*
@@ -351,6 +353,22 @@ typedef struct {
 } state_t;
 
 typedef int (*personality_t)(void);
+
+HLOG_OUTLET_MEDIUM_DEFN(err, all, HLOG_OUTLET_S_ON);
+HLOG_OUTLET_SHORT_DEFN(close, all);
+HLOG_OUTLET_SHORT_DEFN(params, all);
+HLOG_OUTLET_SHORT_DEFN(tx_start, all);
+HLOG_OUTLET_SHORT_DEFN(cxn_loop, all);
+HLOG_OUTLET_SHORT_DEFN(write, all);
+HLOG_OUTLET_SHORT_DEFN(rxctl, all);
+HLOG_OUTLET_SHORT_DEFN(protocol, all);
+HLOG_OUTLET_SHORT_DEFN(txctl, all);
+HLOG_OUTLET_SHORT_DEFN(memreg, all);
+HLOG_OUTLET_SHORT_DEFN(msg, all);
+HLOG_OUTLET_SHORT_DEFN(payload, all);
+HLOG_OUTLET_SHORT_DEFN(paybuf, all);
+HLOG_OUTLET_SHORT_DEFN(paybuflist, paybuf);
+HLOG_OUTLET_SHORT_DEFN(completion, all);
 
 static const char fget_fput_service_name[] = "4242";
 
@@ -783,7 +801,8 @@ worker_paybuflist_replenish(worker_t *w, uint64_t access, buflist_t *bl)
             break;
         }
 
-        warnx("%s: pushing %zu-byte buffer", __func__, buf->hdr.nallocated);
+        hlog_fast(paybuflist,
+            "%s: pushing %zu-byte buffer", __func__, buf->hdr.nallocated);
         bl->buf[i] = &buf->hdr;
     }
     bl->nfull = i;
@@ -801,7 +820,7 @@ worker_payload_txbuf_get(worker_t *w)
         ;   // do nothing
 
     if (b != NULL)
-        warnx("%s: buf length %zu", __func__, b->hdr.nallocated);
+        hlog_fast(paybuf, "%s: buf length %zu", __func__, b->hdr.nallocated);
 
     return b;
 }
@@ -816,7 +835,7 @@ worker_payload_rxbuf_get(worker_t *w)
         ;   // do nothing
 
     if (b != NULL)
-        warnx("%s: buf length %zu", __func__, b->hdr.nallocated);
+        hlog_fast(paybuf, "%s: buf length %zu", __func__, b->hdr.nallocated);
 
     return b;
 }
@@ -875,7 +894,7 @@ mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
 
         size_t nsegs = minsize(nleftover, maxsegs);
 
-        warnx("%zu remaining I/O vectors", nleftover);
+        hlog_fast(memreg, "%zu remaining I/O vectors", nleftover);
 
         rc = fi_mr_regv(domain, iov, nsegs,
             access, offset, keysource_next(keys), flags, &mr, context);
@@ -884,7 +903,7 @@ mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
             goto err;
 
         for (j = 0; j < nsegs; j++) {
-            warnx("filling descriptor %zu", i * maxsegs + j);
+            hlog_fast(memreg, "filling descriptor %zu", i * maxsegs + j);
             mrp[i * maxsegs + j] = mr;
             descp[i * maxsegs + j] = fi_mr_desc(mr);
             raddrp[i * maxsegs + j] = raddr;
@@ -914,7 +933,8 @@ rxctl_complete(rxctl_t *rc, const completion_t *cmpl)
     }
 
     if ((h = fifo_get(rc->posted)) == NULL) {
-        warnx("%s: received a message, but no Rx was posted", __func__);
+        hlog_fast(rxctl,
+            "%s: received a message, but no Rx was posted", __func__);
         return NULL;
     }
 
@@ -997,7 +1017,8 @@ txctl_complete(txctl_t *tc, const completion_t *cmpl)
     }
 
     if ((h = fifo_get(tc->posted)) == NULL) {
-        warnx("%s: message Tx completed, but no Tx was posted", __func__);
+        hlog_fast(txctl,
+            "%s: message Tx completed, but no Tx was posted", __func__);
         return -1;
     }
 
@@ -1058,7 +1079,7 @@ rcvr_start(worker_t *w, session_t *s)
         bytebuf_t *b = worker_payload_rxbuf_get(w);
 
         if (b == NULL) {
-            warnx("%s: could not get a buffer", __func__);
+            hlog_fast(err, "%s: could not get a buffer", __func__);
             return loop_error;
         }
 
@@ -1066,7 +1087,7 @@ rcvr_start(worker_t *w, session_t *s)
         nleftover -= b->hdr.nused;
         nloaded += b->hdr.nused;
         if (!fifo_put(s->ready_for_cxn, &b->hdr)) {
-            warnx("%s: could not enqueue tx buffer", __func__);
+            hlog_fast(err, "%s: could not enqueue tx buffer", __func__);
             return loop_error;
         }
     }
@@ -1156,7 +1177,7 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
     t->eof = true;
     return loop_end;
 fail:
-    warnx("unexpected received message");
+    hlog_fast(payload, "unexpected received payload");
     return loop_error;
 }
 
@@ -1188,14 +1209,14 @@ rcvr_progress_rx_process(rcvr_t *r, const completion_t *cmpl)
         return 0;
     }
 
-    warnx("%s: received progress message, %"
+    hlog_fast(msg, "%s: received progress message, %"
         PRIu64 " bytes filled, %" PRIu64 " bytes leftover.", __func__,
         pb->msg.nfilled, pb->msg.nleftover);
 
     r->nfull += pb->msg.nfilled;
 
     if (pb->msg.nleftover == 0) {
-        warnx("%s: received remote EOF", __func__);
+        hlog_fast(protocol, "%s: received remote EOF", __func__);
         r->cxn.eof.remote = true;
     }
 
@@ -1230,15 +1251,15 @@ rcvr_cq_process(rcvr_t *r)
         };
 
         if (e.err != FI_ECANCELED || !cmpl.xfc->cancelled) {
-            warnx("%s: read %zd errors, %s", __func__, nfailed,
+            hlog_fast(err, "%s: read %zd errors, %s", __func__, nfailed,
                 fi_strerror(e.err));
-            warnx("%s: context %p", __func__, (void *)e.op_context);
-            warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
+            hlog_fast(err, "%s: context %p", __func__, (void *)e.op_context);
+            hlog_fast(err, "%s: completion flags %" PRIx64 " expected %" PRIx64,
                 __func__, e.flags, desired_rx_flags);
-            warnx("%s: symbolic flags %s", __func__,
+            hlog_fast(err, "%s: symbolic flags %s", __func__,
                 completion_flags_to_string(e.flags, flagsbuf,
                 sizeof(flagsbuf)));
-            warnx("%s: provider error %s", __func__,
+            hlog_fast(err, "%s: provider error %s", __func__,
                 fi_cq_strerror(r->cxn.cq, e.prov_errno, e.err_data, errbuf,
                     sizeof(errbuf)));
             return -1;
@@ -1258,13 +1279,13 @@ rcvr_cq_process(rcvr_t *r)
 
     switch (cmpl.xfc->type) {
     case xft_progress:
-        warnx("%s: read a progress rx completion", __func__);
+        hlog_fast(completion, "%s: read a progress rx completion", __func__);
         return rcvr_progress_rx_process(r, &cmpl);
     case xft_vector:
-        warnx("%s: read a vector tx completion", __func__);
+        hlog_fast(completion, "%s: read a vector tx completion", __func__);
         return txctl_complete(&r->vec, &cmpl);
     default:
-        warnx("%s: unexpected xfer context type", __func__);
+        hlog_fast(completion, "%s: unexpected xfer context type", __func__);
         return -1;
     }
 }
@@ -1286,7 +1307,7 @@ rcvr_vector_update(session_t *s, rcvr_t *r)
         vb->msg.niovs = 0;
         (void)fifo_put(r->vec.ready, &vb->hdr);
         r->cxn.eof.local = true;
-        warnx("%s: enqueued local EOF", __func__);
+        hlog_fast(protocol, "%s: enqueued local EOF", __func__);
     } else while (!fifo_full(r->vec.ready) && !fifo_empty(s->ready_for_cxn) &&
            (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
 
@@ -1396,14 +1417,14 @@ rcvr_loop(worker_t *w, session_t *s)
         fifo_empty(r->vec.posted)) {
         if ((rc = fi_close(&r->cxn.ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
-        warnx("%s: closed.", __func__);
+        hlog_fast(close, "%s: closed.", __func__);
         return loop_end;
     }
     return loop_continue;
 fail:
     if ((rc = fi_close(&r->cxn.ep->fid)) < 0)
         bailout_for_ofi_ret(rc, "fi_close");
-    warnx("%s: closed.", __func__);
+    hlog_fast(close, "%s: closed.", __func__);
     return loop_error;
 }
 
@@ -1479,7 +1500,7 @@ xmtr_start(worker_t *w, session_t *s)
 
     /* Await reply to initial message: first ack message. */
     do {
-        warnx("%s: awaiting ack message reception", __func__);
+        hlog_fast(tx_start, "%s: awaiting ack message reception", __func__);
         ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
     } while (ncompleted == -FI_EAGAIN);
 
@@ -1655,15 +1676,18 @@ vecbuf_is_wellformed(vecbuf_t *vb)
         sizeof(vb->msg.iov[0]);
 
     if (len < least_vector_msglen) {
-        warnx("%s: expected >= %zu bytes, received %zu",
+        hlog_fast(err, "%s: expected >= %zu bytes, received %zu",
             __func__, least_vector_msglen, len);
     } else if ((len - least_vector_msglen) % sizeof(vb->msg.iov[0]) != 0) {
-        warnx("%s: %zu-byte vector message did not end on vector boundary, "
+        hlog_fast(err,
+            "%s: %zu-byte vector message did not end on vector boundary, "
             "disconnecting...", __func__, len);
     } else if (niovs_space < vb->msg.niovs) {
-        warnx("%s: peer sent truncated vectors, disconnecting...", __func__);
+        hlog_fast(err,
+            "%s: peer sent truncated vectors, disconnecting...", __func__);
     } else if (vb->msg.niovs > arraycount(vb->msg.iov)) {
-        warnx("%s: peer sent too many vectors, disconnecting...", __func__);
+        hlog_fast(err,
+            "%s: peer sent too many vectors, disconnecting...", __func__);
     } else
         return true;
 
@@ -1683,14 +1707,14 @@ xmtr_vecbuf_unload(xmtr_t *x)
     riov = (!x->phase) ? x->riov : x->riov2;
 
     if (!x->cxn.eof.remote && vb->msg.niovs == 0) {
-        warnx("%s: received remote EOF", __func__);
+        hlog_fast(protocol, "%s: received remote EOF", __func__);
         x->cxn.eof.remote = true;
     }
 
     for (i = x->next_riov;
          i < vb->msg.niovs && x->nriovs < arraycount(x->riov);
          i++) {
-        warnx("%s: received vector %zu "
+        hlog_fast(protocol, "%s: received vector %zu "
             "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
             __func__, i, vb->msg.iov[i].addr, vb->msg.iov[i].len,
             vb->msg.iov[i].key);
@@ -1728,7 +1752,7 @@ xmtr_vector_rx_process(xmtr_t *x, const completion_t *cmpl)
     }
 
     if (!vecbuf_is_wellformed(vb)) {
-        warnx("%s: rx'd malformed vector message", __func__);
+        hlog_fast(err, "%s: rx'd malformed vector message", __func__);
         rxctl_post(&x->cxn, &x->vec, &vb->hdr);
         return 0;
     }
@@ -1766,16 +1790,17 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
         };
 
         if (e.err != FI_ECANCELED || !cmpl.xfc->cancelled) {
-            warnx("%s: read %zd errors, %s", __func__, nfailed,
+            hlog_fast(err, "%s: read %zd errors, %s", __func__, nfailed,
                 fi_strerror(e.err));
-            warnx("%s: context %p", __func__, (void *)e.op_context);
-            warnx("%s: completion flags %" PRIx64 " expected %" PRIx64,
+            hlog_fast(err, "%s: context %p", __func__, (void *)e.op_context);
+            hlog_fast(err, "%s: completion flags %" PRIx64 " expected %" PRIx64,
                 __func__, e.flags, desired_wr_flags);
-            warnx("%s: symbolic flags %s", __func__,
-                completion_flags_to_string(e.flags, flagsbuf, sizeof(flagsbuf)));
-            warnx("%s: provider error %s", __func__,
+            hlog_fast(err, "%s: symbolic flags %s", __func__,
+                completion_flags_to_string(e.flags, flagsbuf,
+                sizeof(flagsbuf)));
+            hlog_fast(err, "%s: provider error %s", __func__,
                 fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
-                    sizeof(errbuf)));
+                sizeof(errbuf)));
             return -1;
         }
     } else if (ncompleted < 0) {
@@ -1795,17 +1820,17 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
 
     switch (cmpl.xfc->type) {
     case xft_vector:
-        warnx("%s: read a vector rx completion", __func__);
+        hlog_fast(completion, "%s: read a vector rx completion", __func__);
         return xmtr_vector_rx_process(x, &cmpl);
     case xft_fragment:
     case xft_rdma_write:
-        warnx("%s: read an RDMA-write completion", __func__);
+        hlog_fast(completion, "%s: read an RDMA-write completion", __func__);
         /* If the head of `wrposted` is marked `xfo_program`, then dequeue the
          * txbuffers at the head of `wrposted` through the last one marked
          * `xfo_program`.
          */
         if ((h = fifo_peek(x->wrposted)) == NULL) {
-            warnx("%s: no RDMA-write completions expected", __func__);
+            hlog_fast(err, "%s: no RDMA-write completions expected", __func__);
             return -1;
         }
         /* XXX This can fail if `s->ready_for_terminal` ever fills
@@ -1814,7 +1839,7 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
          * than there are slots in `s->ready_for_terminal`.  
          */
         if ((h->xfc.place & xfp_first) == 0) {
-            warnx("%s: expected `first` context at head", __func__);
+            hlog_fast(err, "%s: expected `first` context at head", __func__);
             return -1;
         }
         while ((h = fifo_peek(x->wrposted)) != NULL &&
@@ -1845,10 +1870,10 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
         }
         return 1;
     case xft_progress:
-        warnx("%s: read a progress tx completion", __func__);
+        hlog_fast(completion, "%s: read a progress tx completion", __func__);
         return txctl_complete(&x->progress, &cmpl);
     default:
-        warnx("%s: unexpected xfer context type", __func__);
+        hlog_fast(completion, "%s: unexpected xfer context type", __func__);
         return -1;
     }
 }
@@ -1918,7 +1943,8 @@ xmtr_targets_write(session_t *s, xmtr_t *x)
         const bool oversize_load =
             head->nused - x->fragment.offset > maxbytes - total;
 
-        warnx("%s: head %p nchildren %" PRIu32 " offset %zu nused %zu "
+        hlog_fast(write,
+            "%s: head %p nchildren %" PRIu32 " offset %zu nused %zu "
             "total %zu maxbytes %zu nriovs %zu maxsegs %zu",
             __func__, (void *)head, head->xfc.nchildren,
             x->fragment.offset, head->nused, total, maxbytes,
@@ -2000,7 +2026,7 @@ xmtr_targets_write(session_t *s, xmtr_t *x)
             bailout_for_ofi_ret(nwritten, "write_fully");
 
         if (nwritten != total || niovs_out != 0) {
-            warnx("%s: local I/O vectors were partially written, "
+            hlog_fast(err, "%s: local I/O vectors were partially written, "
                 "nwritten %zu total %zu niovs_out %zu", __func__, nwritten,
                 total, niovs_out);
             return loop_error;
@@ -2042,7 +2068,7 @@ xmtr_progress_update(session_t *s, xmtr_t *x)
     pb->msg.nfilled = x->bytes_progress;
     pb->msg.nleftover = reached_eof ? 0 : 1;
 
-    warnx("%s: sending progress message, %"
+    hlog_fast(protocol, "%s: sending progress message, %"
         PRIu64 " filled, %" PRIu64 " leftover", __func__,
         pb->msg.nfilled, pb->msg.nleftover);
 
@@ -2051,7 +2077,7 @@ xmtr_progress_update(session_t *s, xmtr_t *x)
     (void)fifo_put(x->progress.ready, &pb->hdr);
 
     if (reached_eof) {
-        warnx("%s: enqueued local EOF", __func__);
+        hlog_fast(protocol, "%s: enqueued local EOF", __func__);
         x->cxn.eof.local = true;
     }
 }
@@ -2113,7 +2139,7 @@ xmtr_loop(worker_t *w, session_t *s)
     if (x->cxn.eof.remote && fifo_empty(x->progress.posted)) {
         if ((rc = fi_close(&x->cxn.ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
-        warnx("%s: closed.", __func__);
+        hlog_fast(close, "%s: closed.", __func__);
         return loop_end;
     }
 
@@ -2121,16 +2147,14 @@ xmtr_loop(worker_t *w, session_t *s)
 fail:
     if ((rc = fi_close(&x->cxn.ep->fid)) < 0)
         bailout_for_ofi_ret(rc, "fi_close");
-    warnx("%s: closed.", __func__);
+    hlog_fast(close, "%s: closed.", __func__);
     return loop_error;
 }
 
 static loop_control_t
 cxn_loop(worker_t *w, session_t *s)
 {
-#if 0
-    warnx("%s: going around", __func__);
-#endif
+    hlog_fast(cxn_loop, "%s: going around", __func__);
     return s->cxn->loop(w, s);
 }
 
@@ -3171,7 +3195,8 @@ main(int argc, char **argv)
 
     keysource_init(&global_state.keys);
 
-    warnx("%ld POSIX I/O vector items maximum", sysconf(_SC_IOV_MAX));
+    hlog_fast(params,
+        "%ld POSIX I/O vector items maximum", sysconf(_SC_IOV_MAX));
 
     if ((hints = fi_allocinfo()) == NULL)
         errx(EXIT_FAILURE, "%s: fi_allocinfo", __func__);
@@ -3189,10 +3214,10 @@ main(int argc, char **argv)
 
     switch (-rc) {
     case FI_ENODATA:
-        warnx("capabilities not available?");
+        hlog_fast(err, "capabilities not available?");
         break;
     case FI_ENOSYS:
-        warnx("available libfabric version < 1.13?");
+        hlog_fast(err, "available libfabric version < 1.13?");
         break;
     default:
         break;
@@ -3201,7 +3226,7 @@ main(int argc, char **argv)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_getinfo");
 
-    warnx("%d infos found", count_info(global_state.info));
+    hlog_fast(params, "%d infos found", count_info(global_state.info));
 
     if ((global_state.info->mode & FI_CONTEXT) != 0) {
         errx(EXIT_FAILURE,
@@ -3217,27 +3242,29 @@ main(int argc, char **argv)
     rc = fi_domain(global_state.fabric, global_state.info, &global_state.domain,
         NULL);
 
-    warnx("provider %s, memory-registration I/O vector limit %zu",
+    hlog_fast(params, "provider %s, memory-registration I/O vector limit %zu",
         global_state.info->fabric_attr->prov_name,
         global_state.info->domain_attr->mr_iov_limit);
 
-    warnx("provider %s %s application-requested memory-registration keys",
+    hlog_fast(params,
+        "provider %s %s application-requested memory-registration keys",
         global_state.info->fabric_attr->prov_name,
         ((global_state.info->domain_attr->mr_mode & FI_MR_PROV_KEY) != 0)
             ? "does not support"
             : "supports");
 
     if ((global_state.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0) {
-        warnx("provider %s RDMA uses virtual addresses instead of offsets, "
+        hlog_fast(params,
+            "provider %s RDMA uses virtual addresses instead of offsets, "
             "quitting.", global_state.info->fabric_attr->prov_name);
         exit(EXIT_FAILURE);
     }
 
-    warnx("Rx/Tx I/O vector limits %zu/%zu",
+    hlog_fast(params, "Rx/Tx I/O vector limits %zu/%zu",
         global_state.info->rx_attr->iov_limit,
         global_state.info->tx_attr->iov_limit);
 
-    warnx("RMA I/O vector limit %zu",
+    hlog_fast(params, "RMA I/O vector limit %zu",
         global_state.info->tx_attr->rma_iov_limit);
 
     /* Always use 1 because there are problems with using mr_maxsegs > 1,
@@ -3251,14 +3278,15 @@ main(int argc, char **argv)
         : global_state.info->tx_attr->rma_iov_limit;
 
 #if 0
-    warnx("maximum endpoint message size (RMA limit) %zu",
+    hlog_fast(params, "maximum endpoint message size (RMA limit) %zu",
         global_state.info->ep_attr->max_msg_size);
 #endif
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_domain");
 
-    warnx("starting personality '%s'", personality_to_name(personality));
+    hlog_fast(params, "starting personality '%s'",
+        personality_to_name(personality));
 
     if (sigemptyset(&blockset) == -1)
         err(EXIT_FAILURE, "%s.%d: sigemptyset", __func__, __LINE__);
