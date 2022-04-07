@@ -21,6 +21,7 @@ Customized for hlog:
 
 # Do this the first time:
 $ git remote add hlog git@github.com:gnuoyd/hlog.git
+$ git remote update -p
 $ git checkout hlog/main
 $ git subtree split -P src -b tmp-hlog-split
 $ git checkout main
@@ -28,6 +29,7 @@ $ git subtree add --squash -P hlog tmp-hlog-split
 $ git branch -D tmp-hlog-split
 
 # In future, you can merge in additional changes as follows:
+$ git remote update -p
 $ git checkout hlog/main
 $ git subtree split -P src -b tmp-hlog-split
 $ git checkout main
