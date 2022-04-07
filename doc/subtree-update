@@ -1,0 +1,37 @@
+Instructions for adding a *sub*directory as a subtree from [stackoverflow](https://stackoverflow.com/questions/23937436/add-subdirectory-of-remote-repo-with-git-subtree).
+
+# Do this the first time:
+$ git remote add -f -t master --no-tags gitgit https://github.com/git/git.git
+$ git checkout gitgit/master
+$ git subtree split -P contrib/completion -b temporary-split-branch
+$ git checkout master
+$ git subtree add --squash -P third_party/git-completion temporary-split-branch
+$ git branch -D temporary-split-branch
+
+# In future, you can merge in additional changes as follows:
+$ git checkout gitgit/master
+$ git subtree split -P contrib/completion -b temporary-split-branch
+$ git checkout master
+$ git subtree merge --squash -P third_party/git-completion temporary-split-branch
+# Now fix any conflicts if you'd modified third_party/git-completion.
+$ git branch -D temporary-split-branch
+
+
+Customized for hlog:
+
+# Do this the first time:
+$ git remote add hlog git@github.com:gnuoyd/hlog.git
+$ git checkout hlog/main
+$ git subtree split -P src -b tmp-hlog-split
+$ git checkout main
+$ git subtree add --squash -P hlog tmp-hlog-split
+$ git branch -D tmp-hlog-split
+
+# In future, you can merge in additional changes as follows:
+$ git checkout hlog/main
+$ git subtree split -P src -b tmp-hlog-split
+$ git checkout main
+$ git subtree merge --squash -P hlog tmp-hlog-split
+# Now fix any conflicts if you'd modified hlog.
+$ git branch -D tmp-hlog-split
+
