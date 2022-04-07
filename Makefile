@@ -1,7 +1,5 @@
-.include <bsd.own.mk>
+LIB=hlog
 
-PROG=test
-
-SRCS=main.c hlog.c
+SRCS=hlog.c
 	
-.include <bsd.prog.mk>
+.include <mkc.lib.mk>
