@@ -3143,9 +3143,13 @@ personality_to_name(personality_t p)
 }
 
 static void
-usage(const char *progname)
+usage(personality_t personality, const char *progname)
 {
-    fprintf(stderr, "usage: %s [-r] [-g]\n", progname);
+    if (personality == put)
+        fprintf(stderr, "usage: %s [-r] [-g] <address>\n", progname);
+    else
+        fprintf(stderr, "usage: %s [-b <address>] [-r] [-g]\n", progname);
+
     exit(EXIT_FAILURE);
 }
 
@@ -3161,6 +3165,7 @@ main(int argc, char **argv)
     sigset_t oldset, blockset;
     struct fi_info *hints;
     personality_t personality;
+    const char *addr = NULL;
     char *progname, *tmp;
     int ecode, i, opt, rc;
 
@@ -3178,7 +3183,9 @@ main(int argc, char **argv)
            progname);
     }
 
-    while ((opt = getopt(argc, argv, "gr")) != -1) {
+    const char *optstring = (personality == get) ? "b:gr" : "gr";
+
+    while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
         case 'g':
             global_state.contiguous = true;
@@ -3186,10 +3193,23 @@ main(int argc, char **argv)
         case 'r':
             global_state.reregister = true;
             break;
+        case 'b':
+            addr = optarg;
+            break;
         default:
-            usage(progname);
+            usage(personality, progname);
         }
     }
+
+    argc -= optind;
+    argv += optind;
+
+    if (personality == put) {
+        if (argc != 1)
+            usage(personality, progname);
+        addr = argv[0];
+    } else if (argc != 0)
+        usage(personality, progname);
 
     workers_initialize();
 
@@ -3206,7 +3226,7 @@ main(int argc, char **argv)
     hints->mode = FI_CONTEXT;
     hints->domain_attr->mr_mode = FI_MR_PROV_KEY;
 
-    rc = fi_getinfo(FI_VERSION(1, 13), "10.10.10.120" /* -b */,
+    rc = fi_getinfo(FI_VERSION(1, 13), addr,
         fget_fput_service_name, (personality == get) ? FI_SOURCE : 0, hints,
         &global_state.info);
 
