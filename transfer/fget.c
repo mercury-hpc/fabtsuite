@@ -1300,7 +1300,7 @@ rcvr_vector_update(session_t *s, rcvr_t *r)
     int rc;
 
     /* Transmit vector. */
- 
+
     if (r->cxn.eof.remote && !r->cxn.eof.local &&
         !fifo_full(r->vec.ready) &&
         (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
@@ -1757,7 +1757,7 @@ xmtr_vector_rx_process(xmtr_t *x, const completion_t *cmpl)
         rxctl_post(&x->cxn, &x->vec, &vb->hdr);
         return 0;
     }
-    
+
     if (!fifo_put(x->vec.rcvd, &vb->hdr))
         errx(EXIT_FAILURE, "%s: received vectors FIFO was full", __func__);
 
@@ -1837,7 +1837,7 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
         /* XXX This can fail if `s->ready_for_terminal` ever fills
          * to capacity, in the loop below.  That should not happen
          * unless we accidentally put more buffers into circulation
-         * than there are slots in `s->ready_for_terminal`.  
+         * than there are slots in `s->ready_for_terminal`.
          */
         if ((h->xfc.place & xfp_first) == 0) {
             hlog_fast(err, "%s: expected `first` context at head", __func__);
@@ -2852,7 +2852,7 @@ get(void)
     worker_t *w;
     int rc;
 
-    rc = fi_av_open(global_state.domain, &av_attr, &av, NULL); 
+    rc = fi_av_open(global_state.domain, &av_attr, &av, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_av_open");
@@ -3062,7 +3062,7 @@ put(void)
     worker_t *w;
     int rc;
 
-    rc = fi_av_open(global_state.domain, &av_attr, &av, NULL); 
+    rc = fi_av_open(global_state.domain, &av_attr, &av, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_av_open");
