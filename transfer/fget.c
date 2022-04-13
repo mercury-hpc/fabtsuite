@@ -356,6 +356,7 @@ typedef int (*personality_t)(void);
 
 HLOG_OUTLET_MEDIUM_DEFN(err, all, HLOG_OUTLET_S_ON);
 HLOG_OUTLET_SHORT_DEFN(close, all);
+HLOG_OUTLET_SHORT_DEFN(signal, all);
 HLOG_OUTLET_SHORT_DEFN(params, all);
 HLOG_OUTLET_SHORT_DEFN(tx_start, all);
 HLOG_OUTLET_SHORT_DEFN(cxn_loop, all);
@@ -2905,7 +2906,13 @@ get(void)
     /* Await initial message. */
     do {
         ncompleted = fi_cq_sread(gst->listen_cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
+        if (ncompleted == -FI_EINTR)
+            hlog_fast(signal, "%s: fi_cq_sread interrupted", __func__);
+    } while (ncompleted == -FI_EAGAIN ||
+             (ncompleted == -FI_EINTR && !cancelled));
+
+    if (cancelled)
+        errx(EXIT_FAILURE, "caught a signal, exiting.");
 
     if (ncompleted < 0)
         bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
