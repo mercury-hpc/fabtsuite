@@ -3155,7 +3155,7 @@ usage(personality_t personality, const char *progname)
     if (personality == put)
         fprintf(stderr, "usage: %s [-r] [-g] <address>\n", progname);
     else
-        fprintf(stderr, "usage: %s [-b <address>] [-r] [-g]\n", progname);
+        fprintf(stderr, "usage: %s [-b <address>] [-r]\n", progname);
 
     exit(EXIT_FAILURE);
 }
@@ -3190,7 +3190,7 @@ main(int argc, char **argv)
            progname);
     }
 
-    const char *optstring = (personality == get) ? "b:gr" : "gr";
+    const char *optstring = (personality == get) ? "b:r" : "gr";
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
