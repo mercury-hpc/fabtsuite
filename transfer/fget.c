@@ -354,7 +354,7 @@ typedef struct {
 
 typedef int (*personality_t)(void);
 
-HLOG_OUTLET_MEDIUM_DEFN(err, all, HLOG_OUTLET_S_ON);
+HLOG_OUTLET_MEDIUM_DEFN(err, all, 0, HLOG_OUTLET_S_ON);
 HLOG_OUTLET_SHORT_DEFN(close, all);
 HLOG_OUTLET_SHORT_DEFN(signal, all);
 HLOG_OUTLET_SHORT_DEFN(params, all);
@@ -366,7 +366,8 @@ HLOG_OUTLET_SHORT_DEFN(protocol, all);
 HLOG_OUTLET_SHORT_DEFN(txctl, all);
 HLOG_OUTLET_SHORT_DEFN(memreg, all);
 HLOG_OUTLET_SHORT_DEFN(msg, all);
-HLOG_OUTLET_SHORT_DEFN(payload, all);
+HLOG_OUTLET_SHORT_DEFN(payverify, all);
+HLOG_OUTLET_FLAGS_DEFN(payload, all, HLOG_F_NO_PREFIX|HLOG_F_NO_SUFFIX);
 HLOG_OUTLET_SHORT_DEFN(paybuf, all);
 HLOG_OUTLET_SHORT_DEFN(paybuflist, paybuf);
 HLOG_OUTLET_SHORT_DEFN(completion, all);
@@ -1122,8 +1123,7 @@ source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
             size_t txbuf_ofs = (s->idx + ofs) % s->txbuflen;
             len = minsize(h->nused - ofs, s->txbuflen - txbuf_ofs);
             memcpy(&b->payload[ofs], &txbuf[txbuf_ofs], len);
-            printf("%.*s", (int)len, &b->payload[ofs]);
-            fflush(stdout);
+            hlog_fast(payload, "%.*s", (int)len, &b->payload[ofs]);
         }
 
         (void)fifo_get(ready);
@@ -1162,8 +1162,7 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
         for (ofs = 0; ofs < h->nused; ofs += len) {
             size_t txbuf_ofs = (s->idx + ofs) % s->txbuflen;
             len = minsize(h->nused - ofs, s->txbuflen - txbuf_ofs);
-            printf("%.*s", (int)len, &b->payload[ofs]);
-            fflush(stdout);
+            hlog_fast(payload, "%.*s", (int)len, &b->payload[ofs]);
             if (memcmp(&b->payload[ofs], &txbuf[txbuf_ofs], len) != 0)
                 goto fail;
         }
@@ -1178,7 +1177,7 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
     t->eof = true;
     return loop_end;
 fail:
-    hlog_fast(payload, "unexpected received payload");
+    hlog_fast(payverify, "unexpected received payload");
     return loop_error;
 }
 
