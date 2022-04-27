@@ -36,6 +36,8 @@
 struct _hlog_msg {
 	struct timespec elapsed;
 	int errnum;
+	bool prefix;
+	bool suffix;
 };
 
 typedef struct _hlog_msg hlog_msg_t;
@@ -80,8 +82,10 @@ hlog_msg_vsnprintf(char *buf, size_t buflen, hlog_msg_t msg, const char *fmt,
 	char *p = buf;
 	int nwritten;
 
-	nwritten = snprintf(p, remaining, "%ju.%.9ld ",
-	    (uintmax_t)msg.elapsed.tv_sec, msg.elapsed.tv_nsec);
+	if (msg.prefix) {
+		nwritten = snprintf(p, remaining, "%ju.%.9ld ",
+		    (uintmax_t)msg.elapsed.tv_sec, msg.elapsed.tv_nsec);
+	}
 
 	if (nwritten < 0 || remaining <= (size_t)nwritten)
 		return nwritten;
@@ -102,8 +106,9 @@ hlog_msg_vsnprintf(char *buf, size_t buflen, hlog_msg_t msg, const char *fmt,
 	remaining -= (size_t)nwritten;
 
 	nwritten = (msg.errnum == 0)
-	    ? 0
-	    : snprintf(p, remaining, ": %s\n", strerror(msg.errnum));
+	    ? snprintf(p, remaining, msg.suffix ? "\n" : "")
+	    : snprintf(p, remaining, ": %s%s", strerror(msg.errnum),
+	               msg.suffix ? "\n" : "");
 
 	if (nwritten < 0)
 		return nwritten;
@@ -237,11 +242,11 @@ hlog_msg_ring_try_vprintf(hlog_ring_t *r, hlog_msg_t msg,
 	return RING_LENGTH;
 }
 
-/* Empty ring `r` of messages, printing the messages to the standard error
- * stream separated by newlines.  Before the first message,
- * print a header that identifies the ring.  After the last message,
- * print a footer containing ring statistics.  For an empty ring, print
- * a header immediately followed by a footer.
+/* Empty ring `r` of messages, printing the messages to the standard
+ * error stream.  Before the first message, print a header that
+ * identifies the ring.  After the last message, print a footer
+ * containing ring statistics.  For an empty ring, print a header
+ * immediately followed by a footer.
  */
 static void
 hlog_ring_dump(hlog_ring_t *r)
@@ -259,12 +264,12 @@ hlog_ring_dump(hlog_ring_t *r)
 		assert(head + msglen + 1 <= RING_LENGTH);
 
 		if (msglen != 0)
-			fprintf(stderr, "%s\n", &r->content[head]);
+			fprintf(stderr, "%s", &r->content[head]);
 		r->consumer += msglen + 1;
 	}
 	assert(r->consumer == r->producer);
 	fprintf(stderr,
-	    "%" PRIu64 " heads erased, %" PRIu64 " tails zeroed, %" PRIu64
+	    "\n%" PRIu64 " heads erased, %" PRIu64 " tails zeroed, %" PRIu64
 	    " times empty, %" PRIu64 " truncations\n", r->heads_erased,
 	    r->tails_zeroed, r->times_empty, r->truncations);
 	pthread_mutex_unlock(&r->mtx);
@@ -421,17 +426,20 @@ hlog_timestamps_init(void)
 static void
 hlog_msg_vfprintf(FILE *stream, hlog_msg_t msg, const char *fmt, va_list ap)
 {
-	(void)fprintf(stream, "%ju.%.9ld ", (uintmax_t)msg.elapsed.tv_sec,
-	    msg.elapsed.tv_nsec);
+	if (msg.prefix) {
+		(void)fprintf(stream, "%ju.%.9ld ",
+		    (uintmax_t)msg.elapsed.tv_sec, msg.elapsed.tv_nsec);
+	}
 	(void)vfprintf(stream, fmt, ap);
-	if (msg.errnum != 0)
-		(void)fprintf(stream, ": %s\n", strerror(msg.errnum));
-	else
+	if (msg.errnum != 0) {
+		(void)fprintf(stream, ": %s%s", strerror(msg.errnum),
+		              msg.suffix ? "\n" : "");
+	} else if (msg.suffix)
 		(void)fputc('\n', stream);
 }
 
 static hlog_msg_t
-hlog_msg_init(int errnum)
+hlog_msg_init(const hlog_outlet_t *ls, int errnum)
 {
 	struct timespec elapsed, now;
 
@@ -442,7 +450,9 @@ hlog_msg_init(int errnum)
 
 	timespecsub(&now, &timestamp_zero, &elapsed);
 
-	return (hlog_msg_t){.errnum = errnum, .elapsed = elapsed};
+	return (hlog_msg_t){.errnum = errnum, .elapsed = elapsed,
+	                    .prefix = (ls != NULL) ? ls->ls_prefix : true,
+	                    .suffix = (ls != NULL) ? ls->ls_suffix : true};
 }
 
 static void
@@ -464,35 +474,35 @@ vhlog_msg(hlog_msg_t msg, const char *fmt, va_list ap)
 }
 
 void
-vhlog(const char *fmt, va_list ap)
+vhlog(const hlog_outlet_t *ls, const char *fmt, va_list ap)
 {
-	vhlog_msg(hlog_msg_init(0), fmt, ap);
+	vhlog_msg(hlog_msg_init(ls, 0), fmt, ap);
 }
 
 void
 vhlog_err(int status, const char *fmt, va_list ap)
 {
-	vhlog_msg(hlog_msg_init(errno), fmt, ap);
+	vhlog_msg(hlog_msg_init(NULL, errno), fmt, ap);
 	exit(status);
 }
 
 void
 vhlog_errx(int status, const char *fmt, va_list ap)
 {
-	vhlog_msg(hlog_msg_init(0), fmt, ap);
+	vhlog_msg(hlog_msg_init(NULL, 0), fmt, ap);
 	exit(status);
 }
 
 void
 vhlog_warn(const char *fmt, va_list ap)
 {
-	vhlog_msg(hlog_msg_init(errno), fmt, ap);
+	vhlog_msg(hlog_msg_init(NULL, errno), fmt, ap);
 }
 
 void
 vhlog_warnx(const char *fmt, va_list ap)
 {
-	vhlog_msg(hlog_msg_init(0), fmt, ap);
+	vhlog_msg(hlog_msg_init(NULL, 0), fmt, ap);
 }
 
 void
@@ -555,12 +565,12 @@ hlog_outlet_find_active(struct hlog_outlet *ls0)
 }
 
 void
-hlog_always(struct hlog_outlet *ls hlog_unused, const char *fmt, ...)
+hlog_always(const hlog_outlet_t *ls, const char *fmt, ...)
 {
 	va_list ap;
 
 	va_start(ap, fmt);
-	vhlog(fmt, ap);
+	vhlog(ls, fmt, ap);
 	va_end(ap);
 }
 
@@ -578,7 +588,7 @@ hlog_impl(struct hlog_outlet *ls0, const char *fmt, ...)
 	ls0->ls_resolved = HLOG_OUTLET_S_ON;
 
 	va_start(ap, fmt);
-	vhlog(fmt, ap);
+	vhlog(ls, fmt, ap);
 	va_end(ap);
 }
 
