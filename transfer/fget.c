@@ -2928,14 +2928,13 @@ get(void)
     }
 
     if (completion.len != sizeof(r->initial.msg)) {
-        errx(EXIT_FAILURE,
-            "initially received %zu bytes, expected %zu\n", completion.len,
-            sizeof(r->initial.msg));
+        errx(EXIT_FAILURE, "initially received %zu bytes, expected %zu",
+            completion.len, sizeof(r->initial.msg));
     }
 
     if (r->initial.msg.nsources != 1 || r->initial.msg.id != 0) {
         errx(EXIT_FAILURE,
-            "received nsources %" PRIu32 ", id %" PRIu32 ", expected 1, 0\n",
+            "received nsources %" PRIu32 ", id %" PRIu32 ", expected 1, 0",
             r->initial.msg.nsources, r->initial.msg.id);
     }
 
