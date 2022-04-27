@@ -57,6 +57,8 @@ typedef enum hlog_outlet_state hlog_outlet_state_t;
 
 struct hlog_outlet {
         hlog_outlet_state_t             ls_resolved;
+	bool				ls_prefix;
+	bool				ls_suffix;
 	struct hlog_outlet		*ls_parent;
 	hlog_outlet_state_t		ls_state;
 	const char			*ls_name;
@@ -87,23 +89,31 @@ void hlog_undefined_##__sym(void) hlog_constructor
 
 #define	HLOG_OUTLET_DECL(__name)	HLOG_OUTLET_DECL1(HLOG_PREFIX(__name))
 
-#define	HLOG_OUTLET_DEFN(__sym, __name, __parent, __state)	        \
+#define HLOG_F_NO_PREFIX 0x1
+#define HLOG_F_NO_SUFFIX 0x2
+
+#define	HLOG_OUTLET_DEFN(__sym, __name, __parent, __flags, __state)	\
 	struct hlog_outlet __sym = {					\
 		  .ls_name = __name					\
 		, .ls_parent = (__parent)				\
 		, .ls_state = (__state)					\
+		, .ls_prefix = (((__flags) & HLOG_F_NO_PREFIX) == 0)	\
+		, .ls_suffix = (((__flags) & HLOG_F_NO_SUFFIX) == 0)	\
 	};								\
 	HLOG_CONSTRUCTOR(__sym)
 
-#define	HLOG_OUTLET_MEDIUM_DEFN(__name, __parent, __state)		\
+#define	HLOG_OUTLET_MEDIUM_DEFN(__name, __parent, __flags, __state)	\
     HLOG_OUTLET_DEFN(HLOG_PREFIX(__name), #__name, 			\
-                     &HLOG_PREFIX(__parent), __state)
+                     &HLOG_PREFIX(__parent), __flags, __state)
 
 #define	HLOG_OUTLET_SHORT_DEFN(__name, __parent)			\
-    HLOG_OUTLET_MEDIUM_DEFN(__name, __parent, HLOG_OUTLET_S_PASS)
+    HLOG_OUTLET_MEDIUM_DEFN(__name, __parent, 0, HLOG_OUTLET_S_PASS)
+
+#define	HLOG_OUTLET_FLAGS_DEFN(__name, __parent, __flags)		\
+    HLOG_OUTLET_MEDIUM_DEFN(__name, __parent, __flags, HLOG_OUTLET_S_PASS)
 
 #define	HLOG_OUTLET_TOP_DEFN(__name)					\
-    HLOG_OUTLET_DEFN(HLOG_PREFIX(__name), #__name, NULL, HLOG_OUTLET_S_PASS)
+    HLOG_OUTLET_DEFN(HLOG_PREFIX(__name), #__name, NULL, 0, HLOG_OUTLET_S_PASS)
 
 HLOG_OUTLET_DECL(all);
 
@@ -134,7 +144,7 @@ struct hlog_outlet *hlog_outlet_lookup(const char *);
 int hlog_set_state(const char *, hlog_outlet_state_t, bool);
 int hlog_set_output(hlog_output_t);
 
-void vhlog(const char *, va_list) hlog_printflike(1,0);
+void vhlog(const hlog_outlet_t *, const char *, va_list) hlog_printflike(2,0);
 
 void vhlog_warn(const char *, va_list) hlog_printflike(1,0);
 void vhlog_warnx(const char *, va_list) hlog_printflike(1,0);
@@ -147,7 +157,7 @@ void hlog_warn(const char *, ...) hlog_printflike(1,2);
 void hlog_err(int, const char *, ...) hlog_printflike(2,3) hlog_noreturn;
 void hlog_errx(int, const char *, ...) hlog_printflike(2,3) hlog_noreturn;
 
-void hlog_always(struct hlog_outlet *, const char *, ...) hlog_printflike(2,3);
+void hlog_always(const hlog_outlet_t *, const char *, ...) hlog_printflike(2,3);
 
 void hlog_impl(struct hlog_outlet *, const char *, ...) hlog_printflike(2,3);
 void hlog_abort(const char *);
