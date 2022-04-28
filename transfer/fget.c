@@ -2706,7 +2706,7 @@ sink_init(sink_t *s)
     memset(s, 0, sizeof(*s));
     terminal_init(&s->terminal, sink_trade);
     s->txbuflen = strlen(txbuf);
-    s->entirelen = s->txbuflen * (size_t)10000;
+    s->entirelen = s->txbuflen * (size_t)100000;
     s->idx = 0;
 }
 
@@ -2716,7 +2716,7 @@ source_init(source_t *s)
     memset(s, 0, sizeof(*s));
     terminal_init(&s->terminal, source_trade);
     s->txbuflen = strlen(txbuf);
-    s->entirelen = s->txbuflen * (size_t)10000;
+    s->entirelen = s->txbuflen * (size_t)100000;
     s->idx = 0;
 }
 
