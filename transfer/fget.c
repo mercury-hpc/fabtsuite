@@ -45,6 +45,7 @@ typedef struct ack_msg {
 
 typedef struct vector_msg {
     uint32_t niovs;
+    uint32_t pad;
     struct {
         uint64_t addr, len, key;
     } iov[12];
@@ -722,6 +723,7 @@ vecbuf_alloc(void)
         return NULL;
 
     vb = (vecbuf_t *)h;
+    vb->msg.pad = 0;
     h->xfc.type = xft_vector;
 
     return vb;
