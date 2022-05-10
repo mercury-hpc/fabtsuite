@@ -19,13 +19,13 @@ bail()
 child_handler()
 {
 	trap child_handler CHLD
-	echo "$prog ignoring SIGCHLD." 1>&2
+	echo "$prog ignored SIGCHLD." 1>&2
 }
 
 alarm_handler() 
 {
 	trap alarm_handler ALRM
-	echo "$prog ignoring SIGALRM" 1>&2
+	echo "$prog ignored SIGALRM" 1>&2
 }
 
 usr1_handler()
