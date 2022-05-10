@@ -9,6 +9,7 @@ nfail=0
 prog=$(basename $0)
 timed_out=no
 timeout_default=600
+cancel_timeout_default=3
 
 bail()
 {
@@ -123,6 +124,29 @@ env_for_flagset()
 	echo $env
 }
 
+counterpart_cmd_for_flagset()
+{
+	flagset=$1
+	shift
+	cmd="$@"
+	for flag in $(echo $flagset | sed 's/,/ /g'); do
+		case $flag in
+		cancel)
+			cmd="timeout --preserve-status -s INT ${FABTSUITE_CANCEL_TIMEOUT:-$cancel_timeout_default} $cmd -c"
+			;;
+		cacheless)
+			;;
+		contiguous)
+			;;
+		default)
+			;;
+		reregister)
+			;;
+		esac
+	done
+	echo $cmd
+}
+
 cmd_for_flagset()
 {
 	flagset=$1
@@ -130,6 +154,9 @@ cmd_for_flagset()
 	cmd="$@"
 	for flag in $(echo $flagset | sed 's/,/ /g'); do
 		case $flag in
+		cancel)
+			cmd="timeout --preserve-status -s INT ${FABTSUITE_CANCEL_TIMEOUT:-$cancel_timeout_default} $cmd -c"
+			;;
 		cacheless)
 			;;
 		contiguous)
@@ -153,6 +180,7 @@ key:
 
   parameters:
       default: register each RDMA buffer once, use scatter-gather RDMA 
+      cancel: -c, send SIGINT to cancel after 3 seconds
       cacheless: env FI_MR_CACHE_MAX_SIZE=0, disable memory-registration cache
       contiguous: -g, RDMA conti(g)uous bytes, no scatter-gather
       reregister: -r, deregister/(r)eregister each RDMA buffer before reuse
@@ -210,7 +238,7 @@ fi
 
 test_host=$1
 
-generic_flagset="default reregister cacheless cacheless,reregister"
+generic_flagset="default cancel cacheless reregister cacheless,reregister"
 fget_flagset=$generic_flagset
 fput_flagset="$generic_flagset contiguous contiguous,reregister"
 fput_flagset="$fput_flagset contiguous,reregister,cacheless"
@@ -228,7 +256,8 @@ for flagset in $fget_flagset; do
 		fi
 	} > $tmpdir/fget.${flagset}.result &
 
-	if ! ./transfer/fput $test_host; then
+	fputcmd=$(counterpart_cmd_for_flagset $flagset ./transfer/fput)
+	if ! $fputcmd $test_host; then
 		echo fail > $tmpdir/fget.${flagset}.result
 	fi
 
@@ -244,7 +273,9 @@ done
 for flagset in $fput_flagset; do
 	fputenv=$(env_for_flagset $flagset)
 	fputcmd=$(cmd_for_flagset $flagset "./transfer/fput")
-	./transfer/fget -b $test_host &
+	fgetcmd=$(counterpart_cmd_for_flagset $flagset \
+	    ./transfer/fget -b $test_host)
+	$fgetcmd &
 	if env $fputenv time -p $fputcmd $test_host 2>&1 && ! random_fail && \
 	   [ ${timed_out:-no} = no ] ; then
 		echo ok
