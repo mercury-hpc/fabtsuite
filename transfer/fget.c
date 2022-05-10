@@ -1268,7 +1268,7 @@ rcvr_cq_process(rcvr_t *r)
             return -1;
         }
     } else if (ncompleted < 0) {
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+        bailout_for_ofi_ret(ncompleted, "fi_cq_read");
     } else if (ncompleted != 1) {
         errx(EXIT_FAILURE,
             "%s: expected 1 completion, read %zd", __func__, ncompleted);
@@ -1487,7 +1487,7 @@ xmtr_start(worker_t *w, session_t *s)
             continue;
 
         if (ncompleted < 0)
-            bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+            bailout_for_ofi_ret(ncompleted, "fi_cq_read");
 
         if (ncompleted != 1) {
             errx(EXIT_FAILURE,
@@ -2686,11 +2686,9 @@ xmtr_init(xmtr_t *x, struct fid_av *av)
         rc = buf_mr_reg(global_state.domain, FI_SEND,
             keysource_next(&global_state.keys), &pb->hdr);
 
-        if (rc != 0) {
-            warn_about_ofi_ret(rc, "fi_mr_reg");
-            buf_free(&pb->hdr);
-            break;
-        }
+        if (rc != 0)
+            bailout_for_ofi_ret(rc, "fi_mr_reg");
+
         if (!buflist_put(x->progress.pool, &pb->hdr))
             errx(EXIT_FAILURE, "%s: progress buffer pool full", __func__);
     }
@@ -2807,11 +2805,9 @@ rcvr_init(rcvr_t *r, struct fid_av *av)
         rc = buf_mr_reg(global_state.domain, FI_SEND,
             keysource_next(&global_state.keys), &vb->hdr);
 
-        if (rc != 0) {
-            warn_about_ofi_ret(rc, "fi_mr_reg");
-            vecbuf_free(vb);
-            break;
-        }
+        if (rc != 0)
+            bailout_for_ofi_ret(rc, "fi_mr_reg");
+
         if (!buflist_put(r->vec.pool, &vb->hdr))
             errx(EXIT_FAILURE, "%s: vector buffer pool full", __func__);
     }
