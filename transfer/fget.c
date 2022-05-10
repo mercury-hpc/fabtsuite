@@ -937,7 +937,7 @@ rxctl_complete(rxctl_t *rc, const completion_t *cmpl)
     }
 
     if ((h = fifo_get(rc->posted)) == NULL) {
-        hlog_fast(rxctl,
+        errx(EXIT_FAILURE,
             "%s: received a message, but no Rx was posted", __func__);
         return NULL;
     }
