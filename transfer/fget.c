@@ -956,6 +956,8 @@ rxctl_post(cxn_t *c, rxctl_t *ctl, bufhdr_t *h)
 {
     int rc;
 
+    h->xfc.cancelled = 0;
+
     rc = fi_recvmsg(c->ep, &(struct fi_msg){
           .msg_iov = &(struct iovec){.iov_base = &((bytebuf_t *)h)->payload[0],
                                      .iov_len = h->nallocated}
@@ -1306,6 +1308,7 @@ rcvr_vector_update(session_t *s, rcvr_t *r)
         (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
         memset(vb->msg.iov, 0, sizeof(vb->msg.iov));
         vb->msg.niovs = 0;
+        vb->hdr.nused = (char *)&vb->msg.iov[0] - (char *)&vb->msg;
         (void)fifo_put(r->vec.ready, &vb->hdr);
         r->cxn.eof.local = true;
         hlog_fast(protocol, "%s: enqueued local EOF", __func__);
