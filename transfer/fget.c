@@ -191,11 +191,10 @@ struct cxn {
     struct fid_av *av;
     bool cancelled;
     bool started;
-    /* TBD break this condition into remote_eof, local_eof: receiver
-     * needs to send an empty vector.msg.niovs == 0 to close, sender
-     * needs to send progress.msg.nleftover == 0, record having received the
-     * remote close in remote_eof and having completed sending it in
-     * local_eof.
+    /* Receiver needs to send an empty vector.msg.niovs == 0 to close,
+     * sender needs to send progress.msg.nleftover == 0, record having
+     * received the remote close in `eof.remote` and having completed
+     * sending it in `eof.local`.
      */
     struct {
         bool local, remote;
