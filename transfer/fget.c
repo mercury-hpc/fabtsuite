@@ -140,6 +140,7 @@ typedef enum {
     loop_continue
 ,   loop_end
 ,   loop_error
+,   loop_canceled
 } loop_control_t;
 
 struct terminal;
@@ -235,6 +236,10 @@ typedef struct {
     } initial;
     txctl_t vec;
     rxctl_t progress;
+    bool sent_ack;   /* set to `true` once this receiver sends an
+                      * acknowledgement for the transmitter's original
+                      * message
+                      */
 } rcvr_t;
 
 typedef struct {
@@ -287,7 +292,7 @@ typedef struct {
     volatile atomic_uint_fast16_t average;
     uint_fast16_t loops_since_mark;
     uint32_t ctxs_serviced_since_mark;
-} loadavg_t;
+} load_t;
 
 #define WORKER_SESSIONS_MAX 64
 #define WORKERS_MAX 128
@@ -302,7 +307,7 @@ struct session {
 
 struct worker {
     pthread_t thd;
-    loadavg_t avg;
+    load_t load;
     terminal_t *term[WORKER_SESSIONS_MAX];
     session_t session[WORKER_SESSIONS_MAX];
     volatile _Atomic size_t nsessions[2];   // number of sessions in each half
@@ -313,7 +318,8 @@ struct worker {
                              * half
                              */
     pthread_cond_t sleep;   /* Used in conjunction with workers_mtx. */
-    volatile atomic_bool cancelled;
+    volatile atomic_bool shutting_down;
+    volatile atomic_bool canceled;
     bool failed;
     struct {
         buflist_t *tx;
@@ -323,11 +329,17 @@ struct worker {
 };
 
 typedef struct {
+    sink_t sink;
+    rcvr_t rcvr;
+    session_t sess;
+} get_session_t;
+
+typedef struct {
     struct fid_eq *listen_eq;
     struct fid_ep *listen_ep;
     struct fid_cq *listen_cq;
-    sink_t sink;
-    rcvr_t rcvr;
+    struct fid_av *av;
+    get_session_t *session;
 } get_state_t;
 
 typedef struct {
@@ -340,7 +352,6 @@ typedef struct {
     struct fid_fabric *fabric;
     struct fi_info *info;
     union {
-        get_state_t get;
         put_state_t put;
     } u;
     size_t mr_maxsegs;
@@ -349,12 +360,15 @@ typedef struct {
     size_t rma_maxsegs;
     keysource_t keys;
     bool contiguous;
+    bool expect_cancellation;
     bool reregister;
+    size_t nsessions;
 } state_t;
 
 typedef int (*personality_t)(void);
 
 HLOG_OUTLET_MEDIUM_DEFN(err, all, 0, HLOG_OUTLET_S_ON);
+HLOG_OUTLET_SHORT_DEFN(average, all);
 HLOG_OUTLET_SHORT_DEFN(close, all);
 HLOG_OUTLET_SHORT_DEFN(signal, all);
 HLOG_OUTLET_SHORT_DEFN(params, all);
@@ -374,7 +388,7 @@ HLOG_OUTLET_SHORT_DEFN(completion, all);
 
 static const char fget_fput_service_name[] = "4242";
 
-static state_t global_state;
+static state_t global_state = {.nsessions = 1};
 static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
 static size_t nworkers_running;
@@ -1380,12 +1394,45 @@ rcvr_targets_read(session_t *s, rcvr_t *r)
 }
 
 static loop_control_t
+rcvr_ack_send(rcvr_t *r)
+{
+    const int rc = fi_sendmsg(r->cxn.ep, &(struct fi_msg){
+          .msg_iov = r->ack.iov
+        , .desc = r->ack.desc
+        , .iov_count = r->ack.niovs
+        , .addr = r->cxn.peer_addr
+        , .context = NULL
+        , .data = 0
+        }, 0);
+
+    if (rc == -FI_EAGAIN)
+        return loop_continue;
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_sendmsg");
+
+    r->sent_ack = true;
+    return loop_end;
+}
+
+static loop_control_t
 rcvr_loop(worker_t *w, session_t *s)
 {
     rcvr_t *r = (rcvr_t *)s->cxn;
     terminal_t *t = s->terminal;
     int rc;
     loop_control_t ctl;
+
+    switch (r->sent_ack ? loop_end : rcvr_ack_send(r)) {
+    case loop_end:
+        break;
+    case loop_continue:
+        if (rcvr_cq_process(r) == -1)
+            goto fail;
+        return loop_continue;
+    default:
+        goto fail;
+    }
 
     if (!r->cxn.started)
         return rcvr_start(w, s);
@@ -1395,8 +1442,12 @@ rcvr_loop(worker_t *w, session_t *s)
 
     if (r->cxn.cancelled) {
         if (fifo_empty(r->progress.posted) &&
-            fifo_empty(r->vec.posted))
-            goto fail;
+            fifo_empty(r->vec.posted)) {
+            if ((rc = fi_close(&r->cxn.ep->fid)) < 0)
+                bailout_for_ofi_ret(rc, "fi_close");
+            hlog_fast(close, "%s: closed.", __func__);
+            return loop_canceled;
+        }
         return loop_continue;
     } else if (cancelled) {
         rxctl_cancel(r->cxn.ep, &r->progress);
@@ -2102,8 +2153,12 @@ xmtr_loop(worker_t *w, session_t *s)
     if (x->cxn.cancelled) {
         if (fifo_empty(x->progress.posted) &&
             fifo_empty(x->vec.posted) &&
-            fifo_empty(x->wrposted))
-            goto fail;
+            fifo_empty(x->wrposted)) {
+                if ((rc = fi_close(&x->cxn.ep->fid)) < 0)
+                    bailout_for_ofi_ret(rc, "fi_close");
+                hlog_fast(close, "%s: closed.", __func__);
+                return loop_canceled;
+        }
         return loop_continue;
     } else if (cancelled) {
         txctl_cancel(x->cxn.ep, &x->progress);
@@ -2168,16 +2223,40 @@ worker_run_loop(worker_t *self)
     size_t half, i;
 
     for (half = 0; half < 2; half++) {
-        void *context;
+        void *context[WORKER_SESSIONS_MAX];
         pthread_mutex_t *mtx = &self->mtx[half];
         int rc;
 
         if (pthread_mutex_trylock(mtx) == EBUSY)
             continue;
 
-        if ((rc = fi_poll(self->pollset[half], &context, 1)) < 0) {
+        rc = fi_poll(self->pollset[half], context, WORKER_SESSIONS_MAX);
+
+        if (rc < 0) {
             (void)pthread_mutex_unlock(mtx);
             bailout_for_ofi_ret(rc, "fi_poll");
+        }
+
+        load_t *load = &self->load;
+
+        load->ctxs_serviced_since_mark += rc;
+
+        if (load->loops_since_mark < UINT16_MAX) {
+            load->loops_since_mark++;
+        } else {
+            // MARK
+            load->average =
+                (load->average +
+                 256 * load->ctxs_serviced_since_mark / (UINT16_MAX + 1)) / 2;
+            hlog_fast(average, "%s: average %" PRIuFAST16 "x%" PRIuFAST16,
+                __func__, load->average / (uint_fast16_t)256,
+                load->average % (uint_fast16_t)256);
+            hlog_fast(average,
+                "%s: %" PRIu32 " contexts in %" PRIuFAST16 " loops",
+                __func__, load->ctxs_serviced_since_mark,
+                load->loops_since_mark);
+            load->loops_since_mark = 0;
+            load->ctxs_serviced_since_mark = 0;
         }
 
         /* Find a non-empty session slot and go once through
@@ -2199,6 +2278,9 @@ worker_run_loop(worker_t *self)
             case loop_continue:
                 continue;
             case loop_end:
+                break;
+            case loop_canceled:
+                self->canceled = true;
                 break;
             case loop_error:
                 self->failed = true;
@@ -2263,7 +2345,7 @@ worker_idle_loop(worker_t *self)
     const ptrdiff_t self_idx = self - &workers[0];
 
     (void)pthread_mutex_lock(&workers_mtx);
-    while (nworkers_running <= self_idx && !self->cancelled)
+    while (nworkers_running <= self_idx && !self->shutting_down)
         pthread_cond_wait(&self->sleep, &workers_mtx);
     (void)pthread_mutex_unlock(&workers_mtx);
 }
@@ -2273,11 +2355,11 @@ worker_outer_loop(void *arg)
 {
     worker_t *self = arg;
 
-    while (!self->cancelled) {
+    while (!self->shutting_down) {
         worker_idle_loop(self);
         do {
             worker_run_loop(self);
-        } while (!worker_is_idle(self) && !self->cancelled);
+        } while (!worker_is_idle(self) && !self->shutting_down);
     }
     return NULL;
 }
@@ -2337,7 +2419,7 @@ worker_init(worker_t *w)
     int rc;
     size_t i;
 
-    w->cancelled = false;
+    w->shutting_down = false;
     w->failed = false;
     keysource_init(&w->keys);
 
@@ -2563,7 +2645,7 @@ workers_join_all(void)
 
     for (i = 0; i < nworkers_allocated; i++) {
         worker_t *w = &workers[i];
-        w->cancelled = true;
+        w->shutting_down = true;
         pthread_cond_signal(&w->sleep);
     }
 
@@ -2577,7 +2659,7 @@ workers_join_all(void)
                 errx(EXIT_FAILURE, "%s.%d: pthread_join: %s",
                     __func__, __LINE__, strerror(rc));
         }
-        if (w->failed)
+        if (w->failed || w->canceled != global_state.expect_cancellation)
             code = EXIT_FAILURE;
     }
     return code;
@@ -2813,18 +2895,32 @@ rcvr_init(rcvr_t *r, struct fid_av *av)
     }
 }
 
-static int
-get(void)
+/* Post a receive for the initial message for session `gs`
+ * on endpoint `ep`.
+ */
+static void
+post_initial_rx(struct fid_ep *ep, get_session_t *gs)
 {
-    struct fi_av_attr av_attr = {
-      .type = FI_AV_UNSPEC
-    , .rx_ctx_bits = 0
-    , .count = 0
-    , .ep_per_node = 0
-    , .name = NULL
-    , .map_addr = NULL
-    , .flags = 0
-    };
+    int rc;
+
+    rcvr_t *r = &gs->rcvr;
+
+    rc = fi_recvmsg(ep, &(struct fi_msg){
+          .msg_iov = r->initial.iov
+        , .desc = r->initial.desc
+        , .iov_count = r->initial.niovs
+        , .addr = r->cxn.peer_addr
+        , .context = gs
+        , .data = 0
+        }, FI_COMPLETION);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_recvmsg");
+}
+
+static get_session_t *
+get_session_accept(get_state_t *gst)
+{
     struct fi_cq_attr cq_attr = {
       .size = 128
     , .flags = 0
@@ -2841,66 +2937,11 @@ get(void)
     , .signaling_vector = 0     /* don't care */
     , .wait_set = NULL          /* don't care */
     };
-    struct fid_av *av;
-    get_state_t *gst = &global_state.u.get;
-    rcvr_t *r = &gst->rcvr;
-    sink_t *s = &gst->sink;
-    session_t sess;
     struct fi_cq_msg_entry completion;
+    get_session_t *gs;
+    rcvr_t *r;
     ssize_t ncompleted;
-    worker_t *w;
     int rc;
-
-    rc = fi_av_open(global_state.domain, &av_attr, &av, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_av_open");
-
-    rcvr_init(r, av);
-    sink_init(s);
-
-    if (!session_init(&sess, &r->cxn, &s->terminal))
-        errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
-
-    if ((rc = fi_endpoint(global_state.domain, global_state.info,
-                          &gst->listen_ep, NULL)) != 0)
-        bailout_for_ofi_ret(rc, "fi_endpoint");
-
-    if ((rc = fi_eq_open(global_state.fabric, &eq_attr, &gst->listen_eq,
-                         NULL)) != 0)
-        bailout_for_ofi_ret(rc, "fi_eq_open (listen)");
-
-    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &gst->listen_cq,
-                         NULL)) != 0)
-        bailout_for_ofi_ret(rc, "fi_cq_open");
-
-    if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_cq->fid,
-        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
-        bailout_for_ofi_ret(rc, "fi_ep_bind (completion queue)");
-
-    if ((rc = fi_eq_open(global_state.fabric, &eq_attr, &r->cxn.eq, NULL)) != 0)
-        bailout_for_ofi_ret(rc, "fi_eq_open (active)");
-
-    if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_eq->fid, 0)) != 0)
-        bailout_for_ofi_ret(rc, "fi_ep_bind (event queue)");
-
-    if ((rc = fi_ep_bind(gst->listen_ep, &av->fid, 0)) != 0)
-        bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
-
-    if ((rc = fi_enable(gst->listen_ep)) != 0)
-        bailout_for_ofi_ret(rc, "fi_enable");
-
-    rc = fi_recvmsg(gst->listen_ep, &(struct fi_msg){
-          .msg_iov = r->initial.iov
-        , .desc = r->initial.desc
-        , .iov_count = r->initial.niovs
-        , .addr = r->cxn.peer_addr
-        , .context = NULL
-        , .data = 0
-        }, FI_COMPLETION);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_recvmsg");
 
     /* Await initial message. */
     do {
@@ -2927,15 +2968,19 @@ get(void)
             __func__, desired_rx_flags, completion.flags & desired_rx_flags);
     }
 
+    gs = completion.op_context;
+    r = &gs->rcvr;
+
     if (completion.len != sizeof(r->initial.msg)) {
         errx(EXIT_FAILURE, "initially received %zu bytes, expected %zu",
             completion.len, sizeof(r->initial.msg));
     }
 
-    if (r->initial.msg.nsources != 1 || r->initial.msg.id != 0) {
+    if (r->initial.msg.nsources != global_state.nsessions ||
+        r->initial.msg.id > global_state.nsessions) {
         errx(EXIT_FAILURE,
-            "received nsources %" PRIu32 ", id %" PRIu32 ", expected 1, 0",
-            r->initial.msg.nsources, r->initial.msg.id);
+            "received nsources %" PRIu32 ", id %" PRIu32 ", expected %zu, 0",
+            r->initial.msg.nsources, r->initial.msg.id, global_state.nsessions);
     }
 
     rc = fi_av_insert(r->cxn.av, r->initial.msg.addr, 1, &r->cxn.peer_addr,
@@ -2964,6 +3009,9 @@ get(void)
 
     fi_freeinfo(ep_info);
 
+    if ((rc = fi_eq_open(global_state.fabric, &eq_attr, &r->cxn.eq, NULL)) != 0)
+        bailout_for_ofi_ret(rc, "fi_eq_open (active)");
+
     if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.eq->fid, 0)) < 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
@@ -2974,7 +3022,7 @@ get(void)
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    if ((rc = fi_ep_bind(r->cxn.ep, &av->fid, 0)) != 0)
+    if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.av->fid, 0)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
 
     if ((rc = fi_enable(r->cxn.ep)) != 0)
@@ -2987,38 +3035,122 @@ get(void)
 
     r->ack.msg.addrlen = (uint32_t)addrlen;
 
-    while ((rc = fi_sendmsg(r->cxn.ep, &(struct fi_msg){
-          .msg_iov = r->ack.iov
-        , .desc = r->ack.desc
-        , .iov_count = r->ack.niovs
-        , .addr = r->cxn.peer_addr
-        , .context = NULL
-        , .data = 0
-        }, 0)) == -FI_EAGAIN) {
-        ncompleted = fi_cq_read(r->cxn.cq, &completion, 1);
+    return gs;
+}
 
-        if (ncompleted == -FI_EAGAIN)
-            continue;
+static get_state_t *
+get_state_open(void)
+{
+    struct fi_av_attr av_attr = {
+      .type = FI_AV_UNSPEC
+    , .rx_ctx_bits = 0
+    , .count = 0
+    , .ep_per_node = 0
+    , .name = NULL
+    , .map_addr = NULL
+    , .flags = 0
+    };
+    struct fi_cq_attr cq_attr = {
+      .size = 128
+    , .flags = 0
+    , .format = FI_CQ_FORMAT_MSG
+    , .wait_obj = FI_WAIT_UNSPEC
+    , .signaling_vector = 0
+    , .wait_cond = FI_CQ_COND_NONE
+    , .wait_set = NULL
+    };
+    struct fi_eq_attr eq_attr = {
+      .size = 128
+    , .flags = 0
+    , .wait_obj = FI_WAIT_UNSPEC
+    , .signaling_vector = 0     /* don't care */
+    , .wait_set = NULL          /* don't care */
+    };
+    get_state_t *gst;
+    int rc;
 
-        if (ncompleted < 0)
-            bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+    if ((gst = calloc(1, sizeof(*gst))) == NULL)
+        errx(EXIT_FAILURE, "%s: failed to allocate get state", __func__);
 
-        if (ncompleted != 1) {
-            errx(EXIT_FAILURE,
-                "%s: expected 1 completion, read %zd", __func__, ncompleted);
-        }
+    gst->session = calloc(global_state.nsessions, sizeof(*gst->session));
 
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
+    if (gst->session == NULL)
+        errx(EXIT_FAILURE, "%s: failed to allocate sessions", __func__);
+
+    rc = fi_av_open(global_state.domain, &av_attr, &gst->av, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_av_open");
+
+    if ((rc = fi_endpoint(global_state.domain, global_state.info,
+                          &gst->listen_ep, NULL)) != 0)
+        bailout_for_ofi_ret(rc, "fi_endpoint");
+
+    if ((rc = fi_eq_open(global_state.fabric, &eq_attr, &gst->listen_eq,
+                         NULL)) != 0)
+        bailout_for_ofi_ret(rc, "fi_eq_open (listen)");
+
+    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &gst->listen_cq,
+                         NULL)) != 0)
+        bailout_for_ofi_ret(rc, "fi_cq_open");
+
+    if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_cq->fid,
+        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
+        bailout_for_ofi_ret(rc, "fi_ep_bind (completion queue)");
+
+    if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_eq->fid, 0)) != 0)
+        bailout_for_ofi_ret(rc, "fi_ep_bind (event queue)");
+
+    if ((rc = fi_ep_bind(gst->listen_ep, &gst->av->fid, 0)) != 0)
+        bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
+
+    if ((rc = fi_enable(gst->listen_ep)) != 0)
+        bailout_for_ofi_ret(rc, "fi_enable");
+
+    return gst;
+}
+
+static int
+get(void)
+{
+    get_state_t *gst;
+    rcvr_t *r;
+    sink_t *s;
+    get_session_t *gs;
+    worker_t *w;
+    size_t i;
+
+    gst = get_state_open();
+
+    for (i = 0; i < global_state.nsessions; i++) {
+        gs = &gst->session[i];
+
+        r = &gs->rcvr;
+        s = &gs->sink;
+
+        rcvr_init(r, gst->av);
+        sink_init(s);
+
+        post_initial_rx(gst->listen_ep, gs);
     }
 
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_sendmsg");
+    for (i = 0; i < global_state.nsessions; i++) {
+        gs = get_session_accept(gst);
 
-    if ((w = workers_assign_session(&sess)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not assign a new receiver to a worker",
-            __func__);
+        r = &gs->rcvr;
+        s = &gs->sink;
+
+        if (!session_init(&gs->sess, &r->cxn, &s->terminal))
+            errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
+    }
+
+    for (i = 0; i < global_state.nsessions; i++) {
+        gs = &gst->session[i];
+
+        if ((w = workers_assign_session(&gs->sess)) == NULL) {
+            errx(EXIT_FAILURE,
+                "%s: could not assign a new receiver to a worker", __func__);
+        }
     }
 
     return workers_join_all();
@@ -3104,7 +3236,7 @@ put(void)
 
     /* Setup initial message. */
     memset(&x->initial.msg, 0, sizeof(x->initial.msg));
-    x->initial.msg.nsources = 1;
+    x->initial.msg.nsources = global_state.nsessions;
     x->initial.msg.id = 0;
 
     x->initial.desc = fi_mr_desc(x->initial.mr);
@@ -3171,7 +3303,8 @@ main(int argc, char **argv)
     struct fi_info *hints;
     personality_t personality;
     const char *addr = NULL;
-    char *progname, *tmp;
+    char *end, *progname, *tmp;
+    uintmax_t n;
     int ecode, i, opt, rc;
 
     if ((tmp = strdup(argv[0])) == NULL)
@@ -3188,10 +3321,26 @@ main(int argc, char **argv)
            progname);
     }
 
-    const char *optstring = (personality == get) ? "b:r" : "gr";
+    const char *optstring = (personality == get) ? "b:cn:r" : "cgn:r";
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
+        case 'c':
+            global_state.expect_cancellation = true;
+            break;
+        case 'n':
+            errno = 0;
+            n = strtoumax(optarg, &end, 0);
+            if (n < 1 || SIZE_MAX < n) {
+                errx(EXIT_FAILURE, "`-n` parameter `%s` is out of range",
+                    optarg);
+            }
+            if (end == optarg) {
+                errx(EXIT_FAILURE, "could not parse `-n` parameter `%s`",
+                    optarg);
+            }
+            global_state.nsessions = (size_t)n;
+            break;
         case 'g':
             global_state.contiguous = true;
             break;
