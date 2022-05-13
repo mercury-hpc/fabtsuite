@@ -1,8 +1,10 @@
 # Prerequisites
 *.d
+.depend
 
 # Object files
 *.o
+*.os
 
 # Libraries
 *.a
