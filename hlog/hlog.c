@@ -85,14 +85,14 @@ hlog_msg_vsnprintf(char *buf, size_t buflen, hlog_msg_t msg, const char *fmt,
 	if (msg.prefix) {
 		nwritten = snprintf(p, remaining, "%ju.%.9ld ",
 		    (uintmax_t)msg.elapsed.tv_sec, msg.elapsed.tv_nsec);
+
+		if (nwritten < 0 || remaining <= (size_t)nwritten)
+			return nwritten;
+
+		assert(strlen(p) == (size_t)nwritten);
+		p += nwritten;
+		remaining -= (size_t)nwritten;
 	}
-
-	if (nwritten < 0 || remaining <= (size_t)nwritten)
-		return nwritten;
-
-	assert(strlen(p) == (size_t)nwritten);
-	p += nwritten;
-	remaining -= (size_t)nwritten;
 
 	nwritten = vsnprintf(p, remaining, fmt, ap);
 
@@ -106,12 +106,14 @@ hlog_msg_vsnprintf(char *buf, size_t buflen, hlog_msg_t msg, const char *fmt,
 	remaining -= (size_t)nwritten;
 
 	nwritten = (msg.errnum == 0)
-	    ? snprintf(p, remaining, msg.suffix ? "\n" : "")
+	    ? snprintf(p, remaining, "%s", msg.suffix ? "\n" : "")
 	    : snprintf(p, remaining, ": %s%s", strerror(msg.errnum),
 	               msg.suffix ? "\n" : "");
 
 	if (nwritten < 0)
 		return nwritten;
+	if (remaining <= (size_t)nwritten)
+		return (int)(p - buf) + nwritten;
 
 	assert(strlen(p) == (size_t)nwritten);
 	return (int)(p - buf) + nwritten;
