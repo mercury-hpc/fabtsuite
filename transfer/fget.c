@@ -292,6 +292,8 @@ typedef struct {
     volatile atomic_uint_fast16_t average;
     uint_fast16_t loops_since_mark;
     uint32_t ctxs_serviced_since_mark;
+    int max_loop_contexts;
+    int min_loop_contexts;
 } load_t;
 
 #define WORKER_SESSIONS_MAX 64
@@ -2239,6 +2241,12 @@ worker_run_loop(worker_t *self)
 
         load_t *load = &self->load;
 
+        if (rc > load->max_loop_contexts)
+            load->max_loop_contexts = rc;
+
+        if (rc < load->min_loop_contexts)
+            load->min_loop_contexts = rc;
+
         load->ctxs_serviced_since_mark += rc;
 
         if (load->loops_since_mark < UINT16_MAX) {
@@ -2255,8 +2263,13 @@ worker_run_loop(worker_t *self)
                 "%s: %" PRIu32 " contexts in %" PRIuFAST16 " loops",
                 __func__, load->ctxs_serviced_since_mark,
                 load->loops_since_mark);
+            hlog_fast(average,
+                "%s: %d to %d contexts per loop",
+                __func__, load->min_loop_contexts, load->max_loop_contexts);
             load->loops_since_mark = 0;
             load->ctxs_serviced_since_mark = 0;
+            load->max_loop_contexts = 0;
+            load->min_loop_contexts = INT_MAX;
         }
 
         /* Find a non-empty session slot and go once through
