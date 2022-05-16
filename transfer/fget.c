@@ -2455,6 +2455,13 @@ worker_init(worker_t *w)
 
     w->paybufs.rx = worker_paybuflist_create(w, payload_access.rx);
     w->paybufs.tx = worker_paybuflist_create(w, payload_access.tx);
+
+    w->load = (load_t){
+          .max_loop_contexts = 0
+        , .min_loop_contexts = INT_MAX
+        , .average = 0
+        , .loops_since_mark = 0
+        , .ctxs_serviced_since_mark = 0};
 }
 
 static void
