@@ -3,6 +3,7 @@
 #include <libgen.h> /* basename(3) */
 #include <limits.h> /* INT_MAX */
 #include <inttypes.h>   /* PRIu32 */
+#include <sched.h>  /* CPU_SET(3) */
 #include <signal.h>
 #include <stdarg.h>
 #include <stdalign.h>
@@ -296,7 +297,7 @@ typedef struct {
     int min_loop_contexts;
 } load_t;
 
-#define WORKER_SESSIONS_MAX 64
+#define WORKER_SESSIONS_MAX 8
 #define WORKERS_MAX 128
 #define SESSIONS_MAX (WORKER_SESSIONS_MAX * WORKERS_MAX)
 
@@ -349,6 +350,8 @@ typedef struct {
     source_t source;
 } put_state_t;
 
+typedef int (*personality_t)(void);
+
 typedef struct {
     struct fid_domain *domain;
     struct fid_fabric *fabric;
@@ -365,9 +368,9 @@ typedef struct {
     bool expect_cancellation;
     bool reregister;
     size_t nsessions;
+    personality_t personality;
+    int nextcpu;
 } state_t;
-
-typedef int (*personality_t)(void);
 
 HLOG_OUTLET_MEDIUM_DEFN(err, all, 0, HLOG_OUTLET_S_ON);
 HLOG_OUTLET_SHORT_DEFN(average, all);
@@ -390,7 +393,8 @@ HLOG_OUTLET_SHORT_DEFN(completion, all);
 
 static const char fget_fput_service_name[] = "4242";
 
-static state_t global_state = {.nsessions = 1};
+static state_t global_state = {.domain = NULL, .fabric = NULL, .info = NULL,
+                               .personality = NULL, .nsessions = 1};
 static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
 static size_t nworkers_running;
@@ -413,6 +417,8 @@ static const struct {
     uint64_t rx;
     uint64_t tx;
 } payload_access = {.rx = FI_RECV | FI_REMOTE_WRITE, .tx = FI_SEND};
+
+static int get(void);
 
 static char *
 completion_flags_to_string(const uint64_t flags, char * const buf,
@@ -2464,11 +2470,13 @@ worker_init(worker_t *w)
         , .ctxs_serviced_since_mark = 0};
 }
 
-static void
+static bool
 worker_launch(worker_t *w)
 {
-    int i, rc;
+    pthread_attr_t attr;
+    int i, rc, create_rc;
     sigset_t oldset, blockset;
+    cpu_set_t cpuset;
 
     if ((rc = sigemptyset(&blockset)) == -1) {
         err(EXIT_FAILURE, "%s.%d: sigfillset", __func__, __LINE__);
@@ -2479,20 +2487,47 @@ worker_launch(worker_t *w)
             err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
     }
 
+    if (global_state.nextcpu < 0)
+        return false;
+
+    CPU_ZERO(&cpuset);
+    CPU_SET(global_state.nextcpu, &cpuset);
+
+    if ((rc = pthread_attr_init(&attr)) != 0) {
+            errx(EXIT_FAILURE, "%s.%d: pthread_attr_init: %s",
+                __func__, __LINE__, strerror(rc));
+    }
+
+    if (global_state.personality == get &&
+        (rc = pthread_attr_setaffinity_np(&attr,
+                                          sizeof(cpuset), &cpuset)) != 0) {
+            errx(EXIT_FAILURE, "%s.%d: pthread_attr_setaffinity_cp: %s",
+                __func__, __LINE__, strerror(rc));
+    }
+
     if ((rc = pthread_sigmask(SIG_BLOCK, &blockset, &oldset)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
             strerror(rc));
     }
 
-    if ((rc = pthread_create(&w->thd, NULL, worker_outer_loop, w)) != 0) {
-            errx(EXIT_FAILURE, "%s.%d: pthread_create: %s",
-                __func__, __LINE__, strerror(rc));
-    }
+    create_rc = pthread_create(&w->thd, &attr, worker_outer_loop, w);
 
     if ((rc = pthread_sigmask(SIG_SETMASK, &oldset, NULL)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
             strerror(rc));
     }
+
+    if (create_rc != 0) {
+        errx(EXIT_FAILURE, "%s.%d: pthread_create: %s",
+            __func__, __LINE__, strerror(create_rc));
+    }
+
+    if (global_state.nextcpu == INT_MAX)
+        global_state.nextcpu = -1;
+    else
+        global_state.nextcpu++;
+
+    return true;
 }
 
 #if 0
@@ -2534,8 +2569,23 @@ worker_create(void)
         worker_init(w);
     (void)pthread_mutex_unlock(&workers_mtx);
 
-    if (w != NULL)
-        worker_launch(w);
+    if (w == NULL)
+        return NULL;
+
+    if (!worker_launch(w)) {
+        (void)pthread_mutex_lock(&workers_mtx);
+
+        if ((w - &workers[0]) + 1 != nworkers_allocated) {
+            (void)pthread_mutex_unlock(&workers_mtx);
+            errx(EXIT_FAILURE, "%s: worker launch failed irrecoverably",
+                __func__);
+        }
+
+        nworkers_allocated--;
+
+        (void)pthread_mutex_unlock(&workers_mtx);
+        return NULL;
+    }
 
     return w;
 }
@@ -3321,7 +3371,6 @@ main(int argc, char **argv)
 {
     sigset_t oldset, blockset;
     struct fi_info *hints;
-    personality_t personality;
     const char *addr = NULL;
     char *end, *progname, *tmp;
     uintmax_t n;
@@ -3333,15 +3382,16 @@ main(int argc, char **argv)
     progname = basename(tmp);
 
     if (strcmp(progname, "fget") == 0) {
-        personality = get;
+        global_state.personality = get;
     } else if (strcmp(progname, "fput") == 0) {
-        personality = put;
+        global_state.personality = put;
     } else {
         errx(EXIT_FAILURE, "program personality '%s' is not implemented",
            progname);
     }
 
-    const char *optstring = (personality == get) ? "b:cn:r" : "cgn:r";
+    const char *optstring =
+        (global_state.personality == get) ? "b:cn:r" : "cgn:r";
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
@@ -3371,19 +3421,19 @@ main(int argc, char **argv)
             addr = optarg;
             break;
         default:
-            usage(personality, progname);
+            usage(global_state.personality, progname);
         }
     }
 
     argc -= optind;
     argv += optind;
 
-    if (personality == put) {
+    if (global_state.personality == put) {
         if (argc != 1)
-            usage(personality, progname);
+            usage(global_state.personality, progname);
         addr = argv[0];
     } else if (argc != 0)
-        usage(personality, progname);
+        usage(global_state.personality, progname);
 
     workers_initialize();
 
@@ -3401,7 +3451,8 @@ main(int argc, char **argv)
     hints->domain_attr->mr_mode = FI_MR_PROV_KEY;
 
     rc = fi_getinfo(FI_VERSION(1, 13), addr,
-        fget_fput_service_name, (personality == get) ? FI_SOURCE : 0, hints,
+        fget_fput_service_name,
+        (global_state.personality == get) ? FI_SOURCE : 0, hints,
         &global_state.info);
 
     fi_freeinfo(hints);
@@ -3480,7 +3531,7 @@ main(int argc, char **argv)
         bailout_for_ofi_ret(rc, "fi_domain");
 
     hlog_fast(params, "starting personality '%s'",
-        personality_to_name(personality));
+        personality_to_name(global_state.personality));
 
     if (sigemptyset(&blockset) == -1)
         err(EXIT_FAILURE, "%s.%d: sigemptyset", __func__, __LINE__);
@@ -3511,7 +3562,7 @@ main(int argc, char **argv)
             strerror(rc));
     }
 
-    ecode = (*personality)();
+    ecode = (*global_state.personality)();
 
     if ((rc = pthread_sigmask(SIG_SETMASK, &oldset, NULL)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
