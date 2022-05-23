@@ -60,10 +60,11 @@ typedef struct progress_msg {
 /* Communication buffers */
 
 typedef enum {
-  xft_progress
+  xft_ack
+, xft_fragment
+, xft_progress
 , xft_rdma_write
 , xft_vector
-, xft_fragment
 } xfc_type_t;
 
 typedef enum {
@@ -255,6 +256,7 @@ typedef struct {
         initial_msg_t msg;
     } initial;
     struct {
+        xfer_context_t xfc;
         void *desc;
         struct fid_mr *mr;
         ack_msg_t msg;
@@ -277,6 +279,13 @@ typedef struct {
     size_t nriovs;
     size_t next_riov;
     bool phase;
+    bool sent_initial;   /* set to `true` once this transmitter sends an
+                          * initial message to its peer
+                          */
+    bool rcvd_ack;      /* set to `true` once this transmitter receives
+                         * an acknowledgement from its peer for the initial
+                         * message
+                         */
 } xmtr_t;
 
 /* On each loop, a worker checks its poll set for any completions.
@@ -346,8 +355,15 @@ typedef struct {
 } get_state_t;
 
 typedef struct {
-    xmtr_t xmtr;
     source_t source;
+    xmtr_t xmtr;
+    session_t sess;
+} put_session_t;
+
+typedef struct {
+    struct fid_av *av;
+    put_session_t *session;
+    fi_addr_t peer_addr;
 } put_state_t;
 
 typedef int (*personality_t)(void);
@@ -356,9 +372,6 @@ typedef struct {
     struct fid_domain *domain;
     struct fid_fabric *fabric;
     struct fi_info *info;
-    union {
-        put_state_t put;
-    } u;
     size_t mr_maxsegs;
     size_t rx_maxsegs;
     size_t tx_maxsegs;
@@ -370,6 +383,9 @@ typedef struct {
     size_t nsessions;
     personality_t personality;
     int nextcpu;
+    struct {
+        unsigned first, last;
+    } processors;
 } state_t;
 
 HLOG_OUTLET_MEDIUM_DEFN(err, all, 0, HLOG_OUTLET_S_ON);
@@ -394,7 +410,8 @@ HLOG_OUTLET_SHORT_DEFN(completion, all);
 static const char fget_fput_service_name[] = "4242";
 
 static state_t global_state = {.domain = NULL, .fabric = NULL, .info = NULL,
-                               .personality = NULL, .nsessions = 1};
+                               .personality = NULL, .nsessions = 1,
+                               .processors = {.first = 0, .last = INT_MAX}};
 static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
 static size_t nworkers_running;
@@ -1492,12 +1509,79 @@ fail:
 }
 
 static loop_control_t
+xmtr_initial_send(xmtr_t *x)
+{
+    const int rc = fi_sendmsg(x->cxn.ep, &(struct fi_msg){
+          .msg_iov = &(struct iovec){.iov_base = &x->initial.msg,
+                                     .iov_len = sizeof(x->initial.msg)}
+        , .desc = &x->initial.desc
+        , .iov_count = 1
+        , .addr = x->cxn.peer_addr
+        , .context = NULL
+        , .data = 0
+        }, 0);
+
+    if (rc == -FI_EAGAIN)
+        return loop_continue;
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_sendmsg");
+
+    x->sent_initial = true;
+    return loop_end;
+}
+
+static loop_control_t
+xmtr_ack_rx_process(xmtr_t *x, completion_t *cmpl)
+{
+    int rc;
+
+    if ((cmpl->flags & desired_rx_flags) != desired_rx_flags) {
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, cmpl->flags & desired_rx_flags);
+    }
+
+    if (cmpl->len != sizeof(x->ack.msg))
+        errx(EXIT_FAILURE, "%s: ack is incorrect size", __func__);
+
+#if 0
+    fi_addr_t oaddr = x->cxn.peer_addr;
+#endif
+    rc = fi_av_insert(x->cxn.av, x->ack.msg.addr, 1, &x->cxn.peer_addr,
+        0, NULL);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p", x->ack.msg.addr);
+
+#if 0
+    rc = fi_av_remove(x->cxn.av, &oaddr, 1, 0);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_av_remove old dest_addr");
+#endif
+
+    while (!fifo_full(x->vec.posted)) {
+        vecbuf_t *vb = vecbuf_alloc();
+
+        rc = buf_mr_reg(global_state.domain, FI_RECV,
+            keysource_next(&x->cxn.keys), &vb->hdr);
+
+        if (rc < 0)
+            bailout_for_ofi_ret(rc, "buffer memory registration failed");
+
+        rxctl_post(&x->cxn, &x->vec, &vb->hdr);
+    }
+
+    x->rcvd_ack = true;
+
+    return loop_continue;
+}
+
+static loop_control_t
 xmtr_start(worker_t *w, session_t *s)
 {
-    struct fi_cq_msg_entry completion;
     xmtr_t *x = (xmtr_t *)s->cxn;
-    ssize_t ncompleted;
-    int rc;
 
     x->cxn.started = true;
 
@@ -1510,103 +1594,6 @@ xmtr_start(worker_t *w, session_t *s)
         b->hdr.nused = 0;
         if (!fifo_put(s->ready_for_terminal, &b->hdr))
             errx(EXIT_FAILURE, "%s: could not enqueue tx buffer", __func__);
-    }
-
-    /* Post receive for connection acknowledgement. */
-    x->ack.desc = fi_mr_desc(x->ack.mr);
-
-    rc = fi_recvmsg(x->cxn.ep, &(struct fi_msg){
-          .msg_iov = &(struct iovec){.iov_base = &x->ack.msg,
-                                     .iov_len = sizeof(x->ack.msg)}
-        , .desc = &x->ack.desc
-        , .iov_count = 1
-        , .addr = x->cxn.peer_addr
-        , .context = NULL
-        , .data = 0
-        }, FI_COMPLETION);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_recvmsg");
-
-    /* Transmit initial message. */
-    while ((rc = fi_sendmsg(x->cxn.ep, &(struct fi_msg){
-          .msg_iov = &(struct iovec){.iov_base = &x->initial.msg,
-                                     .iov_len = sizeof(x->initial.msg)}
-        , .desc = &x->initial.desc
-        , .iov_count = 1
-        , .addr = x->cxn.peer_addr
-        , .context = NULL
-        , .data = 0
-        }, 0)) == -FI_EAGAIN) {
-
-        /* Await reply to initial message: first vector message. */
-        ncompleted = fi_cq_read(x->cxn.cq, &completion, 1);
-
-        if (ncompleted == -FI_EAGAIN)
-            continue;
-
-        if (ncompleted < 0)
-            bailout_for_ofi_ret(ncompleted, "fi_cq_read");
-
-        if (ncompleted != 1) {
-            errx(EXIT_FAILURE,
-                "%s: expected 1 completion, read %zd", __func__, ncompleted);
-        }
-
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
-    }
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_sendmsg");
-
-    /* Await reply to initial message: first ack message. */
-    do {
-        hlog_fast(tx_start, "%s: awaiting ack message reception", __func__);
-        ncompleted = fi_cq_sread(x->cxn.cq, &completion, 1, NULL, -1);
-    } while (ncompleted == -FI_EAGAIN);
-
-    if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
-
-    if (ncompleted != 1) {
-        errx(EXIT_FAILURE,
-            "%s: expected 1 completion, read %zd", __func__, ncompleted);
-    }
-
-    if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
-        errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
-    }
-
-    if (completion.len != sizeof(x->ack.msg))
-        errx(EXIT_FAILURE, "%s: ack is incorrect size", __func__);
-
-    fi_addr_t oaddr = x->cxn.peer_addr;
-    rc = fi_av_insert(x->cxn.av, x->ack.msg.addr, 1, &x->cxn.peer_addr,
-        0, NULL);
-
-    if (rc < 0) {
-        bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p", x->ack.msg.addr);
-    }
-
-    rc = fi_av_remove(x->cxn.av, &oaddr, 1, 0);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_av_remove old dest_addr");
-
-    while (!fifo_full(x->vec.posted)) {
-        vecbuf_t *vb = vecbuf_alloc();
-
-        rc = buf_mr_reg(global_state.domain, FI_RECV,
-            keysource_next(&x->cxn.keys), &vb->hdr);
-
-        if (rc < 0)
-            bailout_for_ofi_ret(rc, "buffer memory registration failed");
-
-        rxctl_post(&x->cxn, &x->vec, &vb->hdr);
     }
 
     return loop_continue;
@@ -1935,6 +1922,9 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
     case xft_progress:
         hlog_fast(completion, "%s: read a progress tx completion", __func__);
         return txctl_complete(&x->progress, &cmpl);
+    case xft_ack:
+        hlog_fast(completion, "%s: read an ack rx completion", __func__);
+        return xmtr_ack_rx_process(x, &cmpl);
     default:
         hlog_fast(completion, "%s: unexpected xfer context type", __func__);
         return -1;
@@ -2152,11 +2142,25 @@ xmtr_loop(worker_t *w, session_t *s)
     xmtr_t *x = (xmtr_t *)s->cxn;
     ssize_t rc;
 
+    switch (x->sent_initial ? loop_end : xmtr_initial_send(x)) {
+    case loop_end:
+        break;
+    case loop_continue:
+        if (xmtr_cq_process(x, s, global_state.reregister) == -1)
+            goto fail;
+        return loop_continue;
+    default:
+        goto fail;
+    }
+
     if (!x->cxn.started)
         return xmtr_start(w, s);
 
     if (xmtr_cq_process(x, s, global_state.reregister) == -1)
         goto fail;
+
+    if (!x->rcvd_ack)
+        return loop_continue;
 
     if (x->cxn.cancelled) {
         if (fifo_empty(x->progress.posted) &&
@@ -2487,9 +2491,6 @@ worker_launch(worker_t *w)
             err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
     }
 
-    if (global_state.nextcpu < 0)
-        return false;
-
     CPU_ZERO(&cpuset);
     CPU_SET(global_state.nextcpu, &cpuset);
 
@@ -2522,8 +2523,8 @@ worker_launch(worker_t *w)
             __func__, __LINE__, strerror(create_rc));
     }
 
-    if (global_state.nextcpu == INT_MAX)
-        global_state.nextcpu = -1;
+    if (global_state.nextcpu == (int)global_state.processors.last)
+        global_state.nextcpu = (int)global_state.processors.first;
     else
         global_state.nextcpu++;
 
@@ -3108,6 +3109,45 @@ get_session_accept(get_state_t *gst)
     return gs;
 }
 
+static put_state_t *
+put_state_open(void)
+{
+    struct fi_av_attr av_attr = {
+      .type = FI_AV_UNSPEC
+    , .rx_ctx_bits = 0
+    , .count = 0
+    , .ep_per_node = 0
+    , .name = NULL
+    , .map_addr = NULL
+    , .flags = 0
+    };
+    put_state_t *pst;
+    int rc;
+
+    if ((pst = calloc(1, sizeof(*pst))) == NULL)
+        errx(EXIT_FAILURE, "%s: failed to allocate put state", __func__);
+
+    pst->session = calloc(global_state.nsessions, sizeof(*pst->session));
+
+    if (pst->session == NULL)
+        errx(EXIT_FAILURE, "%s: failed to allocate sessions", __func__);
+
+    rc = fi_av_open(global_state.domain, &av_attr, &pst->av, NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_av_open");
+
+    rc = fi_av_insert(pst->av, global_state.info->dest_addr, 1,
+        &pst->peer_addr, 0, NULL);
+
+    if (rc < 0) {
+        bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p",
+            global_state.info->dest_addr);
+    }
+
+    return pst;
+}
+
 static get_state_t *
 get_state_open(void)
 {
@@ -3226,18 +3266,9 @@ get(void)
     return workers_join_all();
 }
 
-static int
-put(void)
+static void
+put_session_setup(put_state_t *pst, put_session_t *ps)
 {
-    struct fi_av_attr av_attr = {
-      .type = FI_AV_UNSPEC
-    , .rx_ctx_bits = 0
-    , .count = 0
-    , .ep_per_node = 0
-    , .name = NULL
-    , .map_addr = NULL
-    , .flags = 0
-    };
     struct fi_cq_attr cq_attr = {
       .size = 128
     , .flags = 0
@@ -3254,24 +3285,8 @@ put(void)
     , .signaling_vector = 0     /* don't care */
     , .wait_set = NULL          /* don't care */
     };
-    session_t sess;
-    put_state_t *pst = &global_state.u.put;
-    xmtr_t *x = &pst->xmtr;
-    source_t *s = &pst->source;
-    struct fid_av *av;
-    worker_t *w;
+    xmtr_t *x = &ps->xmtr;
     int rc;
-
-    rc = fi_av_open(global_state.domain, &av_attr, &av, NULL);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_av_open");
-
-    xmtr_init(x, av);
-    source_init(s);
-
-    if (!session_init(&sess, &x->cxn, &s->terminal))
-        errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
 
     if ((rc = fi_endpoint(global_state.domain, global_state.info, &x->cxn.ep,
                           NULL)) != 0)
@@ -3290,19 +3305,13 @@ put(void)
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    if ((rc = fi_ep_bind(x->cxn.ep, &av->fid, 0)) != 0)
+    if ((rc = fi_ep_bind(x->cxn.ep, &pst->av->fid, 0)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
 
     if ((rc = fi_enable(x->cxn.ep)) != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
 
-    rc = fi_av_insert(av, global_state.info->dest_addr, 1, &x->cxn.peer_addr, 0,
-        NULL);
-
-    if (rc < 0) {
-        bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p",
-            global_state.info->dest_addr);
-    }
+    x->cxn.peer_addr = pst->peer_addr;
 
     /* Setup initial message. */
     memset(&x->initial.msg, 0, sizeof(x->initial.msg));
@@ -3316,11 +3325,64 @@ put(void)
     if ((rc = fi_getname(&x->cxn.ep->fid, x->initial.msg.addr, &addrlen)) != 0)
         bailout_for_ofi_ret(rc, "fi_getname");
 
+    assert(addrlen <= sizeof(x->initial.msg.addr));
     x->initial.msg.addrlen = (uint32_t)addrlen;
 
-    if ((w = workers_assign_session(&sess)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not assign a new transmitter to a worker",
-            __func__);
+    /* Post receive for connection acknowledgement. */
+    x->ack.desc = fi_mr_desc(x->ack.mr);
+
+    xfer_context_t *xfc = &x->ack.xfc;
+
+    xfc->type = xft_ack;
+    xfc->owner = xfo_nic;
+    xfc->place = xfp_first | xfp_last;
+    xfc->nchildren = 0;
+    xfc->cancelled = 0;
+
+    rc = fi_recvmsg(x->cxn.ep, &(struct fi_msg){
+          .msg_iov = &(struct iovec){.iov_base = &x->ack.msg,
+                                     .iov_len = sizeof(x->ack.msg)}
+        , .desc = &x->ack.desc
+        , .iov_count = 1
+        , .addr = x->cxn.peer_addr
+        , .context = xfc
+        , .data = 0
+        }, FI_COMPLETION);
+
+    if (rc < 0)
+        bailout_for_ofi_ret(rc, "fi_recvmsg");
+}
+
+static int
+put(void)
+{
+    put_state_t *pst;
+    put_session_t *ps;
+    worker_t *w;
+    size_t i;
+
+    pst = put_state_open();
+
+    for (i = 0; i < global_state.nsessions; i++) {
+        ps = &pst->session[i];
+        xmtr_t *x = &ps->xmtr;
+        source_t *s = &ps->source;
+        xmtr_init(x, pst->av);
+        source_init(s);
+
+        if (!session_init(&ps->sess, &x->cxn, &s->terminal))
+            errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
+
+        put_session_setup(pst, ps);
+    }
+
+    for (i = 0; i < global_state.nsessions; i++) {
+        ps = &pst->session[i];
+
+        if ((w = workers_assign_session(&ps->sess)) == NULL) {
+            errx(EXIT_FAILURE,
+                "%s: could not assign a new transmitter to a worker", __func__);
+        }
     }
 
     return workers_join_all();
@@ -3374,7 +3436,7 @@ main(int argc, char **argv)
     const char *addr = NULL;
     char *end, *progname, *tmp;
     uintmax_t n;
-    int ecode, i, opt, rc;
+    int ecode, i, opt, ninput, rc;
 
     if ((tmp = strdup(argv[0])) == NULL)
         err(EXIT_FAILURE, "%s: strdup", __func__);
@@ -3391,7 +3453,7 @@ main(int argc, char **argv)
     }
 
     const char *optstring =
-        (global_state.personality == get) ? "b:cn:r" : "cgn:r";
+        (global_state.personality == get) ? "b:cn:p:r" : "cgn:p:r";
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
@@ -3411,6 +3473,17 @@ main(int argc, char **argv)
             }
             global_state.nsessions = (size_t)n;
             break;
+        case 'p':
+            ninput = 0;
+            (void)sscanf(optarg, "%u - %u%n",
+                &global_state.processors.first, &global_state.processors.last,
+                &ninput);
+            if (optarg[ninput] != '\0')
+                errx(EXIT_FAILURE, "unexpected `-p` parameter `%s`", optarg);
+            if (INT_MAX < global_state.processors.first ||
+                INT_MAX < global_state.processors.last)
+                errx(EXIT_FAILURE, "unexpected `-p` parameter `%s`", optarg);
+            break;
         case 'g':
             global_state.contiguous = true;
             break;
@@ -3427,6 +3500,8 @@ main(int argc, char **argv)
 
     argc -= optind;
     argv += optind;
+
+    global_state.nextcpu = (int)global_state.processors.first;
 
     if (global_state.personality == put) {
         if (argc != 1)
