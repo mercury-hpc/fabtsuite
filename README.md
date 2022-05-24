@@ -14,7 +14,7 @@ a server or client personality, depending depending on the name by which
 it is invoked.  Invoked as `fget`, it is the test server, and as `fput`,
 the test client.
 
-`scripts/run-suite is the main test script.
+`scripts/run-suite` is the main test script.
 
 `doc/building.md` tells how to build the project.
 
