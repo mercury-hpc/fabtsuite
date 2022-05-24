@@ -18,3 +18,4 @@ the test client.
 
 `doc/building.md` tells how to build the project.
 
+`doc/tests.md` describes the tests in this suite.
