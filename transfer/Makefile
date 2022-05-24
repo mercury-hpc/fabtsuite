@@ -9,4 +9,7 @@ CC=gcc
 SRCS=fget.c
 WARNS=4
 
+all: fget
+	@$(LN) -sf fget fput
+
 .include <mkc.prog.mk>
