@@ -1,5 +1,5 @@
-# Questions related to dynamic assignment of endpoints/completion queues
-  to threads.
+# Outstanding questions related to dynamic assignment of
+  endpoints/completion queues to threads.
 
 Can one completion queue belong to more than one poll set?
 Probably not.  Documentation is silent on this point.
