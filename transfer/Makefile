@@ -1,9 +1,13 @@
 PROG=fget
 
-CPPFLAGS+=-I$(HOME)/wrk/install/libfabric-1.15.0/include
+LIBFABRIC_INCFLAGS!=pkg-config --cflags-only-I libfabric
+LIBFABRIC_CFLAGS!=pkg-config --cflags-only-other libfabric
+LIBFABRIC_LIBDIR!=pkg-config --libs libfabric
+CPPFLAGS+=$(LIBFABRIC_INCFLAGS)
 CPPFLAGS+=-D_GNU_SOURCE
 CPPFLAGS+=-D_POSIX_C_SOURCE=200809L
-LDADD+=-pthread -L$(HOME)/wrk/install/libfabric-1.15.0/lib -lfabric
+LDADD+=-pthread $(LIBFABRIC_LIBDIR)
+CFLAGS+=$(LIBFABRIC_CFLAGS)
 CFLAGS+=-gdwarf-4 -std=c11 # -O3
 CC=gcc
 SRCS=fget.c
