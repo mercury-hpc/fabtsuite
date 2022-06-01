@@ -1466,8 +1466,7 @@ rcvr_loop(worker_t *w, session_t *s)
         goto fail;
 
     if (r->cxn.cancelled) {
-        if (fifo_empty(r->progress.posted) &&
-            fifo_empty(r->vec.posted)) {
+        if (fifo_empty(r->progress.posted) && fifo_empty(r->vec.posted)) {
             if ((rc = fi_close(&r->cxn.ep->fid)) < 0)
                 bailout_for_ofi_ret(rc, "fi_close");
             hlog_fast(close, "%s: closed.", __func__);
@@ -2184,8 +2183,7 @@ xmtr_loop(worker_t *w, session_t *s)
     txctl_transmit(&x->cxn, &x->progress);
 
     if (!(s->terminal->eof && fifo_empty(s->ready_for_cxn) &&
-        fifo_empty(x->wrposted) && x->bytes_progress == 0 &&
-        x->cxn.eof.local))
+        fifo_empty(x->wrposted) && x->bytes_progress == 0 && x->cxn.eof.local))
         return loop_continue;
 
     /* Hunt for remote EOF. */
