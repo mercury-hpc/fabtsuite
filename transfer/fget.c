@@ -1545,21 +1545,11 @@ xmtr_ack_rx_process(xmtr_t *x, completion_t *cmpl)
     if (cmpl->len != sizeof(x->ack.msg))
         errx(EXIT_FAILURE, "%s: ack is incorrect size", __func__);
 
-#if 0
-    fi_addr_t oaddr = x->cxn.peer_addr;
-#endif
     rc = fi_av_insert(x->cxn.av, x->ack.msg.addr, 1, &x->cxn.peer_addr,
         0, NULL);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p", x->ack.msg.addr);
-
-#if 0
-    rc = fi_av_remove(x->cxn.av, &oaddr, 1, 0);
-
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_av_remove old dest_addr");
-#endif
 
     while (!fifo_full(x->vec.posted)) {
         vecbuf_t *vb = vecbuf_alloc();
@@ -3597,10 +3587,8 @@ main(int argc, char **argv)
         ? 1
         : global_state.info->tx_attr->rma_iov_limit;
 
-#if 0
-    hlog_fast(params, "maximum endpoint message size (RMA limit) %zu",
+    hlog_fast(params, "maximum endpoint message size (RMA limit) 0x%zx",
         global_state.info->ep_attr->max_msg_size);
-#endif
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_domain");
