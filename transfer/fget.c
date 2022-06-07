@@ -62,6 +62,7 @@ typedef struct progress_msg {
 typedef enum {
   xft_ack
 , xft_fragment
+, xft_initial
 , xft_progress
 , xft_rdma_write
 , xft_vector
@@ -192,6 +193,14 @@ struct cxn {
     fi_addr_t peer_addr;
     struct fid_cq *cq;
     struct fid_av *av;
+    session_t *parent;  // pointer to the connection's current session_t
+    bool sent_first;    /* receiving: set to `true` once this receiver sends an
+                         * acknowledgement for the transmitter's original
+                         * message
+                         *
+                         * transmitting: set to `true` once this transmitter
+                         * sends an initial message to its peer
+                         */
     bool cancelled;
     bool started;
     /* Receiver needs to send an empty vector.msg.niovs == 0 to close,
@@ -221,6 +230,7 @@ typedef struct {
     uint64_t nfull;
     fifo_t *tgtposted; // posted RDMA target buffers in order of issuance
     struct {
+        xfer_context_t xfc;
         struct iovec iov[12];
         void *desc[12];
         struct fid_mr *mr[12];
@@ -238,10 +248,6 @@ typedef struct {
     } initial;
     txctl_t vec;
     rxctl_t progress;
-    bool sent_ack;   /* set to `true` once this receiver sends an
-                      * acknowledgement for the transmitter's original
-                      * message
-                      */
 } rcvr_t;
 
 typedef struct {
@@ -251,6 +257,7 @@ typedef struct {
     rxctl_t vec;
     txctl_t progress;
     struct {
+        xfer_context_t xfc;
         void *desc;
         struct fid_mr *mr;
         initial_msg_t msg;
@@ -279,9 +286,6 @@ typedef struct {
     size_t nriovs;
     size_t next_riov;
     bool phase;
-    bool sent_initial;   /* set to `true` once this transmitter sends an
-                          * initial message to its peer
-                          */
     bool rcvd_ack;      /* set to `true` once this transmitter receives
                          * an acknowledgement from its peer for the initial
                          * message
@@ -399,6 +403,7 @@ HLOG_OUTLET_SHORT_DEFN(write, all);
 HLOG_OUTLET_SHORT_DEFN(rxctl, all);
 HLOG_OUTLET_SHORT_DEFN(protocol, all);
 HLOG_OUTLET_SHORT_DEFN(txctl, all);
+HLOG_OUTLET_SHORT_DEFN(txdefer, all);
 HLOG_OUTLET_SHORT_DEFN(memreg, all);
 HLOG_OUTLET_SHORT_DEFN(msg, all);
 HLOG_OUTLET_SHORT_DEFN(payverify, all);
@@ -1098,6 +1103,7 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
             (void)fifo_get(tc->ready);
             (void)fifo_put(tc->posted, h);
         } else if (rc == -FI_EAGAIN) {
+            hlog_fast(txdefer, "%s: deferred transmission", __func__);
             break;
         } else if (rc < 0) {
             bailout_for_ofi_ret(rc, "fi_sendmsg");
@@ -1326,6 +1332,9 @@ rcvr_cq_process(rcvr_t *r)
     case xft_vector:
         hlog_fast(completion, "%s: read a vector tx completion", __func__);
         return txctl_complete(&r->vec, &cmpl);
+    case xft_ack:
+        hlog_fast(completion, "%s: read an ack tx completion", __func__);
+        return 1;
     default:
         hlog_fast(completion, "%s: unexpected xfer context type", __func__);
         return -1;
@@ -1421,22 +1430,32 @@ rcvr_targets_read(session_t *s, rcvr_t *r)
 static loop_control_t
 rcvr_ack_send(rcvr_t *r)
 {
+    xfer_context_t *xfc = &r->ack.xfc;
+
+    xfc->type = xft_ack;
+    xfc->owner = xfo_nic;
+    xfc->place = xfp_first | xfp_last;
+    xfc->nchildren = 0;
+    xfc->cancelled = 0;
+
     const int rc = fi_sendmsg(r->cxn.ep, &(struct fi_msg){
           .msg_iov = r->ack.iov
         , .desc = r->ack.desc
         , .iov_count = r->ack.niovs
         , .addr = r->cxn.peer_addr
-        , .context = NULL
+        , .context = xfc
         , .data = 0
-        }, 0);
+        }, FI_COMPLETION);
 
-    if (rc == -FI_EAGAIN)
+    if (rc == -FI_EAGAIN) {
+        hlog_fast(txdefer, "%s: deferred transmission", __func__);
         return loop_continue;
+    }
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_sendmsg");
 
-    r->sent_ack = true;
+    r->cxn.sent_first = true;
     return loop_end;
 }
 
@@ -1448,7 +1467,7 @@ rcvr_loop(worker_t *w, session_t *s)
     int rc;
     loop_control_t ctl;
 
-    switch (r->sent_ack ? loop_end : rcvr_ack_send(r)) {
+    switch (r->cxn.sent_first ? loop_end : rcvr_ack_send(r)) {
     case loop_end:
         break;
     case loop_continue:
@@ -1510,23 +1529,33 @@ fail:
 static loop_control_t
 xmtr_initial_send(xmtr_t *x)
 {
+    xfer_context_t *xfc = &x->initial.xfc;
+
+    xfc->type = xft_initial;
+    xfc->owner = xfo_nic;
+    xfc->place = xfp_first | xfp_last;
+    xfc->nchildren = 0;
+    xfc->cancelled = 0;
+
     const int rc = fi_sendmsg(x->cxn.ep, &(struct fi_msg){
           .msg_iov = &(struct iovec){.iov_base = &x->initial.msg,
                                      .iov_len = sizeof(x->initial.msg)}
         , .desc = &x->initial.desc
         , .iov_count = 1
         , .addr = x->cxn.peer_addr
-        , .context = NULL
+        , .context = xfc
         , .data = 0
-        }, 0);
+        }, FI_COMPLETION);
 
-    if (rc == -FI_EAGAIN)
+    if (rc == -FI_EAGAIN) {
+        hlog_fast(txdefer, "%s: deferred transmission", __func__);
         return loop_continue;
+    }
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_sendmsg");
 
-    x->sent_initial = true;
+    x->cxn.sent_first = true;
     return loop_end;
 }
 
@@ -1914,6 +1943,9 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
     case xft_ack:
         hlog_fast(completion, "%s: read an ack rx completion", __func__);
         return xmtr_ack_rx_process(x, &cmpl);
+    case xft_initial:
+        hlog_fast(completion, "%s: read an initial tx completion", __func__);
+        return 1;
     default:
         hlog_fast(completion, "%s: unexpected xfer context type", __func__);
         return -1;
@@ -2131,7 +2163,7 @@ xmtr_loop(worker_t *w, session_t *s)
     xmtr_t *x = (xmtr_t *)s->cxn;
     ssize_t rc;
 
-    switch (x->sent_initial ? loop_end : xmtr_initial_send(x)) {
+    switch (x->cxn.sent_first ? loop_end : xmtr_initial_send(x)) {
     case loop_end:
         break;
     case loop_continue:
@@ -2298,12 +2330,11 @@ worker_run_loop(worker_t *self)
                 break;
             }
 
+            c->parent = NULL;
             *cp = NULL;
 
-            if ((rc = fi_poll_del(self->pollset[half], &c->cq->fid, 0)) != 0) {
-                warn_about_ofi_ret(rc, "fi_poll_del");
-                continue;
-            }
+            if ((rc = fi_poll_del(self->pollset[half], &c->cq->fid, 0)) != 0)
+                bailout_for_ofi_ret(rc, "fi_poll_del");
             atomic_fetch_add_explicit(&self->nsessions[half], -1,
                 memory_order_relaxed);
         }
@@ -2605,13 +2636,12 @@ worker_assign_session(worker_t *w, session_t *s)
                 continue;
 
             rc = fi_poll_add(w->pollset[half], &s->cxn->cq->fid, 0);
-            if (rc != 0) {
-                warn_about_ofi_ret(rc, "fi_poll_add");
-                continue;
-            }
+            if (rc != 0)
+                bailout_for_ofi_ret(rc, "fi_poll_add");
             atomic_fetch_add_explicit(&w->nsessions[half], 1,
                 memory_order_relaxed);
             *slot = *s;
+            s->cxn->parent = slot;
             (void)pthread_mutex_unlock(mtx);
             return true;
         }
@@ -2731,6 +2761,7 @@ cxn_init(cxn_t *c, struct fid_av *av,
     memset(c, 0, sizeof(*c));
     c->loop = loop;
     c->av = av;
+    c->sent_first = false;
     c->started = false;
     c->cancelled = false;
     c->eof.local = c->eof.remote = false;
@@ -3074,7 +3105,8 @@ get_session_accept(get_state_t *gst)
     if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.eq->fid, 0)) < 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
-    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &r->cxn.cq, NULL)) != 0)
+    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &r->cxn.cq,
+                         &r->cxn)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
     if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.cq->fid,
@@ -3280,7 +3312,8 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
                           NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
-    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &x->cxn.cq, NULL)) != 0)
+    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &x->cxn.cq,
+                         &x->cxn)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
     if ((rc = fi_eq_open(global_state.fabric, &eq_attr, &x->cxn.eq, NULL)) != 0)
