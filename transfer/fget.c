@@ -1556,7 +1556,7 @@ xmtr_initial_send(xmtr_t *x)
         bailout_for_ofi_ret(rc, "fi_sendmsg");
 
     x->cxn.sent_first = true;
-    return loop_end;
+    return loop_continue;
 }
 
 static loop_control_t
@@ -2163,25 +2163,8 @@ xmtr_loop(worker_t *w, session_t *s)
     xmtr_t *x = (xmtr_t *)s->cxn;
     ssize_t rc;
 
-    switch (x->cxn.sent_first ? loop_end : xmtr_initial_send(x)) {
-    case loop_end:
-        break;
-    case loop_continue:
-        if (xmtr_cq_process(x, s, global_state.reregister) == -1)
-            goto fail;
-        return loop_continue;
-    default:
-        goto fail;
-    }
-
-    if (!x->cxn.started)
-        return xmtr_start(w, s);
-
     if (xmtr_cq_process(x, s, global_state.reregister) == -1)
         goto fail;
-
-    if (!x->rcvd_ack)
-        return loop_continue;
 
     if (x->cxn.cancelled) {
         if (fifo_empty(x->progress.posted) &&
@@ -2200,6 +2183,15 @@ xmtr_loop(worker_t *w, session_t *s)
         x->cxn.cancelled = true;
         return loop_continue;
     }
+
+    if (!x->cxn.sent_first)
+        return xmtr_initial_send(x);
+
+    if (!x->cxn.started)
+        return xmtr_start(w, s);
+
+    if (!x->rcvd_ack)
+        return loop_continue;
 
     xmtr_vecbuf_unload(x);
 
