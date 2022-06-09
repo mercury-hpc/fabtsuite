@@ -2242,6 +2242,23 @@ cxn_loop(worker_t *w, session_t *s)
 }
 
 static void
+sessions_swap(session_t *r, session_t *s)
+{
+    session_t tmp;
+
+    if (r == s)
+        return;
+
+    tmp = *r;
+    *r = *s;
+    if (r->cxn != NULL)
+        r->cxn->parent = r;
+    *s = tmp;
+    if (s->cxn != NULL)
+        s->cxn->parent = s;
+}
+
+static void
 worker_run_loop(worker_t *self)
 {
     size_t half, i;
