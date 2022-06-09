@@ -384,6 +384,7 @@ typedef struct {
     bool contiguous;
     bool expect_cancellation;
     bool reregister;
+    bool waitfd;
     size_t nsessions;
     personality_t personality;
     int nextcpu;
