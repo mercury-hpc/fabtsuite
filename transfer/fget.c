@@ -2266,27 +2266,27 @@ worker_run_loop(worker_t *self)
     for (half = 0; half < 2; half++) {
         void *context[WORKER_SESSIONS_MAX];
         pthread_mutex_t *mtx = &self->mtx[half];
-        int rc;
+        int ncontexts, rc;
 
         if (pthread_mutex_trylock(mtx) == EBUSY)
             continue;
 
-        rc = fi_poll(self->pollset[half], context, WORKER_SESSIONS_MAX);
+        ncontexts = fi_poll(self->pollset[half], context, WORKER_SESSIONS_MAX);
 
-        if (rc < 0) {
+        if (ncontexts < 0) {
             (void)pthread_mutex_unlock(mtx);
-            bailout_for_ofi_ret(rc, "fi_poll");
+            bailout_for_ofi_ret(ncontexts, "fi_poll");
         }
 
         load_t *load = &self->load;
 
-        if (rc > load->max_loop_contexts)
-            load->max_loop_contexts = rc;
+        if (ncontexts > load->max_loop_contexts)
+            load->max_loop_contexts = ncontexts;
 
-        if (rc < load->min_loop_contexts)
-            load->min_loop_contexts = rc;
+        if (ncontexts < load->min_loop_contexts)
+            load->min_loop_contexts = ncontexts;
 
-        load->ctxs_serviced_since_mark += rc;
+        load->ctxs_serviced_since_mark += ncontexts;
 
         if (load->loops_since_mark < UINT16_MAX) {
             load->loops_since_mark++;
@@ -2311,19 +2311,111 @@ worker_run_loop(worker_t *self)
             load->min_loop_contexts = INT_MAX;
         }
 
-        /* Find a non-empty session slot and go once through
-         * connection & terminal loops.
+        session_t *session_half =
+            &self->session[half * arraycount(self->session) / 2];
+
+        for (i = 0; i < ncontexts; i++) {
+            cxn_t *c = context[i];
+            assert(c != NULL);
+
+            session_t *s = c->parent;
+            assert(s != NULL);
+
+            ptrdiff_t sess_idx = s - session_half;
+
+            assert(0 <= sess_idx && sess_idx < arraycount(self->session) / 2);
+
+            sessions_swap(s, &session_half[i]);
+        }
+
+        session_t *ready_up_to = &session_half[ncontexts];
+
+        for (i = ready_up_to - session_half;
+             i < arraycount(self->session) / 2;
+             i++) {
+            session_t *s = &session_half[i];
+            cxn_t *c = s->cxn;
+
+            // skip empty slots
+            if (c == NULL)
+                continue;
+
+            if (c->sent_first && fifo_empty(s->ready_for_terminal) &&
+                !cancelled)
+                continue;
+
+            sessions_swap(s, ready_up_to);
+            ready_up_to++;
+        }
+
+        session_t *active_up_to = ready_up_to;
+
+        /* Move active session slots (i.e., s->cxn != NULL) to front
+         * so that inactive slots are consecutive at the end of
+         * the self->session[] half.  Point `active_up_to` at
+         * the first inactive slot or, if there are no inactive
+         * slots, point it one past the end of the session[] half.
          */
-        for (i = 0; i < arraycount(self->session) / 2; i++) {
+        for (i = active_up_to - session_half;
+             i < arraycount(self->session) / 2;
+             i++) {
+            session_t *s = &session_half[i];
+
+            // skip empty (inactive) slots
+            if (s->cxn == NULL)
+                continue;
+
+            sessions_swap(s, active_up_to);
+            active_up_to++;
+        }
+
+#if 1
+        session_t *ready_from = session_half;
+        bool stole = false;
+#else
+        session_t *ready_from;
+        bool stole;
+
+        /* TBD If
+         * `ready_up_to == session_half`,
+         * then choose a second worker at random and ask for it to
+         * fill inactive session slots, if there are any.
+         */
+
+        if (ready_up_to == session_half &&
+            active_up_to - session_half < arraycount(self->session) / 2) {
+            worker_steal(self, active_up_to,
+                arraycount(self->session) / 2 - (active_up_to - session_half),
+                &ready_up_to);
+            stole = true;
+        } else {
+            ready_from = session_half;
+            stole = false;
+        }
+#endif
+
+        /* Service ready session slots. */
+        for (i = ready_from - session_half;
+             i < ready_up_to - session_half;
+             i++) {
             session_t *s;
             cxn_t *c, **cp;
 
-            s = &self->session[half * arraycount(self->session) / 2 + i];
+            s = &session_half[i];
+
+            if (s == ready_up_to) {
+                assert(i >= ncontexts);
+                break;
+            }
+
             cp = &s->cxn;
 
-            // skip empty slots
-            if ((c = *cp) == NULL)
-                continue;
+            c = *cp;
+            assert(c != NULL);
+
+            assert(stole || i < ncontexts ||
+                   !c->sent_first || !fifo_empty(s->ready_for_terminal) ||
+                   cancelled);
 
             // continue at next cxn_t if `c` did not exit
             switch (cxn_loop(self, s)) {
