@@ -3579,8 +3579,14 @@ main(int argc, char **argv)
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
+        case 'b':
+            addr = optarg;
+            break;
         case 'c':
             global_state.expect_cancellation = true;
+            break;
+        case 'g':
+            global_state.contiguous = true;
             break;
         case 'n':
             errno = 0;
@@ -3606,14 +3612,8 @@ main(int argc, char **argv)
                 INT_MAX < global_state.processors.last)
                 errx(EXIT_FAILURE, "unexpected `-p` parameter `%s`", optarg);
             break;
-        case 'g':
-            global_state.contiguous = true;
-            break;
         case 'r':
             global_state.reregister = true;
-            break;
-        case 'b':
-            addr = optarg;
             break;
         default:
             usage(global_state.personality, progname);
