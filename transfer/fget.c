@@ -3117,7 +3117,7 @@ get_session_accept(get_state_t *gst)
       .size = 128
     , .flags = 0
     , .format = FI_CQ_FORMAT_MSG
-    , .wait_obj = FI_WAIT_UNSPEC
+    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC
     , .signaling_vector = 0
     , .wait_cond = FI_CQ_COND_NONE
     , .wait_set = NULL
@@ -3286,7 +3286,7 @@ get_state_open(void)
       .size = 128
     , .flags = 0
     , .format = FI_CQ_FORMAT_MSG
-    , .wait_obj = FI_WAIT_UNSPEC
+    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC
     , .signaling_vector = 0
     , .wait_cond = FI_CQ_COND_NONE
     , .wait_set = NULL
@@ -3395,7 +3395,7 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
       .size = 128
     , .flags = 0
     , .format = FI_CQ_FORMAT_MSG
-    , .wait_obj = FI_WAIT_UNSPEC
+    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC
     , .signaling_vector = 0
     , .wait_cond = FI_CQ_COND_NONE
     , .wait_set = NULL
@@ -3537,10 +3537,13 @@ personality_to_name(personality_t p)
 static void
 usage(personality_t personality, const char *progname)
 {
-    if (personality == put)
-        fprintf(stderr, "usage: %s [-r] [-g] <address>\n", progname);
-    else
-        fprintf(stderr, "usage: %s [-b <address>] [-r]\n", progname);
+    const char *common = "[-n] [-p 'i - j' ] [-r] [-w]";
+
+    if (personality == put) {
+        fprintf(stderr, "usage: %s [-c] [-g] %s <address>\n", progname, common);
+    } else {
+        fprintf(stderr, "usage: %s [-b <address>] [-c] %s\n", progname, common);
+    }
 
     exit(EXIT_FAILURE);
 }
@@ -3576,7 +3579,7 @@ main(int argc, char **argv)
     }
 
     const char *optstring =
-        (global_state.personality == get) ? "b:cn:p:r" : "cgn:p:r";
+        (global_state.personality == get) ? "b:cn:p:rw" : "cgn:p:rw";
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
@@ -3615,6 +3618,9 @@ main(int argc, char **argv)
             break;
         case 'r':
             global_state.reregister = true;
+            break;
+        case 'w':
+            global_state.waitfd = true;
             break;
         default:
             usage(global_state.personality, progname);
