@@ -399,7 +399,7 @@ HLOG_OUTLET_SHORT_DEFN(close, all);
 HLOG_OUTLET_SHORT_DEFN(signal, all);
 HLOG_OUTLET_SHORT_DEFN(params, all);
 HLOG_OUTLET_SHORT_DEFN(tx_start, all);
-HLOG_OUTLET_SHORT_DEFN(cxn_loop, all);
+HLOG_OUTLET_SHORT_DEFN(session_loop, all);
 HLOG_OUTLET_SHORT_DEFN(write, all);
 HLOG_OUTLET_SHORT_DEFN(rxctl, all);
 HLOG_OUTLET_SHORT_DEFN(protocol, all);
@@ -1113,9 +1113,8 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
 }
 
 static loop_control_t
-rcvr_start(worker_t *w, session_t *s)
+rcvr_start(worker_t *w, rcvr_t *r, fifo_t *ready_for_cxn)
 {
-    rcvr_t *r = (rcvr_t *)s->cxn;
     size_t nleftover, nloaded;
 
     r->cxn.started = true;
@@ -1137,7 +1136,7 @@ rcvr_start(worker_t *w, session_t *s)
         b->hdr.nused = minsize(nleftover, b->hdr.nallocated);
         nleftover -= b->hdr.nused;
         nloaded += b->hdr.nused;
-        if (!fifo_put(s->ready_for_cxn, &b->hdr)) {
+        if (!fifo_put(ready_for_cxn, &b->hdr)) {
             hlog_fast(err, "%s: could not enqueue tx buffer", __func__);
             return loop_error;
         }
@@ -1343,7 +1342,7 @@ rcvr_cq_process(rcvr_t *r)
 }
 
 static void
-rcvr_vector_update(session_t *s, rcvr_t *r)
+rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
 {
     bufhdr_t *h;
     vecbuf_t *vb;
@@ -1361,12 +1360,12 @@ rcvr_vector_update(session_t *s, rcvr_t *r)
         (void)fifo_put(r->vec.ready, &vb->hdr);
         r->cxn.eof.local = true;
         hlog_fast(protocol, "%s: enqueued local EOF", __func__);
-    } else while (!fifo_full(r->vec.ready) && !fifo_empty(s->ready_for_cxn) &&
+    } else while (!fifo_full(r->vec.ready) && !fifo_empty(ready_for_cxn) &&
            (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
 
         for (i = 0;
              i < arraycount(vb->msg.iov) &&
-                 (h = fifo_get(s->ready_for_cxn)) != NULL;
+                 (h = fifo_get(ready_for_cxn)) != NULL;
              i++) {
 
             h->nused = 0;
@@ -1390,14 +1389,14 @@ rcvr_vector_update(session_t *s, rcvr_t *r)
 }
 
 static void
-rcvr_targets_read(session_t *s, rcvr_t *r)
+rcvr_targets_read(fifo_t *ready_for_terminal, rcvr_t *r)
 {
     bufhdr_t *h;
     int rc;
 
     while (r->nfull > 0 &&
           (h = fifo_peek(r->tgtposted)) != NULL &&
-          !fifo_full(s->ready_for_terminal)) {
+          !fifo_full(ready_for_terminal)) {
         if (h->nused + r->nfull < h->nallocated) {
             h->nused += r->nfull;
             r->nfull = 0;
@@ -1409,7 +1408,7 @@ rcvr_targets_read(session_t *s, rcvr_t *r)
             if (global_state.reregister && (rc = fi_close(&h->mr->fid)) != 0)
                 warn_about_ofi_ret(rc, "fi_close");
 
-            (void)fifo_put(s->ready_for_terminal, h);
+            (void)fifo_put(ready_for_terminal, h);
         }
     }
 
@@ -1424,7 +1423,7 @@ rcvr_targets_read(session_t *s, rcvr_t *r)
         if (global_state.reregister && (rc = fi_close(&h->mr->fid)) != 0)
             warn_about_ofi_ret(rc, "fi_close");
 
-        (void)fifo_put(s->ready_for_terminal, h);
+        (void)fifo_put(ready_for_terminal, h);
     }
 }
 
@@ -1466,24 +1465,23 @@ rcvr_loop(worker_t *w, session_t *s)
     rcvr_t *r = (rcvr_t *)s->cxn;
     terminal_t *t = s->terminal;
     int rc;
-    loop_control_t ctl;
 
     switch (r->cxn.sent_first ? loop_end : rcvr_ack_send(r)) {
     case loop_end:
         break;
     case loop_continue:
         if (rcvr_cq_process(r) == -1)
-            goto fail;
+            return loop_error;
         return loop_continue;
     default:
-        goto fail;
+        return loop_error;
     }
 
     if (!r->cxn.started)
-        return rcvr_start(w, s);
+        return rcvr_start(w, r, s->ready_for_cxn);
 
     if (rcvr_cq_process(r) == -1)
-        goto fail;
+        return loop_error;
 
     if (r->cxn.cancelled) {
         if (fifo_empty(r->progress.posted) && fifo_empty(r->vec.posted)) {
@@ -1500,31 +1498,20 @@ rcvr_loop(worker_t *w, session_t *s)
         return loop_continue;
     }
 
-    ctl = sink_trade(t, s->ready_for_terminal, s->ready_for_cxn);
+    if (t->trade(t, s->ready_for_terminal, s->ready_for_cxn) == loop_error)
+        return loop_error;
 
-    if (ctl == loop_error)
-        goto fail;
-
-    rcvr_vector_update(s, r);
+    rcvr_vector_update(s->ready_for_cxn, r);
 
     txctl_transmit(&r->cxn, &r->vec);
 
-    rcvr_targets_read(s, r);
+    rcvr_targets_read(s->ready_for_terminal, r);
 
     if (t->eof && fifo_empty(s->ready_for_terminal) &&
-        r->cxn.eof.remote && r->cxn.eof.local &&
-        fifo_empty(r->vec.posted)) {
-        if ((rc = fi_close(&r->cxn.ep->fid)) < 0)
-            bailout_for_ofi_ret(rc, "fi_close");
-        hlog_fast(close, "%s: closed.", __func__);
+        r->cxn.eof.remote && r->cxn.eof.local && fifo_empty(r->vec.posted))
         return loop_end;
-    }
+
     return loop_continue;
-fail:
-    if ((rc = fi_close(&r->cxn.ep->fid)) < 0)
-        bailout_for_ofi_ret(rc, "fi_close");
-    hlog_fast(close, "%s: closed.", __func__);
-    return loop_error;
 }
 
 static loop_control_t
@@ -1598,20 +1585,18 @@ xmtr_ack_rx_process(xmtr_t *x, completion_t *cmpl)
 }
 
 static loop_control_t
-xmtr_start(worker_t *w, session_t *s)
+xmtr_start(worker_t *w, xmtr_t *x, fifo_t *ready_for_terminal)
 {
-    xmtr_t *x = (xmtr_t *)s->cxn;
-
     x->cxn.started = true;
 
-    while (!fifo_full(s->ready_for_terminal)) {
+    while (!fifo_full(ready_for_terminal)) {
         bytebuf_t *b = worker_payload_txbuf_get(w);
 
         if (b == NULL)
             errx(EXIT_FAILURE, "%s: could not get a buffer", __func__);
 
         b->hdr.nused = 0;
-        if (!fifo_put(s->ready_for_terminal, &b->hdr))
+        if (!fifo_put(ready_for_terminal, &b->hdr))
             errx(EXIT_FAILURE, "%s: could not enqueue tx buffer", __func__);
     }
 
@@ -1836,7 +1821,7 @@ xmtr_vector_rx_process(xmtr_t *x, const completion_t *cmpl)
  * any completion occurred, -1 on an irrecoverable error.
  */
 static int
-xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
+xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
 {
     struct fi_cq_msg_entry fcmpl;
     completion_t cmpl;
@@ -1902,10 +1887,10 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
             hlog_fast(err, "%s: no RDMA-write completions expected", __func__);
             return -1;
         }
-        /* XXX This can fail if `s->ready_for_terminal` ever fills
+        /* XXX This can fail if `ready_for_terminal` ever fills
          * to capacity, in the loop below.  That should not happen
          * unless we accidentally put more buffers into circulation
-         * than there are slots in `s->ready_for_terminal`.
+         * than there are slots in `ready_for_terminal`.
          */
         if ((h->xfc.place & xfp_first) == 0) {
             hlog_fast(err, "%s: expected `first` context at head", __func__);
@@ -1926,7 +1911,7 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
                h->xfc.owner == xfo_program &&
                h->xfc.type == xft_rdma_write &&
                h->xfc.nchildren == 0 &&
-               !fifo_full(s->ready_for_terminal)) {
+               !fifo_full(ready_for_terminal)) {
             int rc;
 
             (void)fifo_get(x->wrposted);
@@ -1935,7 +1920,7 @@ xmtr_cq_process(xmtr_t *x, session_t *s, bool reregister)
                 warn_about_ofi_ret(rc, "fi_close");
 
             x->bytes_progress += h->nused;
-            (void)fifo_put(s->ready_for_terminal, h);
+            (void)fifo_put(ready_for_terminal, h);
         }
         return 1;
     case xft_progress:
@@ -1995,7 +1980,7 @@ xmtr_buf_split(xmtr_t *x, bufhdr_t *parent, size_t len)
  * Tx buffer.
  */
 static loop_control_t
-xmtr_targets_write(session_t *s, xmtr_t *x)
+xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
 {
     bufhdr_t *first_h, *h, *head, *last_h = NULL;
     const size_t maxriovs = minsize(global_state.rma_maxsegs, x->nriovs);
@@ -2012,7 +1997,7 @@ xmtr_targets_write(session_t *s, xmtr_t *x)
 
     for (i = 0, total = 0, first_h = last_h = NULL;
          i < maxriovs &&
-             (head = fifo_peek(s->ready_for_cxn)) != NULL &&
+             (head = fifo_peek(ready_for_cxn)) != NULL &&
              total < maxbytes && !fifo_full(x->wrposted);
          i++, last_h = h, total += len) {
         const bool oversize_load =
@@ -2045,7 +2030,7 @@ xmtr_targets_write(session_t *s, xmtr_t *x)
         if (oversize_load) {
             h = xmtr_buf_split(x, head, len);
         } else {
-            (void)fifo_get(s->ready_for_cxn);
+            (void)fifo_get(ready_for_cxn);
             h = head;
         }
 
@@ -2115,7 +2100,7 @@ xmtr_targets_write(session_t *s, xmtr_t *x)
 }
 
 static void
-xmtr_progress_update(session_t *s, xmtr_t *x)
+xmtr_progress_update(fifo_t *ready_for_cxn, bool terminal_eof, xmtr_t *x)
 {
     progbuf_t *pb;
 
@@ -2124,8 +2109,8 @@ xmtr_progress_update(session_t *s, xmtr_t *x)
      * (!x->cxn.eof.local), then send nleftover == 0; on a successful
      * transmission, set x->cxn.eof.local to true.
      */
-    bool reached_eof = (s->terminal->eof &&
-        fifo_empty(s->ready_for_cxn) && fifo_empty(x->wrposted) &&
+    bool reached_eof = (terminal_eof &&
+        fifo_empty(ready_for_cxn) && fifo_empty(x->wrposted) &&
         !x->cxn.eof.local);
 
     if (x->bytes_progress == 0 && !reached_eof)
@@ -2162,10 +2147,12 @@ xmtr_loop(worker_t *w, session_t *s)
 {
     vecbuf_t *vb;
     xmtr_t *x = (xmtr_t *)s->cxn;
+    terminal_t *t = s->terminal;
     ssize_t rc;
 
-    if (xmtr_cq_process(x, s, global_state.reregister) == -1)
-        goto fail;
+    if (xmtr_cq_process(x, s->ready_for_terminal,
+                        global_state.reregister) == -1)
+        return loop_error;
 
     if (x->cxn.cancelled) {
         if (fifo_empty(x->progress.posted) &&
@@ -2189,25 +2176,24 @@ xmtr_loop(worker_t *w, session_t *s)
         return xmtr_initial_send(x);
 
     if (!x->cxn.started)
-        return xmtr_start(w, s);
+        return xmtr_start(w, x, s->ready_for_terminal);
 
     if (!x->rcvd_ack)
         return loop_continue;
 
     xmtr_vecbuf_unload(x);
 
-    if (source_trade(s->terminal, s->ready_for_terminal, s->ready_for_cxn) ==
-        loop_error)
-        goto fail;
+    if (t->trade(t, s->ready_for_terminal, s->ready_for_cxn) == loop_error)
+        return loop_error;
 
-    if (xmtr_targets_write(s, x) == loop_error)
-        goto fail;
+    if (xmtr_targets_write(s->ready_for_cxn, x) == loop_error)
+        return loop_error;
 
-    xmtr_progress_update(s, x);
+    xmtr_progress_update(s->ready_for_cxn, s->terminal->eof, x);
 
     txctl_transmit(&x->cxn, &x->progress);
 
-    if (!(s->terminal->eof && fifo_empty(s->ready_for_cxn) &&
+    if (!(t->eof && fifo_empty(s->ready_for_cxn) &&
         fifo_empty(x->wrposted) && x->bytes_progress == 0 && x->cxn.eof.local))
         return loop_continue;
 
@@ -2220,26 +2206,34 @@ xmtr_loop(worker_t *w, session_t *s)
         vecbuf_free(vb);
     }
 
-    if (x->cxn.eof.remote && fifo_empty(x->progress.posted)) {
-        if ((rc = fi_close(&x->cxn.ep->fid)) < 0)
-            bailout_for_ofi_ret(rc, "fi_close");
-        hlog_fast(close, "%s: closed.", __func__);
+    if (x->cxn.eof.remote && fifo_empty(x->progress.posted))
         return loop_end;
-    }
 
     return loop_continue;
-fail:
-    if ((rc = fi_close(&x->cxn.ep->fid)) < 0)
-        bailout_for_ofi_ret(rc, "fi_close");
-    hlog_fast(close, "%s: closed.", __func__);
-    return loop_error;
 }
 
 static loop_control_t
 cxn_loop(worker_t *w, session_t *s)
 {
-    hlog_fast(cxn_loop, "%s: going around", __func__);
-    return s->cxn->loop(w, s);
+    int rc;
+    cxn_t *cxn = s->cxn;
+    loop_control_t ctl;
+
+    hlog_fast(session_loop, "%s: going around", __func__);
+
+    if ((ctl = cxn->loop(w, s)) == loop_error || ctl == loop_end) {
+        if ((rc = fi_close(&cxn->ep->fid)) < 0)
+            bailout_for_ofi_ret(rc, "fi_close");
+        hlog_fast(close, "%s: closed.", __func__);
+    }
+    return ctl;
+}
+
+static loop_control_t
+session_loop(worker_t *w, session_t *s)
+{
+    // TBD trade with terminal
+    return cxn_loop(w, s);
 }
 
 static void
@@ -2419,7 +2413,7 @@ worker_run_loop(worker_t *self)
                    cancelled);
 
             // continue at next cxn_t if `c` did not exit
-            switch (cxn_loop(self, s)) {
+            switch (session_loop(self, s)) {
             case loop_continue:
                 continue;
             case loop_end:
