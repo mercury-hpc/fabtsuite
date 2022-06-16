@@ -2452,6 +2452,10 @@ worker_run_loop(worker_t *self)
 
         session_t *active_up_to = ready_up_to;
 
+        /*
+         * TBD change terminology to `occupied` and `empty` slots.
+         */
+
         /* Move active session slots (i.e., s->cxn != NULL) to front
          * so that inactive slots are consecutive at the end of
          * the self->session[] half.  Point `active_up_to` at
