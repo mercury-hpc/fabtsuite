@@ -2354,6 +2354,41 @@ sessions_swap(session_t *r, session_t *s)
 }
 
 static void
+worker_update_load(load_t *load, int nready)
+{
+    if (nready > load->max_loop_contexts)
+        load->max_loop_contexts = nready;
+
+    if (nready < load->min_loop_contexts)
+        load->min_loop_contexts = nready;
+
+    load->ctxs_serviced_since_mark += nready;
+
+    if (load->loops_since_mark < UINT16_MAX) {
+        load->loops_since_mark++;
+    } else {
+        // MARK
+        load->average =
+            (load->average +
+             256 * load->ctxs_serviced_since_mark / (UINT16_MAX + 1)) / 2;
+        hlog_fast(average, "%s: average %" PRIuFAST16 "x%" PRIuFAST16,
+            __func__, load->average / (uint_fast16_t)256,
+            load->average % (uint_fast16_t)256);
+        hlog_fast(average,
+            "%s: %" PRIu32 " contexts in %" PRIuFAST16 " loops",
+            __func__, load->ctxs_serviced_since_mark,
+            load->loops_since_mark);
+        hlog_fast(average,
+            "%s: %d to %d contexts per loop",
+            __func__, load->min_loop_contexts, load->max_loop_contexts);
+        load->loops_since_mark = 0;
+        load->ctxs_serviced_since_mark = 0;
+        load->max_loop_contexts = 0;
+        load->min_loop_contexts = INT_MAX;
+    }
+}
+
+static void
 worker_run_loop(worker_t *self)
 {
     size_t half, i;
@@ -2373,38 +2408,10 @@ worker_run_loop(worker_t *self)
             bailout_for_ofi_ret(ncontexts, "fi_poll");
         }
 
-        load_t *load = &self->load;
-
-        if (ncontexts > load->max_loop_contexts)
-            load->max_loop_contexts = ncontexts;
-
-        if (ncontexts < load->min_loop_contexts)
-            load->min_loop_contexts = ncontexts;
-
-        load->ctxs_serviced_since_mark += ncontexts;
-
-        if (load->loops_since_mark < UINT16_MAX) {
-            load->loops_since_mark++;
-        } else {
-            // MARK
-            load->average =
-                (load->average +
-                 256 * load->ctxs_serviced_since_mark / (UINT16_MAX + 1)) / 2;
-            hlog_fast(average, "%s: average %" PRIuFAST16 "x%" PRIuFAST16,
-                __func__, load->average / (uint_fast16_t)256,
-                load->average % (uint_fast16_t)256);
-            hlog_fast(average,
-                "%s: %" PRIu32 " contexts in %" PRIuFAST16 " loops",
-                __func__, load->ctxs_serviced_since_mark,
-                load->loops_since_mark);
-            hlog_fast(average,
-                "%s: %d to %d contexts per loop",
-                __func__, load->min_loop_contexts, load->max_loop_contexts);
-            load->loops_since_mark = 0;
-            load->ctxs_serviced_since_mark = 0;
-            load->max_loop_contexts = 0;
-            load->min_loop_contexts = INT_MAX;
-        }
+        /* TBD move this down, use the total number ready regardless of
+         * I/O readiness.
+         */
+        worker_update_load(&self->load, ncontexts);
 
         session_t *session_half =
             &self->session[half * arraycount(self->session) / 2];
