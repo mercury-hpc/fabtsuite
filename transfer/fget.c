@@ -2410,6 +2410,9 @@ worker_run_loop(worker_t *self)
 
         /* TBD move this down, use the total number ready regardless of
          * I/O readiness.
+         *
+         * May need to take care about counting all sessions ready because
+         * they are cancelled.
          */
         worker_update_load(&self->load, ncontexts);
 
