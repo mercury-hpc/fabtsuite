@@ -127,6 +127,9 @@ typedef struct fifo {
     uint64_t insertions;
     uint64_t removals;
     size_t index_mask;  // for some integer n > 0, 2^n - 1 == index_mask
+    uint64_t closed;    /* close position: no insertions or removals may
+                         * take place at or after this position.
+                         */
     bufhdr_t *hdr[];
 } fifo_t;
 
@@ -152,7 +155,6 @@ typedef struct terminal terminal_t;
 struct terminal {
     /* trade(t, ready, completed) */
     loop_control_t (*trade)(terminal_t *, fifo_t *, fifo_t *);
-    bool eof;
 };
 
 typedef struct {
@@ -584,8 +586,49 @@ fifo_create(size_t size)
 
     f->insertions = f->removals = 0;
     f->index_mask = size - 1;
+    f->closed = UINT64_MAX;
 
     return f;
+}
+
+/* Return true if the head of the FIFO (the removal point) is at or past
+ * the close position.  Otherwise, return false.
+ */
+static inline bool
+fifo_eoget(const fifo_t *f)
+{
+    return f->closed <= f->removals;
+}
+
+/* Return true if the tail of the FIFO (the insertion point) is at or
+ * past the close position.  Otherwise, return false.
+ */
+static inline bool
+fifo_eoput(const fifo_t *f)
+{
+    return f->closed <= f->insertions;
+}
+
+/* Set the close position to the current head of the FIFO (the removal
+ * point).  Every `fifo_get` that follows will fail, and `fifo_eoget`
+ * will be true.
+ */
+static inline void
+fifo_get_close(fifo_t *f)
+{
+    assert(!fifo_eoget(f));
+    f->closed = f->removals;
+}
+
+/* Set the close position to the current tail of the FIFO (the insertion
+ * point).  Every `fifo_put` that follows will fail, and `fifo_eoput`
+ * will be true.
+ */
+static inline void
+fifo_put_close(fifo_t *f)
+{
+    assert(!fifo_eoput(f));
+    f->closed = f->insertions;
 }
 
 static void
@@ -594,8 +637,11 @@ fifo_destroy(fifo_t *f)
     free(f);
 }
 
+/* See `fifo_get`: this is a variant that does not respect the close
+ * position.
+ */
 static inline bufhdr_t *
-fifo_get(fifo_t *f)
+fifo_alt_get(fifo_t *f)
 {
     assert(f->insertions >= f->removals);
 
@@ -608,31 +654,75 @@ fifo_get(fifo_t *f)
     return h;
 }
 
+/* Return NULL if the FIFO is empty or if the FIFO has been read up to
+ * the close position.  Otherwise, remove and return the next item on the
+ * FIFO.
+ */
+static inline bufhdr_t *
+fifo_get(fifo_t *f)
+{
+    if (fifo_eoget(f))
+        return NULL;
+
+    return fifo_alt_get(f);
+}
+
+/* See `fifo_empty`: this is a variant that does not respect the close
+ * position.
+ */
+static inline bool
+fifo_alt_empty(fifo_t *f)
+{
+    return f->insertions == f->removals;
+}
+
+/* Return true if the FIFO is empty or if the FIFO has been read up
+ * to the close position.  Otherwise, return false.
+ */
+static inline bool
+fifo_empty(fifo_t *f)
+{
+    return fifo_eoget(f) || fifo_alt_empty(f);
+}
+
+/* Return NULL if the FIFO is empty or if the FIFO has been read up to
+ * the close position.  Otherwise, return the next item on the FIFO without
+ * removing it.
+ */
 static inline bufhdr_t *
 fifo_peek(fifo_t *f)
 {
     assert(f->insertions >= f->removals);
 
-    if (f->insertions == f->removals)
+    if (fifo_empty(f))
         return NULL;
 
     return f->hdr[f->removals & (uint64_t)f->index_mask];
 }
 
+/* See `fifo_full`: this is a variant that does not respect the close
+ * position.
+ */
 static inline bool
-fifo_empty(fifo_t *f)
-{
-    return f->insertions == f->removals;
-}
-
-static inline bool
-fifo_full(fifo_t *f)
+fifo_alt_full(fifo_t *f)
 {
     return f->insertions - f->removals == f->index_mask + 1;
 }
 
+/* Return true if the FIFO is full or if the FIFO has been written up
+ * to the close position.  Otherwise, return false.
+ */
 static inline bool
-fifo_put(fifo_t *f, bufhdr_t *h)
+fifo_full(fifo_t *f)
+{
+    return fifo_eoput(f) || fifo_alt_full(f);
+}
+
+/* See `fifo_put`: this is a variant that does not respect the close
+ * position.
+ */
+static inline bool
+fifo_alt_put(fifo_t *f, bufhdr_t *h)
 {
     assert(f->insertions - f->removals <= f->index_mask + 1);
 
@@ -643,6 +733,19 @@ fifo_put(fifo_t *f, bufhdr_t *h)
     f->insertions++;
 
     return true;
+}
+
+/* If the FIFO is full or if it has been written up to the close
+ * position, then return false without changing the FIFO.
+ * Otherwise, add item `h` to the tail of the FIFO.
+ */
+static inline bool
+fifo_put(fifo_t *f, bufhdr_t *h)
+{
+    if (fifo_eoput(f))
+        return false;
+
+    return fifo_alt_put(f, h);
 }
 
 static bufhdr_t *
@@ -1154,7 +1257,7 @@ source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
     source_t *s = (source_t *)t;
     bufhdr_t *h;
 
-    if (t->eof)
+    if (fifo_eoput(completed))
         return loop_end;
 
     while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
@@ -1162,8 +1265,8 @@ source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
         size_t len, ofs;
 
         if (s->idx == s->entirelen) {
-            t->eof = true;
-            return loop_end;
+            fifo_put_close(completed);
+            break;
         }
 
         h->nused = minsize(s->entirelen - s->idx, h->nallocated);
@@ -1175,7 +1278,7 @@ source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
         }
 
         (void)fifo_get(ready);
-        (void)fifo_put(completed, h);
+        (void)fifo_alt_put(completed, h);
 
         s->idx += h->nused;
     }
@@ -1183,7 +1286,6 @@ source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
     if (s->idx != s->entirelen)
         return loop_continue;
 
-    t->eof = true;
     return loop_end;
 }
 
@@ -1197,8 +1299,11 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
     sink_t *s = (sink_t *)t;
     bufhdr_t *h;
 
-    if (t->eof && !fifo_empty(ready))
-        goto fail;
+    if (fifo_eoget(ready)) {
+        if (!fifo_alt_empty(ready))
+            goto fail;
+        return loop_end;
+    }
 
     while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
         bytebuf_t *b = (bytebuf_t *)h;
@@ -1222,7 +1327,7 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
     if (s->idx != s->entirelen)
         return loop_continue;
 
-    t->eof = true;
+    fifo_get_close(ready);
     return loop_end;
 fail:
     hlog_fast(payverify, "unexpected received payload");
@@ -1396,7 +1501,7 @@ rcvr_targets_read(fifo_t *ready_for_terminal, rcvr_t *r)
 
     while (r->nfull > 0 &&
           (h = fifo_peek(r->tgtposted)) != NULL &&
-          !fifo_full(ready_for_terminal)) {
+          !fifo_alt_full(ready_for_terminal)) {
         if (h->nused + r->nfull < h->nallocated) {
             h->nused += r->nfull;
             r->nfull = 0;
@@ -1408,7 +1513,7 @@ rcvr_targets_read(fifo_t *ready_for_terminal, rcvr_t *r)
             if (global_state.reregister && (rc = fi_close(&h->mr->fid)) != 0)
                 warn_about_ofi_ret(rc, "fi_close");
 
-            (void)fifo_put(ready_for_terminal, h);
+            (void)fifo_alt_put(ready_for_terminal, h);
         }
     }
 
@@ -1423,7 +1528,7 @@ rcvr_targets_read(fifo_t *ready_for_terminal, rcvr_t *r)
         if (global_state.reregister && (rc = fi_close(&h->mr->fid)) != 0)
             warn_about_ofi_ret(rc, "fi_close");
 
-        (void)fifo_put(ready_for_terminal, h);
+        (void)fifo_alt_put(ready_for_terminal, h);
     }
 }
 
@@ -1507,7 +1612,7 @@ rcvr_loop(worker_t *w, session_t *s)
 
     rcvr_targets_read(s->ready_for_terminal, r);
 
-    if (t->eof && fifo_empty(s->ready_for_terminal) &&
+    if (fifo_eoget(s->ready_for_terminal) &&
         r->cxn.eof.remote && r->cxn.eof.local && fifo_empty(r->vec.posted))
         return loop_end;
 
@@ -1920,7 +2025,7 @@ xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
                 warn_about_ofi_ret(rc, "fi_close");
 
             x->bytes_progress += h->nused;
-            (void)fifo_put(ready_for_terminal, h);
+            (void)fifo_alt_put(ready_for_terminal, h);
         }
         return 1;
     case xft_progress:
@@ -2100,7 +2205,7 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
 }
 
 static void
-xmtr_progress_update(fifo_t *ready_for_cxn, bool terminal_eof, xmtr_t *x)
+xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
 {
     progbuf_t *pb;
 
@@ -2109,9 +2214,8 @@ xmtr_progress_update(fifo_t *ready_for_cxn, bool terminal_eof, xmtr_t *x)
      * (!x->cxn.eof.local), then send nleftover == 0; on a successful
      * transmission, set x->cxn.eof.local to true.
      */
-    bool reached_eof = (terminal_eof &&
-        fifo_empty(ready_for_cxn) && fifo_empty(x->wrposted) &&
-        !x->cxn.eof.local);
+    bool reached_eof = (fifo_eoget(ready_for_cxn) &&
+        fifo_empty(x->wrposted) && !x->cxn.eof.local);
 
     if (x->bytes_progress == 0 && !reached_eof)
         return;
@@ -2189,11 +2293,11 @@ xmtr_loop(worker_t *w, session_t *s)
     if (xmtr_targets_write(s->ready_for_cxn, x) == loop_error)
         return loop_error;
 
-    xmtr_progress_update(s->ready_for_cxn, s->terminal->eof, x);
+    xmtr_progress_update(s->ready_for_cxn, x);
 
     txctl_transmit(&x->cxn, &x->progress);
 
-    if (!(t->eof && fifo_empty(s->ready_for_cxn) &&
+    if (!(fifo_eoget(s->ready_for_cxn) &&
         fifo_empty(x->wrposted) && x->bytes_progress == 0 && x->cxn.eof.local))
         return loop_continue;
 
@@ -2967,7 +3071,6 @@ terminal_init(terminal_t *t,
     loop_control_t (*trade)(terminal_t *, fifo_t *, fifo_t *))
 {
     t->trade = trade;
-    t->eof = false;
 }
 
 static void
