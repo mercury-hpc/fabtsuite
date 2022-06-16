@@ -1568,7 +1568,6 @@ static loop_control_t
 rcvr_loop(worker_t *w, session_t *s)
 {
     rcvr_t *r = (rcvr_t *)s->cxn;
-    terminal_t *t = s->terminal;
     int rc;
 
     switch (r->cxn.sent_first ? loop_end : rcvr_ack_send(r)) {
@@ -1602,9 +1601,6 @@ rcvr_loop(worker_t *w, session_t *s)
         r->cxn.cancelled = true;
         return loop_continue;
     }
-
-    if (t->trade(t, s->ready_for_terminal, s->ready_for_cxn) == loop_error)
-        return loop_error;
 
     rcvr_vector_update(s->ready_for_cxn, r);
 
@@ -2251,7 +2247,6 @@ xmtr_loop(worker_t *w, session_t *s)
 {
     vecbuf_t *vb;
     xmtr_t *x = (xmtr_t *)s->cxn;
-    terminal_t *t = s->terminal;
     ssize_t rc;
 
     if (xmtr_cq_process(x, s->ready_for_terminal,
@@ -2287,9 +2282,6 @@ xmtr_loop(worker_t *w, session_t *s)
 
     xmtr_vecbuf_unload(x);
 
-    if (t->trade(t, s->ready_for_terminal, s->ready_for_cxn) == loop_error)
-        return loop_error;
-
     if (xmtr_targets_write(s->ready_for_cxn, x) == loop_error)
         return loop_error;
 
@@ -2323,8 +2315,6 @@ cxn_loop(worker_t *w, session_t *s)
     cxn_t *cxn = s->cxn;
     loop_control_t ctl;
 
-    hlog_fast(session_loop, "%s: going around", __func__);
-
     if ((ctl = cxn->loop(w, s)) == loop_error || ctl == loop_end) {
         if ((rc = fi_close(&cxn->ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
@@ -2336,7 +2326,13 @@ cxn_loop(worker_t *w, session_t *s)
 static loop_control_t
 session_loop(worker_t *w, session_t *s)
 {
-    // TBD trade with terminal
+    terminal_t *t = s->terminal;
+
+    hlog_fast(session_loop, "%s: going around", __func__);
+
+    if (t->trade(t, s->ready_for_terminal, s->ready_for_cxn) == loop_error)
+        return loop_error;
+
     return cxn_loop(w, s);
 }
 
