@@ -2846,12 +2846,16 @@ worker_assign_session(worker_t *w, session_t *s)
                 continue;
 
             rc = fi_poll_add(w->pollset[half], &s->cxn->cq->fid, 0);
+
             if (rc != 0)
                 bailout_for_ofi_ret(rc, "fi_poll_add");
+
             atomic_fetch_add_explicit(&w->nsessions[half], 1,
                 memory_order_relaxed);
+
             *slot = *s;
             s->cxn->parent = slot;
+
             (void)pthread_mutex_unlock(mtx);
             return true;
         }
