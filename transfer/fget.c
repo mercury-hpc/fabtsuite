@@ -323,6 +323,16 @@ struct session {
     fifo_t *ready_for_terminal;
 };
 
+typedef struct worker_stats worker_stats_t;
+
+struct worker_stats {
+    struct {
+        uint64_t no_io_ready;
+        uint64_t no_session_ready;
+        uint64_t total;
+    } loops;
+};
+
 struct worker {
     pthread_t thd;
     load_t load;
@@ -344,6 +354,7 @@ struct worker {
         buflist_t *rx;
     } paybufs;    /* Reservoirs for free payload buffers. */
     keysource_t keys;
+    worker_stats_t stats;
 };
 
 typedef struct {
@@ -414,6 +425,7 @@ HLOG_OUTLET_FLAGS_DEFN(payload, all, HLOG_F_NO_PREFIX|HLOG_F_NO_SUFFIX);
 HLOG_OUTLET_SHORT_DEFN(paybuf, all);
 HLOG_OUTLET_SHORT_DEFN(paybuflist, paybuf);
 HLOG_OUTLET_SHORT_DEFN(completion, all);
+HLOG_OUTLET_SHORT_DEFN(worker_stats, all);
 
 static const char fget_fput_service_name[] = "4242";
 
@@ -2433,7 +2445,8 @@ worker_run_loop(worker_t *self)
             sessions_swap(s, &session_half[i]);
         }
 
-        session_t *ready_up_to = &session_half[ncontexts];
+        session_t *io_ready_up_to = &session_half[ncontexts];
+        session_t *ready_up_to = io_ready_up_to;
 
         for (i = ready_up_to - session_half;
              i < arraycount(self->session) / 2;
@@ -2454,6 +2467,14 @@ worker_run_loop(worker_t *self)
         }
 
         session_t *active_up_to = ready_up_to;
+
+        self->stats.loops.total++;
+
+        if (io_ready_up_to == session_half)
+            self->stats.loops.no_io_ready++;
+
+        if (ready_up_to == io_ready_up_to)
+            self->stats.loops.no_session_ready++;
 
         /*
          * TBD change terminology to `occupied` and `empty` slots.
@@ -2602,6 +2623,17 @@ worker_idle_loop(worker_t *self)
     (void)pthread_mutex_unlock(&workers_mtx);
 }
 
+static void
+worker_stats_log(worker_t *self)
+{
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " loops no I/O ready",
+        (void *)self, self->stats.loops.no_io_ready);
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " loops no session ready",
+        (void *)self, self->stats.loops.no_session_ready);
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " loops total",
+        (void *)self, self->stats.loops.total);
+}
+
 static void *
 worker_outer_loop(void *arg)
 {
@@ -2700,7 +2732,15 @@ worker_init(worker_t *w)
         , .min_loop_contexts = INT_MAX
         , .average = 0
         , .loops_since_mark = 0
-        , .ctxs_serviced_since_mark = 0};
+        , .ctxs_serviced_since_mark = 0
+    };
+    w->stats = (worker_stats_t){
+        .loops = {
+              .no_io_ready = 0
+            , .no_session_ready = 0
+            , .total = 0
+        }
+    };
 }
 
 static bool
@@ -2965,6 +3005,12 @@ workers_join_all(void)
         if (w->failed || w->canceled != global_state.expect_cancellation)
             code = EXIT_FAILURE;
     }
+
+    for (i = 0; i < nworkers_allocated; i++) {
+        worker_t *w = &workers[i];
+        worker_stats_log(w);
+    }
+
     return code;
 }
 
