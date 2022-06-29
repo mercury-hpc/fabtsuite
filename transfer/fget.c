@@ -416,6 +416,8 @@ HLOG_OUTLET_SHORT_DEFN(session_loop, all);
 HLOG_OUTLET_SHORT_DEFN(write, all);
 HLOG_OUTLET_SHORT_DEFN(rxctl, all);
 HLOG_OUTLET_SHORT_DEFN(protocol, all);
+HLOG_OUTLET_SHORT_DEFN(proto_vector, protocol);
+HLOG_OUTLET_SHORT_DEFN(proto_progress, protocol);
 HLOG_OUTLET_SHORT_DEFN(txctl, all);
 HLOG_OUTLET_SHORT_DEFN(txdefer, all);
 HLOG_OUTLET_SHORT_DEFN(memreg, all);
@@ -1381,7 +1383,7 @@ rcvr_progress_rx_process(rcvr_t *r, const completion_t *cmpl)
     r->nfull += pb->msg.nfilled;
 
     if (pb->msg.nleftover == 0) {
-        hlog_fast(protocol, "%s: received remote EOF", __func__);
+        hlog_fast(proto_progress, "%s: received remote EOF", __func__);
         r->cxn.eof.remote = true;
     }
 
@@ -1476,8 +1478,14 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
         vb->hdr.nused = (char *)&vb->msg.iov[0] - (char *)&vb->msg;
         (void)fifo_put(r->vec.ready, &vb->hdr);
         r->cxn.eof.local = true;
-        hlog_fast(protocol, "%s: enqueued local EOF", __func__);
-    } else while (!fifo_full(r->vec.ready) && !fifo_empty(ready_for_cxn) &&
+        hlog_fast(proto_vector, "%s: rcvr %p enqueued local EOF", __func__,
+            (void *)r);
+        return;
+    } else if (r->cxn.eof.remote) {
+        return;   // send no more non-empty vectors after remote sends EOF
+    }
+
+    while (!fifo_full(r->vec.ready) && !fifo_empty(ready_for_cxn) &&
            (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
 
         for (i = 0;
@@ -1502,6 +1510,8 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
         vb->hdr.nused = (char *)&vb->msg.iov[i] - (char *)&vb->msg;
 
         (void)fifo_put(r->vec.ready, &vb->hdr);
+        hlog_fast(proto_vector, "%s: rcvr %p enqueued vector", __func__,
+            (void *)r);
     }
 }
 
@@ -1874,14 +1884,14 @@ xmtr_vecbuf_unload(xmtr_t *x)
     riov = (!x->phase) ? x->riov : x->riov2;
 
     if (!x->cxn.eof.remote && vb->msg.niovs == 0) {
-        hlog_fast(protocol, "%s: received remote EOF", __func__);
+        hlog_fast(proto_vector, "%s: received remote EOF", __func__);
         x->cxn.eof.remote = true;
     }
 
     for (i = x->next_riov;
          i < vb->msg.niovs && x->nriovs < arraycount(x->riov);
          i++) {
-        hlog_fast(protocol, "%s: received vector %zu "
+        hlog_fast(proto_vector, "%s: received vector %zu "
             "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
             __func__, i, vb->msg.iov[i].addr, vb->msg.iov[i].len,
             vb->msg.iov[i].key);
@@ -2240,7 +2250,7 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
     pb->msg.nfilled = x->bytes_progress;
     pb->msg.nleftover = reached_eof ? 0 : 1;
 
-    hlog_fast(protocol, "%s: sending progress message, %"
+    hlog_fast(proto_progress, "%s: sending progress message, %"
         PRIu64 " filled, %" PRIu64 " leftover", __func__,
         pb->msg.nfilled, pb->msg.nleftover);
 
@@ -2249,7 +2259,7 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
     (void)fifo_put(x->progress.ready, &pb->hdr);
 
     if (reached_eof) {
-        hlog_fast(protocol, "%s: enqueued local EOF", __func__);
+        hlog_fast(proto_progress, "%s: enqueued local EOF", __func__);
         x->cxn.eof.local = true;
     }
 }
