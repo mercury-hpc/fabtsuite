@@ -14,6 +14,8 @@
 #include <string.h> /* strcmp(3), strdup(3) */
 #include <unistd.h> /* getopt(3), sysconf(3) */
 
+#include <sys/epoll.h>
+
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>     /* fi_listen, fi_getname */
 #include <rdma/fi_domain.h>
@@ -194,6 +196,10 @@ struct cxn {
     struct fid_eq *eq;
     fi_addr_t peer_addr;
     struct fid_cq *cq;
+    int cq_wait_fd;     /* if we're using FI_WAIT_FD, the descriptor  
+                         * to use with epoll(2) to sleep until I/O is
+                         * ready
+                         */
     struct fid_av *av;
     session_t *parent;  // pointer to the connection's current session_t
     bool sent_first;    /* receiving: set to `true` once this receiver sends an
@@ -335,6 +341,7 @@ struct worker_stats {
 
 struct worker {
     pthread_t thd;
+    sigset_t epoll_sigset;
     load_t load;
     terminal_t *term[WORKER_SESSIONS_MAX];
     session_t session[WORKER_SESSIONS_MAX];
@@ -355,6 +362,7 @@ struct worker {
     } paybufs;    /* Reservoirs for free payload buffers. */
     keysource_t keys;
     worker_stats_t stats;
+    int epoll_fd;   /* returned by epoll_create(2) */
 };
 
 typedef struct {
@@ -451,6 +459,8 @@ static struct {
 , {.signum = SIGQUIT}
 , {.signum = SIGTERM}
 };
+
+static struct sigaction saved_wakeup_action;
 
 static const struct {
     uint64_t rx;
@@ -1191,7 +1201,7 @@ txctl_complete(txctl_t *tc, const completion_t *cmpl)
 
     if (cmpl->xfc != &h->xfc) {
         errx(EXIT_FAILURE, "%s: expected context %p received %p",
-            __func__, (void *)&h->xfc.ctx, cmpl->xfc);
+            __func__, (void *)&h->xfc.ctx, (void *)cmpl->xfc);
     }
 
     if (!buflist_put(tc->pool, h))
@@ -2410,20 +2420,88 @@ worker_update_load(load_t *load, int nready)
     }
 }
 
+static bool
+worker_epoll_ready(worker_t *self)
+{
+    struct fid *fid[WORKER_SESSIONS_MAX];
+    size_t nfids = 0;
+    int i;
+
+    for (i = 0; i < arraycount(self->session); i++) {
+        cxn_t *c = self->session[i].cxn;
+
+        if (c == NULL)
+            continue;
+
+        fid[nfids++] = &c->cq->fid;
+    }
+
+    return fi_trywait(global_state.fabric, fid, nfids) == FI_SUCCESS;
+}
+
+static int
+extract_contexts_for_half(const session_t *session_half,
+    const struct epoll_event *events, int nevents, void **context,
+    bool epoll_not_ready)
+{
+    int i, ncontexts = 0;
+    const session_t *from = session_half,
+                    *upto = &session_half[WORKER_SESSIONS_MAX / 2];
+
+    if (epoll_not_ready) {
+        for (i = 0; i < upto - from; i++) {
+            if (from[i].cxn == NULL)
+                continue;
+            context[ncontexts++] = from[i].cxn;
+        }
+        return ncontexts;
+    }
+
+    for (i = 0; i < nevents; i++) {
+        cxn_t *c = events[i].data.ptr;
+
+        if (c->parent < from || upto < c->parent)
+            continue;
+
+        context[ncontexts++] = c;
+    }
+
+    return ncontexts;
+}
+
 static void
 worker_run_loop(worker_t *self)
 {
     size_t half, i;
+    struct epoll_event events[WORKER_SESSIONS_MAX];
+    int nevents;
+    bool epoll_ready;
+
+    if (global_state.waitfd &&
+        (epoll_ready = worker_epoll_ready(self)) &&
+        (nevents =
+            epoll_pwait(self->epoll_fd, events, (int)arraycount(events), 0,
+                        &self->epoll_sigset)) == -1 &&
+        errno != EINTR)
+        err(EXIT_FAILURE, "%s: epoll_pwait", __func__);
 
     for (half = 0; half < 2; half++) {
         void *context[WORKER_SESSIONS_MAX];
         pthread_mutex_t *mtx = &self->mtx[half];
+        session_t *session_half =
+            &self->session[half * arraycount(self->session) / 2];
         int ncontexts, rc;
 
         if (pthread_mutex_trylock(mtx) == EBUSY)
             continue;
 
-        ncontexts = fi_poll(self->pollset[half], context, WORKER_SESSIONS_MAX);
+        if (global_state.waitfd) {
+            ncontexts = extract_contexts_for_half(session_half, events, nevents,
+                context, !epoll_ready);
+        } else {
+            ncontexts = fi_poll(self->pollset[half], context,
+                WORKER_SESSIONS_MAX);
+        }
 
         if (ncontexts < 0) {
             (void)pthread_mutex_unlock(mtx);
@@ -2437,9 +2515,6 @@ worker_run_loop(worker_t *self)
          * they are cancelled.
          */
         worker_update_load(&self->load, ncontexts);
-
-        session_t *session_half =
-            &self->session[half * arraycount(self->session) / 2];
 
         for (i = 0; i < ncontexts; i++) {
             cxn_t *c = context[i];
@@ -2576,6 +2651,15 @@ worker_run_loop(worker_t *self)
 
             if ((rc = fi_poll_del(self->pollset[half], &c->cq->fid, 0)) != 0)
                 bailout_for_ofi_ret(rc, "fi_poll_del");
+
+            if (!global_state.waitfd)
+                ;
+            else if (epoll_ctl(self->epoll_fd, EPOLL_CTL_DEL, c->cq_wait_fd,
+                NULL) == -1) {
+                err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_ADD,)",
+                    __func__, __LINE__);
+            }
+
             atomic_fetch_add_explicit(&self->nsessions[half], -1,
                 memory_order_relaxed);
         }
@@ -2722,6 +2806,11 @@ worker_init(worker_t *w)
             strerror(rc));
     }
 
+    if (!global_state.waitfd)
+        w->epoll_fd = -1;
+    else if ((w->epoll_fd = epoll_create(1)) == -1)
+        err(EXIT_FAILURE, "%s.%d: epoll_create", __func__, __LINE__);
+
     for (i = 0; i < arraycount(w->mtx); i++) {
         if ((rc = pthread_mutex_init(&w->mtx[i], NULL)) != 0) {
             errx(EXIT_FAILURE, "%s.%d: pthread_mutex_init: %s",
@@ -2769,6 +2858,11 @@ worker_launch(worker_t *w)
         if (sigaddset(&blockset, siglist[i].signum) == -1)
             err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
     }
+
+    w->epoll_sigset = blockset;
+
+    if (sigaddset(&blockset, SIGUSR1) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
     CPU_ZERO(&cpuset);
     CPU_SET(global_state.nextcpu, &cpuset);
@@ -2900,6 +2994,17 @@ worker_assign_session(worker_t *w, session_t *s)
             if (rc != 0)
                 bailout_for_ofi_ret(rc, "fi_poll_add");
 
+            if (!global_state.waitfd)
+                ;
+            else if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, s->cxn->cq_wait_fd,
+                &(struct epoll_event){
+                  .events = EPOLLIN
+                , .data = {.ptr = &s->cxn}
+                }) == -1) {
+                err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_ADD,)",
+                    __func__, __LINE__);
+            }
+
             atomic_fetch_add_explicit(&w->nsessions[half], 1,
                 memory_order_relaxed);
 
@@ -2910,6 +3015,10 @@ worker_assign_session(worker_t *w, session_t *s)
             return true;
         }
         (void)pthread_mutex_unlock(mtx);
+    }
+    if (global_state.waitfd && (rc = pthread_kill(w->thd, SIGUSR1)) != 0) {
+        errx(EXIT_FAILURE, "%s: could not signal thread for worker %p: %s",
+            __func__, (void *)w, strerror(rc));
     }
     return false;
 }
@@ -3378,6 +3487,17 @@ get_session_accept(get_state_t *gst)
                          &r->cxn)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
+    if (global_state.waitfd) {
+        int fd;
+
+        rc = fi_control(&r->cxn.cq->fid, FI_GETWAIT, &fd);
+
+        if (rc != 0)
+            bailout_for_ofi_ret(rc, "fi_control(,FI_GETWAIT,)");
+
+        r->cxn.cq_wait_fd = fd;
+    }
+
     if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.cq->fid,
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
@@ -3585,6 +3705,17 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
                          &x->cxn)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
+    if (global_state.waitfd) {
+        int fd;
+
+        rc = fi_control(&x->cxn.cq->fid, FI_GETWAIT, &fd);
+
+        if (rc != 0)
+            bailout_for_ofi_ret(rc, "fi_control(,FI_GETWAIT,)");
+
+        x->cxn.cq_wait_fd = fd;
+    }
+
     if ((rc = fi_eq_open(global_state.fabric, &eq_attr, &x->cxn.eq, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open");
 
@@ -3715,8 +3846,17 @@ usage(personality_t personality, const char *progname)
     exit(EXIT_FAILURE);
 }
 
+/* Handler for SIGUSR1, used to wake a thread from epoll(2) so that
+ * it can pick up new sessions.
+ */
 static void
-handler(int signum, siginfo_t *info, void *ucontext)
+handle_wakeup(int signum, siginfo_t *info, void *ucontext)
+{
+}
+
+/* Handler for SIG{HUP,INT,QUIT,TERM}, used to cancel the program. */
+static void
+handle_cancel(int signum, siginfo_t *info, void *ucontext)
 {
     cancelled = 1;
 }
@@ -3910,21 +4050,34 @@ main(int argc, char **argv)
             err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
     }
 
+    if (sigaddset(&blockset, SIGUSR1) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+
     if ((rc = pthread_sigmask(SIG_BLOCK, &blockset, &oldset)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
             strerror(rc));
     }
 
-    struct sigaction action = {.sa_sigaction = handler, .sa_flags = SA_SIGINFO};
+    struct sigaction cancel_action = {.sa_sigaction = handle_cancel,
+                                      .sa_flags = SA_SIGINFO};
 
-    if (sigemptyset(&action.sa_mask) == -1)
+    if (sigemptyset(&cancel_action.sa_mask) == -1)
         err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
     for (i = 0; i < arraycount(siglist); i++) {
-        if (sigaction(siglist[i].signum, &action,
+        if (sigaction(siglist[i].signum, &cancel_action,
                       &siglist[i].saved_action) == -1)
             err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
     }
+
+    struct sigaction wakeup_action = {.sa_sigaction = handle_wakeup,
+                                      .sa_flags = SA_SIGINFO};
+
+    if (sigemptyset(&wakeup_action.sa_mask) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+
+    if (sigaction(SIGUSR1, &wakeup_action, &saved_wakeup_action) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
     if ((rc = pthread_sigmask(SIG_UNBLOCK, &blockset, NULL)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
