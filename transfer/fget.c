@@ -366,6 +366,7 @@ struct worker {
 };
 
 typedef struct {
+    struct fi_context ctx;  // this has to be the first member
     sink_t sink;
     rcvr_t rcvr;
     session_t sess;
@@ -3378,7 +3379,7 @@ post_initial_rx(struct fid_ep *ep, get_session_t *gs)
         , .desc = r->initial.desc
         , .iov_count = r->initial.niovs
         , .addr = r->cxn.peer_addr
-        , .context = gs
+        , .context = &gs->ctx
         , .data = 0
         }, FI_COMPLETION);
 
@@ -3985,8 +3986,9 @@ main(int argc, char **argv)
     hlog_fast(params, "%d infos found", count_info(global_state.info));
 
     if ((global_state.info->mode & FI_CONTEXT) != 0) {
-        errx(EXIT_FAILURE,
-           "contexts should embed fi_context, but I don't do that, yet.");
+        hlog_fast(params,
+            "contexts must embed fi_context; good thing %s does that.",
+            progname);
     }
 
     rc = fi_fabric(global_state.info->fabric_attr, &global_state.fabric,
