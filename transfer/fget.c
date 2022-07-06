@@ -190,8 +190,15 @@ typedef struct session session_t;
 struct worker;
 typedef struct worker worker_t;
 
+typedef struct {
+    bool local, remote;
+} eof_state_t;
+
 struct cxn {
+    uint32_t magic;
     loop_control_t (*loop)(worker_t *, session_t *);
+    void (*cancel)(cxn_t *);
+    bool (*cancellation_complete)(cxn_t *);
     struct fid_ep *ep;
     struct fid_eq *eq;
     fi_addr_t peer_addr;
@@ -216,9 +223,7 @@ struct cxn {
      * received the remote close in `eof.remote` and having completed
      * sending it in `eof.local`.
      */
-    struct {
-        bool local, remote;
-    } eof;
+    eof_state_t eof;
     keysource_t keys;
 };
 
@@ -327,16 +332,21 @@ struct session {
     cxn_t *cxn;
     fifo_t *ready_for_cxn;
     fifo_t *ready_for_terminal;
+    bool waitable;
 };
 
 typedef struct worker_stats worker_stats_t;
 
 struct worker_stats {
     struct {
+        uint64_t waitable;
+        uint64_t total;
+    } epoll_loops;
+    struct {
         uint64_t no_io_ready;
         uint64_t no_session_ready;
         uint64_t total;
-    } loops;
+    } half_loops;
 };
 
 struct worker {
@@ -413,6 +423,9 @@ typedef struct {
     struct {
         unsigned first, last;
     } processors;
+    volatile bool cancelled;
+    pthread_t cancel_thd;
+    pthread_t main_thd;
 } state_t;
 
 HLOG_OUTLET_MEDIUM_DEFN(err, all, 0, HLOG_OUTLET_S_ON);
@@ -442,7 +455,9 @@ static const char fget_fput_service_name[] = "4242";
 
 static state_t global_state = {.domain = NULL, .fabric = NULL, .info = NULL,
                                .personality = NULL, .nsessions = 1,
-                               .processors = {.first = 0, .last = INT_MAX}};
+                               .processors = {.first = 0, .last = INT_MAX},
+                               .cancelled = 0};
+
 static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
 static size_t nworkers_running;
@@ -461,7 +476,8 @@ static struct {
 , {.signum = SIGTERM}
 };
 
-static struct sigaction saved_wakeup_action;
+static struct sigaction saved_wakeup1_action;
+static struct sigaction saved_wakeup2_action;
 
 static const struct {
     uint64_t rx;
@@ -532,8 +548,6 @@ static const uint64_t desired_wr_flags =
     FI_RMA | FI_WRITE | FI_COMPLETION | FI_DELIVERY_COMPLETE;
 
 static uint64_t _Atomic next_key_pool = 512;
-
-static volatile sig_atomic_t cancelled = 0;
 
 static char txbuf[] =
     "If this message was received in error then please "
@@ -797,6 +811,7 @@ session_init(session_t *s, cxn_t *c, terminal_t *t)
 {
     memset(s, 0, sizeof(*s));
 
+    s->waitable = false;
     s->cxn = c;
     s->terminal = t;
 
@@ -1597,11 +1612,27 @@ rcvr_ack_send(rcvr_t *r)
     return loop_end;
 }
 
+static void
+rcvr_cancel(cxn_t *cxn)
+{
+    rcvr_t *r = (rcvr_t *)cxn;
+
+    rxctl_cancel(r->cxn.ep, &r->progress);
+    txctl_cancel(r->cxn.ep, &r->vec);
+}
+
+static bool
+rcvr_cancellation_complete(cxn_t *cxn)
+{
+    rcvr_t *r = (rcvr_t *)cxn;
+
+    return fifo_empty(r->progress.posted) && fifo_empty(r->vec.posted);
+}
+
 static loop_control_t
 rcvr_loop(worker_t *w, session_t *s)
 {
     rcvr_t *r = (rcvr_t *)s->cxn;
-    int rc;
 
     switch (r->cxn.sent_first ? loop_end : rcvr_ack_send(r)) {
     case loop_end:
@@ -1619,21 +1650,6 @@ rcvr_loop(worker_t *w, session_t *s)
 
     if (rcvr_cq_process(r) == -1)
         return loop_error;
-
-    if (r->cxn.cancelled) {
-        if (fifo_empty(r->progress.posted) && fifo_empty(r->vec.posted)) {
-            if ((rc = fi_close(&r->cxn.ep->fid)) < 0)
-                bailout_for_ofi_ret(rc, "fi_close");
-            hlog_fast(close, "%s: closed.", __func__);
-            return loop_canceled;
-        }
-        return loop_continue;
-    } else if (cancelled) {
-        rxctl_cancel(r->cxn.ep, &r->progress);
-        txctl_cancel(r->cxn.ep, &r->vec);
-        r->cxn.cancelled = true;
-        return loop_continue;
-    }
 
     rcvr_vector_update(s->ready_for_cxn, r);
 
@@ -2275,34 +2291,34 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
     }
 }
 
+static void
+xmtr_cancel(cxn_t *cxn)
+{
+    xmtr_t *x = (xmtr_t *)cxn;
+
+    txctl_cancel(x->cxn.ep, &x->progress);
+    rxctl_cancel(x->cxn.ep, &x->vec);
+    fifo_cancel(x->cxn.ep, x->wrposted);
+}
+
+static bool
+xmtr_cancellation_complete(cxn_t *cxn)
+{
+    xmtr_t *x = (xmtr_t *)cxn;
+
+    return fifo_empty(x->progress.posted) && fifo_empty(x->vec.posted) &&
+           fifo_empty(x->wrposted);
+}
+
 static loop_control_t
 xmtr_loop(worker_t *w, session_t *s)
 {
     vecbuf_t *vb;
     xmtr_t *x = (xmtr_t *)s->cxn;
-    ssize_t rc;
 
     if (xmtr_cq_process(x, s->ready_for_terminal,
                         global_state.reregister) == -1)
         return loop_error;
-
-    if (x->cxn.cancelled) {
-        if (fifo_empty(x->progress.posted) &&
-            fifo_empty(x->vec.posted) &&
-            fifo_empty(x->wrposted)) {
-                if ((rc = fi_close(&x->cxn.ep->fid)) < 0)
-                    bailout_for_ofi_ret(rc, "fi_close");
-                hlog_fast(close, "%s: closed.", __func__);
-                return loop_canceled;
-        }
-        return loop_continue;
-    } else if (cancelled) {
-        txctl_cancel(x->cxn.ep, &x->progress);
-        rxctl_cancel(x->cxn.ep, &x->vec);
-        fifo_cancel(x->cxn.ep, x->wrposted);
-        x->cxn.cancelled = true;
-        return loop_continue;
-    }
 
     if (!x->cxn.sent_first)
         return xmtr_initial_send(x);
@@ -2346,12 +2362,30 @@ cxn_loop(worker_t *w, session_t *s)
 {
     int rc;
     cxn_t *cxn = s->cxn;
-    loop_control_t ctl;
+    const loop_control_t ctl = cxn->loop(w, s);
 
-    if ((ctl = cxn->loop(w, s)) == loop_error || ctl == loop_end) {
+    switch (ctl) {
+    case loop_end:
+    case loop_error:
         if ((rc = fi_close(&cxn->ep->fid)) < 0)
             bailout_for_ofi_ret(rc, "fi_close");
         hlog_fast(close, "%s: closed.", __func__);
+        break;
+    case loop_continue:
+        if (cxn->cancelled) {
+            if (cxn->cancellation_complete(cxn)) {
+                if ((rc = fi_close(&cxn->ep->fid)) < 0)
+                    bailout_for_ofi_ret(rc, "fi_close");
+                hlog_fast(close, "%s: closed.", __func__);
+                return loop_canceled;
+            }
+        } else if (global_state.cancelled) {
+            cxn->cancel(cxn);
+            cxn->cancelled = true;
+        }
+        break;
+    default:
+        break;
     }
     return ctl;
 }
@@ -2422,34 +2456,50 @@ worker_update_load(load_t *load, int nready)
 }
 
 static bool
-worker_epoll_ready(worker_t *self)
+worker_waitable(worker_t *self)
 {
     struct fid *fid[WORKER_SESSIONS_MAX];
     size_t nfids = 0;
     int i;
+    bool waitable;
+
+    self->stats.epoll_loops.total++;
+
+    if (global_state.cancelled)
+        return false;
+
+    if (self->nsessions[0] == 0 && self->nsessions[1] == 0)
+        return false;
 
     for (i = 0; i < arraycount(self->session); i++) {
-        cxn_t *c = self->session[i].cxn;
+        session_t *s = &self->session[i];
+        cxn_t *c = s->cxn;
 
         if (c == NULL)
             continue;
 
+        if (!s->waitable)
+            return false;
+
         fid[nfids++] = &c->cq->fid;
     }
 
-    return fi_trywait(global_state.fabric, fid, nfids) == FI_SUCCESS;
+    waitable = (fi_trywait(global_state.fabric, fid, nfids) == FI_SUCCESS);
+    if (waitable)
+        self->stats.epoll_loops.waitable++;
+    return waitable;
 }
 
 static int
 extract_contexts_for_half(const session_t *session_half,
     const struct epoll_event *events, int nevents, void **context,
-    bool epoll_not_ready)
+    bool waitable)
 {
     int i, ncontexts = 0;
     const session_t *from = session_half,
                     *upto = &session_half[WORKER_SESSIONS_MAX / 2];
 
-    if (epoll_not_ready) {
+    if (!waitable) {
         for (i = 0; i < upto - from; i++) {
             if (from[i].cxn == NULL)
                 continue;
@@ -2461,7 +2511,12 @@ extract_contexts_for_half(const session_t *session_half,
     for (i = 0; i < nevents; i++) {
         cxn_t *c = events[i].data.ptr;
 
-        if (c->parent < from || upto < c->parent)
+        assert(c->magic == 0xdeadbeef);
+
+        if (c->parent == NULL)
+            continue;
+
+        if (c->parent < from || upto <= c->parent)
             continue;
 
         context[ncontexts++] = c;
@@ -2476,12 +2531,12 @@ worker_run_loop(worker_t *self)
     size_t half, i;
     struct epoll_event events[WORKER_SESSIONS_MAX];
     int nevents;
-    bool epoll_ready;
+    bool waitable;
 
     if (global_state.waitfd &&
-        (epoll_ready = worker_epoll_ready(self)) &&
+        (waitable = worker_waitable(self)) &&
         (nevents =
-            epoll_pwait(self->epoll_fd, events, (int)arraycount(events), 0,
+            epoll_pwait(self->epoll_fd, events, (int)arraycount(events), -1,
                         &self->epoll_sigset)) == -1 &&
         errno != EINTR)
         err(EXIT_FAILURE, "%s: epoll_pwait", __func__);
@@ -2498,7 +2553,7 @@ worker_run_loop(worker_t *self)
 
         if (global_state.waitfd) {
             ncontexts = extract_contexts_for_half(session_half, events, nevents,
-                context, !epoll_ready);
+                context, waitable);
         } else {
             ncontexts = fi_poll(self->pollset[half], context,
                 WORKER_SESSIONS_MAX);
@@ -2520,6 +2575,7 @@ worker_run_loop(worker_t *self)
         for (i = 0; i < ncontexts; i++) {
             cxn_t *c = context[i];
             assert(c != NULL);
+            assert(c->magic == 0xdeadbeef);
 
             session_t *s = c->parent;
             assert(s != NULL);
@@ -2545,7 +2601,7 @@ worker_run_loop(worker_t *self)
                 continue;
 
             if (c->sent_first && fifo_empty(s->ready_for_terminal) &&
-                !cancelled)
+                !global_state.cancelled)
                 continue;
 
             sessions_swap(s, ready_up_to);
@@ -2554,13 +2610,13 @@ worker_run_loop(worker_t *self)
 
         session_t *active_up_to = ready_up_to;
 
-        self->stats.loops.total++;
+        self->stats.half_loops.total++;
 
         if (io_ready_up_to == session_half)
-            self->stats.loops.no_io_ready++;
+            self->stats.half_loops.no_io_ready++;
 
         if (ready_up_to == io_ready_up_to)
-            self->stats.loops.no_session_ready++;
+            self->stats.half_loops.no_session_ready++;
 
         /*
          * TBD change terminology to `occupied` and `empty` slots.
@@ -2616,6 +2672,15 @@ worker_run_loop(worker_t *self)
              i++) {
             session_t *s;
             cxn_t *c, **cp;
+            struct {
+                bool cxn_empty;
+                bool terminal_full;
+                eof_state_t eof;
+            }
+#if 0
+            before,
+#endif
+            after;
 
             s = &session_half[i];
 
@@ -2631,10 +2696,41 @@ worker_run_loop(worker_t *self)
 
             assert(stole || i < ncontexts ||
                    !c->sent_first || !fifo_empty(s->ready_for_terminal) ||
-                   cancelled);
+                   global_state.cancelled);
+
+#if 0
+            before.cxn_empty = fifo_empty(s->ready_for_cxn);
+            before.terminal_full = fifo_full(s->ready_for_terminal);
+            before.eof = c->eof;
+#endif
+
+            loop_control_t ctl = session_loop(self, s);
+
+            after.cxn_empty = fifo_empty(s->ready_for_cxn);
+            after.terminal_full = fifo_full(s->ready_for_terminal);
+            after.eof = c->eof;
+
+#if 0
+            if (after.cxn_empty && !before.cxn_empty)
+                s->waitable = false;
+            else if (after.terminal_full && !before.terminal_full)
+                s->waitable = false;
+            else if (after.eof.local != before.eof.local ||
+                     after.eof.remote != before.eof.remote)
+                s->waitable = false;
+#else
+            if (!fifo_empty(s->ready_for_terminal))
+                s->waitable = false;
+            else if (after.eof.remote && !after.eof.local)
+                s->waitable = false;
+#endif
+            else if (!c->sent_first)
+                s->waitable = false;
+            else
+                s->waitable = true;
 
             // continue at next cxn_t if `c` did not exit
-            switch (session_loop(self, s)) {
+            switch (ctl) {
             case loop_continue:
                 continue;
             case loop_end:
@@ -2657,7 +2753,7 @@ worker_run_loop(worker_t *self)
                 ;
             else if (epoll_ctl(self->epoll_fd, EPOLL_CTL_DEL, c->cq_wait_fd,
                 NULL) == -1) {
-                err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_ADD,)",
+                err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_DEL,)",
                     __func__, __LINE__);
             }
 
@@ -2713,7 +2809,8 @@ worker_idle_loop(worker_t *self)
     const ptrdiff_t self_idx = self - &workers[0];
 
     (void)pthread_mutex_lock(&workers_mtx);
-    while (nworkers_running <= self_idx && !self->shutting_down)
+    while (nworkers_running <= self_idx && !self->shutting_down &&
+           !self->canceled)
         pthread_cond_wait(&self->sleep, &workers_mtx);
     (void)pthread_mutex_unlock(&workers_mtx);
 }
@@ -2721,12 +2818,16 @@ worker_idle_loop(worker_t *self)
 static void
 worker_stats_log(worker_t *self)
 {
-    hlog_fast(worker_stats, "worker %p %" PRIu64 " loops no I/O ready",
-        (void *)self, self->stats.loops.no_io_ready);
-    hlog_fast(worker_stats, "worker %p %" PRIu64 " loops no session ready",
-        (void *)self, self->stats.loops.no_session_ready);
-    hlog_fast(worker_stats, "worker %p %" PRIu64 " loops total",
-        (void *)self, self->stats.loops.total);
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " epoll loops waitable",
+        (void *)self, self->stats.epoll_loops.waitable);
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " epoll loops total",
+        (void *)self, self->stats.epoll_loops.total);
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " half loops no I/O ready",
+        (void *)self, self->stats.half_loops.no_io_ready);
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " half loops no session ready",
+        (void *)self, self->stats.half_loops.no_session_ready);
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " half loops total",
+        (void *)self, self->stats.half_loops.total);
 }
 
 static void *
@@ -2835,11 +2936,15 @@ worker_init(worker_t *w)
         , .ctxs_serviced_since_mark = 0
     };
     w->stats = (worker_stats_t){
-        .loops = {
+          .epoll_loops = {
+              .waitable = 0
+            , .total = 0
+          }
+        , .half_loops = {
               .no_io_ready = 0
             , .no_session_ready = 0
             , .total = 0
-        }
+          }
     };
 }
 
@@ -2863,6 +2968,9 @@ worker_launch(worker_t *w)
     w->epoll_sigset = blockset;
 
     if (sigaddset(&blockset, SIGUSR1) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+
+    if (sigaddset(&blockset, SIGUSR2) == -1)
         err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
     CPU_ZERO(&cpuset);
@@ -2971,7 +3079,7 @@ workers_initialize(void)
 }
 
 static bool
-worker_assign_session(worker_t *w, session_t *s)
+worker_assign_session(worker_t *w, session_t s)
 {
     size_t half, i;
     int rc;
@@ -2990,17 +3098,20 @@ worker_assign_session(worker_t *w, session_t *s)
             if (slot->cxn != NULL)
                 continue;
 
-            rc = fi_poll_add(w->pollset[half], &s->cxn->cq->fid, 0);
+            *slot = s;
+            slot->cxn->parent = slot;
+
+            rc = fi_poll_add(w->pollset[half], &s.cxn->cq->fid, 0);
 
             if (rc != 0)
                 bailout_for_ofi_ret(rc, "fi_poll_add");
 
             if (!global_state.waitfd)
                 ;
-            else if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, s->cxn->cq_wait_fd,
+            else if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, s.cxn->cq_wait_fd,
                 &(struct epoll_event){
                   .events = EPOLLIN
-                , .data = {.ptr = &s->cxn}
+                , .data = {.ptr = slot->cxn}
                 }) == -1) {
                 err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_ADD,)",
                     __func__, __LINE__);
@@ -3008,9 +3119,6 @@ worker_assign_session(worker_t *w, session_t *s)
 
             atomic_fetch_add_explicit(&w->nsessions[half], 1,
                 memory_order_relaxed);
-
-            *slot = *s;
-            s->cxn->parent = slot;
 
             (void)pthread_mutex_unlock(mtx);
             return true;
@@ -3028,7 +3136,7 @@ worker_assign_session(worker_t *w, session_t *s)
  * Caller must hold `workers_mtx`.
  */
 static worker_t *
-workers_assign_session_to_running(session_t *s)
+workers_assign_session_to_running(session_t s)
 {
     size_t iplus1;
 
@@ -3045,7 +3153,7 @@ workers_assign_session_to_running(session_t *s)
  * Caller must hold `workers_mtx`.
  */
 static worker_t *
-workers_assign_session_to_idle(session_t *s)
+workers_assign_session_to_idle(session_t s)
 {
     size_t i;
 
@@ -3070,7 +3178,7 @@ workers_wake(worker_t *w)
 }
 
 static worker_t *
-workers_assign_session(session_t *s)
+workers_assign_session(session_t s)
 {
     worker_t *w;
 
@@ -3136,9 +3244,13 @@ workers_join_all(void)
 
 static void
 cxn_init(cxn_t *c, struct fid_av *av,
-    loop_control_t (*loop)(worker_t *, session_t *))
+    loop_control_t (*loop)(worker_t *, session_t *),
+    void (*cancel)(cxn_t *), bool (*cancellation_complete)(cxn_t *))
 {
     memset(c, 0, sizeof(*c));
+    c->magic = 0xdeadbeef;
+    c->cancel = cancel;
+    c->cancellation_complete = cancellation_complete;
     c->loop = loop;
     c->av = av;
     c->sent_first = false;
@@ -3189,7 +3301,7 @@ xmtr_init(xmtr_t *x, struct fid_av *av)
     x->phase = false;
     x->bytes_progress = 0;
 
-    cxn_init(&x->cxn, av, xmtr_loop);
+    cxn_init(&x->cxn, av, xmtr_loop, xmtr_cancel, xmtr_cancellation_complete);
     xmtr_memory_init(x);
     if ((x->wrposted = fifo_create(maxposted)) == NULL) {
         errx(EXIT_FAILURE,
@@ -3317,7 +3429,7 @@ rcvr_init(rcvr_t *r, struct fid_av *av)
 
     memset(r, 0, sizeof(*r));
 
-    cxn_init(&r->cxn, av, rcvr_loop);
+    cxn_init(&r->cxn, av, rcvr_loop, rcvr_cancel, rcvr_cancellation_complete);
     rcvr_memory_init(r);
 
     if ((r->tgtposted = fifo_create(64)) == NULL) {
@@ -3418,9 +3530,9 @@ get_session_accept(get_state_t *gst)
         if (ncompleted == -FI_EINTR)
             hlog_fast(signal, "%s: fi_cq_sread interrupted", __func__);
     } while (ncompleted == -FI_EAGAIN ||
-             (ncompleted == -FI_EINTR && !cancelled));
+             (ncompleted == -FI_EINTR && !global_state.cancelled));
 
-    if (cancelled)
+    if (global_state.cancelled)
         errx(EXIT_FAILURE, "caught a signal, exiting.");
 
     if (ncompleted < 0)
@@ -3667,7 +3779,7 @@ get(void)
     for (i = 0; i < global_state.nsessions; i++) {
         gs = &gst->session[i];
 
-        if ((w = workers_assign_session(&gs->sess)) == NULL) {
+        if ((w = workers_assign_session(gs->sess)) == NULL) {
             errx(EXIT_FAILURE,
                 "%s: could not assign a new receiver to a worker", __func__);
         }
@@ -3801,7 +3913,7 @@ put(void)
     for (i = 0; i < global_state.nsessions; i++) {
         ps = &pst->session[i];
 
-        if ((w = workers_assign_session(&ps->sess)) == NULL) {
+        if ((w = workers_assign_session(ps->sess)) == NULL) {
             errx(EXIT_FAILURE,
                 "%s: could not assign a new transmitter to a worker", __func__);
         }
@@ -3859,13 +3971,79 @@ handle_wakeup(int signum, siginfo_t *info, void *ucontext)
 static void
 handle_cancel(int signum, siginfo_t *info, void *ucontext)
 {
-    cancelled = 1;
+}
+
+static void *
+await_cancellation(void *arg)
+{
+    sigset_t cancelset;
+    size_t i;
+
+    if (sigemptyset(&cancelset) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigemptyset", __func__, __LINE__);
+
+    for (i = 0; i < arraycount(siglist); i++) {
+        if (sigaddset(&cancelset, siglist[i].signum) == -1)
+            err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+    }
+
+    if (sigaddset(&cancelset, SIGUSR1) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+
+    for (;;) {
+        int rc, sig;
+
+        if ((rc = sigwait(&cancelset, &sig)) != 0) {
+            errx(EXIT_FAILURE, "%s.%d: sigwait: %s", __func__, __LINE__,
+                strerror(rc));
+        }
+
+        /* Join the main thread when SIGUSR1 arrives. */
+        if (sig == SIGUSR1)
+            break;
+
+        /* Ignore repeat cancellations. */
+        if (global_state.cancelled)
+            continue;
+
+        global_state.cancelled = true;
+
+        if ((rc = pthread_kill(global_state.main_thd, SIGUSR2)) != 0) {
+            errx(EXIT_FAILURE,
+                "%s: could not signal thread for main thread: %s",
+                __func__, strerror(rc));
+        }
+
+        (void)pthread_mutex_lock(&workers_mtx);
+
+        for (i = 0; i < nworkers_running; i++) {
+            worker_t *w = &workers[i];
+
+            (void)pthread_cond_signal(&w->sleep);
+
+            /*
+             * Wake each worker with SIGUSR1 if blocking in epoll_pwait(2)
+             * is allowed.
+             */
+            if (global_state.waitfd &&
+                (rc = pthread_kill(w->thd, SIGUSR1)) != 0) {
+                errx(EXIT_FAILURE,
+                    "%s: could not signal thread for worker %p: %s",
+                    __func__, (void *)w, strerror(rc));
+            }
+        }
+
+        (void)pthread_cond_signal(&nworkers_cond);
+
+        (void)pthread_mutex_unlock(&workers_mtx);
+    }
+    return NULL;
 }
 
 int
 main(int argc, char **argv)
 {
-    sigset_t oldset, blockset;
+    sigset_t oldset, blockset, usr2set;
     struct fi_info *hints;
     const char *addr = NULL;
     char *end, *progname, *tmp;
@@ -4047,12 +4225,21 @@ main(int argc, char **argv)
     if (sigemptyset(&blockset) == -1)
         err(EXIT_FAILURE, "%s.%d: sigemptyset", __func__, __LINE__);
 
+    if (sigemptyset(&usr2set) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigemptyset", __func__, __LINE__);
+
     for (i = 0; i < arraycount(siglist); i++) {
         if (sigaddset(&blockset, siglist[i].signum) == -1)
             err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
     }
 
     if (sigaddset(&blockset, SIGUSR1) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+
+    if (sigaddset(&blockset, SIGUSR2) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+
+    if (sigaddset(&usr2set, SIGUSR2) == -1)
         err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
     if ((rc = pthread_sigmask(SIG_BLOCK, &blockset, &oldset)) != 0) {
@@ -4078,15 +4265,38 @@ main(int argc, char **argv)
     if (sigemptyset(&wakeup_action.sa_mask) == -1)
         err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
-    if (sigaction(SIGUSR1, &wakeup_action, &saved_wakeup_action) == -1)
+    if (sigaction(SIGUSR1, &wakeup_action, &saved_wakeup1_action) == -1)
         err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
-    if ((rc = pthread_sigmask(SIG_UNBLOCK, &blockset, NULL)) != 0) {
-        errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
+    if (sigaction(SIGUSR2, &wakeup_action, &saved_wakeup2_action) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+
+    if ((rc = pthread_create(&global_state.cancel_thd, NULL,
+        await_cancellation, NULL)) != 0) {
+        warnx("%s.%d: pthread_create: %s", __func__, __LINE__,
             strerror(rc));
+        ecode = EXIT_FAILURE;
+        goto out;
+    }
+
+    global_state.main_thd = pthread_self();
+
+    if ((rc = pthread_sigmask(SIG_UNBLOCK, &usr2set, NULL)) != 0) {
+        warnx("%s.%d: pthread_sigmask: %s", __func__, __LINE__, strerror(rc));
+        goto out;
     }
 
     ecode = (*global_state.personality)();
+
+    if ((rc = pthread_kill(global_state.cancel_thd, SIGUSR1)) != 0) {
+        warnx("%s.%d: pthread_kill: %s", __func__, __LINE__, strerror(rc));
+    }
+
+    if ((rc = pthread_join(global_state.cancel_thd, NULL)) != 0) {
+        warnx("%s.%d: pthread_join: %s", __func__, __LINE__, strerror(rc));
+    }
+
+out:
 
     if ((rc = pthread_sigmask(SIG_SETMASK, &oldset, NULL)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
