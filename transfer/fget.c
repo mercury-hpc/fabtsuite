@@ -14,6 +14,8 @@
 #include <string.h> /* strcmp(3), strdup(3) */
 #include <unistd.h> /* getopt(3), sysconf(3) */
 
+#include <sys/epoll.h>
+
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>     /* fi_listen, fi_getname */
 #include <rdma/fi_domain.h>
@@ -194,6 +196,10 @@ struct cxn {
     struct fid_eq *eq;
     fi_addr_t peer_addr;
     struct fid_cq *cq;
+    int cq_wait_fd;     /* if we're using FI_WAIT_FD, the descriptor  
+                         * to use with epoll(2) to sleep until I/O is
+                         * ready
+                         */
     struct fid_av *av;
     session_t *parent;  // pointer to the connection's current session_t
     bool sent_first;    /* receiving: set to `true` once this receiver sends an
@@ -323,8 +329,19 @@ struct session {
     fifo_t *ready_for_terminal;
 };
 
+typedef struct worker_stats worker_stats_t;
+
+struct worker_stats {
+    struct {
+        uint64_t no_io_ready;
+        uint64_t no_session_ready;
+        uint64_t total;
+    } loops;
+};
+
 struct worker {
     pthread_t thd;
+    sigset_t epoll_sigset;
     load_t load;
     terminal_t *term[WORKER_SESSIONS_MAX];
     session_t session[WORKER_SESSIONS_MAX];
@@ -344,9 +361,12 @@ struct worker {
         buflist_t *rx;
     } paybufs;    /* Reservoirs for free payload buffers. */
     keysource_t keys;
+    worker_stats_t stats;
+    int epoll_fd;   /* returned by epoll_create(2) */
 };
 
 typedef struct {
+    struct fi_context ctx;  // this has to be the first member
     sink_t sink;
     rcvr_t rcvr;
     session_t sess;
@@ -405,6 +425,8 @@ HLOG_OUTLET_SHORT_DEFN(session_loop, all);
 HLOG_OUTLET_SHORT_DEFN(write, all);
 HLOG_OUTLET_SHORT_DEFN(rxctl, all);
 HLOG_OUTLET_SHORT_DEFN(protocol, all);
+HLOG_OUTLET_SHORT_DEFN(proto_vector, protocol);
+HLOG_OUTLET_SHORT_DEFN(proto_progress, protocol);
 HLOG_OUTLET_SHORT_DEFN(txctl, all);
 HLOG_OUTLET_SHORT_DEFN(txdefer, all);
 HLOG_OUTLET_SHORT_DEFN(memreg, all);
@@ -414,6 +436,7 @@ HLOG_OUTLET_FLAGS_DEFN(payload, all, HLOG_F_NO_PREFIX|HLOG_F_NO_SUFFIX);
 HLOG_OUTLET_SHORT_DEFN(paybuf, all);
 HLOG_OUTLET_SHORT_DEFN(paybuflist, paybuf);
 HLOG_OUTLET_SHORT_DEFN(completion, all);
+HLOG_OUTLET_SHORT_DEFN(worker_stats, all);
 
 static const char fget_fput_service_name[] = "4242";
 
@@ -437,6 +460,8 @@ static struct {
 , {.signum = SIGQUIT}
 , {.signum = SIGTERM}
 };
+
+static struct sigaction saved_wakeup_action;
 
 static const struct {
     uint64_t rx;
@@ -1177,7 +1202,7 @@ txctl_complete(txctl_t *tc, const completion_t *cmpl)
 
     if (cmpl->xfc != &h->xfc) {
         errx(EXIT_FAILURE, "%s: expected context %p received %p",
-            __func__, (void *)&h->xfc.ctx, cmpl->xfc);
+            __func__, (void *)&h->xfc.ctx, (void *)cmpl->xfc);
     }
 
     if (!buflist_put(tc->pool, h))
@@ -1369,7 +1394,7 @@ rcvr_progress_rx_process(rcvr_t *r, const completion_t *cmpl)
     r->nfull += pb->msg.nfilled;
 
     if (pb->msg.nleftover == 0) {
-        hlog_fast(protocol, "%s: received remote EOF", __func__);
+        hlog_fast(proto_progress, "%s: received remote EOF", __func__);
         r->cxn.eof.remote = true;
     }
 
@@ -1464,8 +1489,14 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
         vb->hdr.nused = (char *)&vb->msg.iov[0] - (char *)&vb->msg;
         (void)fifo_put(r->vec.ready, &vb->hdr);
         r->cxn.eof.local = true;
-        hlog_fast(protocol, "%s: enqueued local EOF", __func__);
-    } else while (!fifo_full(r->vec.ready) && !fifo_empty(ready_for_cxn) &&
+        hlog_fast(proto_vector, "%s: rcvr %p enqueued local EOF", __func__,
+            (void *)r);
+        return;
+    } else if (r->cxn.eof.remote) {
+        return;   // send no more non-empty vectors after remote sends EOF
+    }
+
+    while (!fifo_full(r->vec.ready) && !fifo_empty(ready_for_cxn) &&
            (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
 
         for (i = 0;
@@ -1490,6 +1521,8 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
         vb->hdr.nused = (char *)&vb->msg.iov[i] - (char *)&vb->msg;
 
         (void)fifo_put(r->vec.ready, &vb->hdr);
+        hlog_fast(proto_vector, "%s: rcvr %p enqueued vector", __func__,
+            (void *)r);
     }
 }
 
@@ -1862,14 +1895,14 @@ xmtr_vecbuf_unload(xmtr_t *x)
     riov = (!x->phase) ? x->riov : x->riov2;
 
     if (!x->cxn.eof.remote && vb->msg.niovs == 0) {
-        hlog_fast(protocol, "%s: received remote EOF", __func__);
+        hlog_fast(proto_vector, "%s: received remote EOF", __func__);
         x->cxn.eof.remote = true;
     }
 
     for (i = x->next_riov;
          i < vb->msg.niovs && x->nriovs < arraycount(x->riov);
          i++) {
-        hlog_fast(protocol, "%s: received vector %zu "
+        hlog_fast(proto_vector, "%s: received vector %zu "
             "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
             __func__, i, vb->msg.iov[i].addr, vb->msg.iov[i].len,
             vb->msg.iov[i].key);
@@ -2228,7 +2261,7 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
     pb->msg.nfilled = x->bytes_progress;
     pb->msg.nleftover = reached_eof ? 0 : 1;
 
-    hlog_fast(protocol, "%s: sending progress message, %"
+    hlog_fast(proto_progress, "%s: sending progress message, %"
         PRIu64 " filled, %" PRIu64 " leftover", __func__,
         pb->msg.nfilled, pb->msg.nleftover);
 
@@ -2237,7 +2270,7 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
     (void)fifo_put(x->progress.ready, &pb->hdr);
 
     if (reached_eof) {
-        hlog_fast(protocol, "%s: enqueued local EOF", __func__);
+        hlog_fast(proto_progress, "%s: enqueued local EOF", __func__);
         x->cxn.eof.local = true;
     }
 }
@@ -2388,20 +2421,88 @@ worker_update_load(load_t *load, int nready)
     }
 }
 
+static bool
+worker_epoll_ready(worker_t *self)
+{
+    struct fid *fid[WORKER_SESSIONS_MAX];
+    size_t nfids = 0;
+    int i;
+
+    for (i = 0; i < arraycount(self->session); i++) {
+        cxn_t *c = self->session[i].cxn;
+
+        if (c == NULL)
+            continue;
+
+        fid[nfids++] = &c->cq->fid;
+    }
+
+    return fi_trywait(global_state.fabric, fid, nfids) == FI_SUCCESS;
+}
+
+static int
+extract_contexts_for_half(const session_t *session_half,
+    const struct epoll_event *events, int nevents, void **context,
+    bool epoll_not_ready)
+{
+    int i, ncontexts = 0;
+    const session_t *from = session_half,
+                    *upto = &session_half[WORKER_SESSIONS_MAX / 2];
+
+    if (epoll_not_ready) {
+        for (i = 0; i < upto - from; i++) {
+            if (from[i].cxn == NULL)
+                continue;
+            context[ncontexts++] = from[i].cxn;
+        }
+        return ncontexts;
+    }
+
+    for (i = 0; i < nevents; i++) {
+        cxn_t *c = events[i].data.ptr;
+
+        if (c->parent < from || upto < c->parent)
+            continue;
+
+        context[ncontexts++] = c;
+    }
+
+    return ncontexts;
+}
+
 static void
 worker_run_loop(worker_t *self)
 {
     size_t half, i;
+    struct epoll_event events[WORKER_SESSIONS_MAX];
+    int nevents;
+    bool epoll_ready;
+
+    if (global_state.waitfd &&
+        (epoll_ready = worker_epoll_ready(self)) &&
+        (nevents =
+            epoll_pwait(self->epoll_fd, events, (int)arraycount(events), 0,
+                        &self->epoll_sigset)) == -1 &&
+        errno != EINTR)
+        err(EXIT_FAILURE, "%s: epoll_pwait", __func__);
 
     for (half = 0; half < 2; half++) {
         void *context[WORKER_SESSIONS_MAX];
         pthread_mutex_t *mtx = &self->mtx[half];
+        session_t *session_half =
+            &self->session[half * arraycount(self->session) / 2];
         int ncontexts, rc;
 
         if (pthread_mutex_trylock(mtx) == EBUSY)
             continue;
 
-        ncontexts = fi_poll(self->pollset[half], context, WORKER_SESSIONS_MAX);
+        if (global_state.waitfd) {
+            ncontexts = extract_contexts_for_half(session_half, events, nevents,
+                context, !epoll_ready);
+        } else {
+            ncontexts = fi_poll(self->pollset[half], context,
+                WORKER_SESSIONS_MAX);
+        }
 
         if (ncontexts < 0) {
             (void)pthread_mutex_unlock(mtx);
@@ -2415,9 +2516,6 @@ worker_run_loop(worker_t *self)
          * they are cancelled.
          */
         worker_update_load(&self->load, ncontexts);
-
-        session_t *session_half =
-            &self->session[half * arraycount(self->session) / 2];
 
         for (i = 0; i < ncontexts; i++) {
             cxn_t *c = context[i];
@@ -2433,7 +2531,8 @@ worker_run_loop(worker_t *self)
             sessions_swap(s, &session_half[i]);
         }
 
-        session_t *ready_up_to = &session_half[ncontexts];
+        session_t *io_ready_up_to = &session_half[ncontexts];
+        session_t *ready_up_to = io_ready_up_to;
 
         for (i = ready_up_to - session_half;
              i < arraycount(self->session) / 2;
@@ -2454,6 +2553,14 @@ worker_run_loop(worker_t *self)
         }
 
         session_t *active_up_to = ready_up_to;
+
+        self->stats.loops.total++;
+
+        if (io_ready_up_to == session_half)
+            self->stats.loops.no_io_ready++;
+
+        if (ready_up_to == io_ready_up_to)
+            self->stats.loops.no_session_ready++;
 
         /*
          * TBD change terminology to `occupied` and `empty` slots.
@@ -2545,6 +2652,15 @@ worker_run_loop(worker_t *self)
 
             if ((rc = fi_poll_del(self->pollset[half], &c->cq->fid, 0)) != 0)
                 bailout_for_ofi_ret(rc, "fi_poll_del");
+
+            if (!global_state.waitfd)
+                ;
+            else if (epoll_ctl(self->epoll_fd, EPOLL_CTL_DEL, c->cq_wait_fd,
+                NULL) == -1) {
+                err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_ADD,)",
+                    __func__, __LINE__);
+            }
+
             atomic_fetch_add_explicit(&self->nsessions[half], -1,
                 memory_order_relaxed);
         }
@@ -2600,6 +2716,17 @@ worker_idle_loop(worker_t *self)
     while (nworkers_running <= self_idx && !self->shutting_down)
         pthread_cond_wait(&self->sleep, &workers_mtx);
     (void)pthread_mutex_unlock(&workers_mtx);
+}
+
+static void
+worker_stats_log(worker_t *self)
+{
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " loops no I/O ready",
+        (void *)self, self->stats.loops.no_io_ready);
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " loops no session ready",
+        (void *)self, self->stats.loops.no_session_ready);
+    hlog_fast(worker_stats, "worker %p %" PRIu64 " loops total",
+        (void *)self, self->stats.loops.total);
 }
 
 static void *
@@ -2680,6 +2807,11 @@ worker_init(worker_t *w)
             strerror(rc));
     }
 
+    if (!global_state.waitfd)
+        w->epoll_fd = -1;
+    else if ((w->epoll_fd = epoll_create(1)) == -1)
+        err(EXIT_FAILURE, "%s.%d: epoll_create", __func__, __LINE__);
+
     for (i = 0; i < arraycount(w->mtx); i++) {
         if ((rc = pthread_mutex_init(&w->mtx[i], NULL)) != 0) {
             errx(EXIT_FAILURE, "%s.%d: pthread_mutex_init: %s",
@@ -2700,7 +2832,15 @@ worker_init(worker_t *w)
         , .min_loop_contexts = INT_MAX
         , .average = 0
         , .loops_since_mark = 0
-        , .ctxs_serviced_since_mark = 0};
+        , .ctxs_serviced_since_mark = 0
+    };
+    w->stats = (worker_stats_t){
+        .loops = {
+              .no_io_ready = 0
+            , .no_session_ready = 0
+            , .total = 0
+        }
+    };
 }
 
 static bool
@@ -2719,6 +2859,11 @@ worker_launch(worker_t *w)
         if (sigaddset(&blockset, siglist[i].signum) == -1)
             err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
     }
+
+    w->epoll_sigset = blockset;
+
+    if (sigaddset(&blockset, SIGUSR1) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
     CPU_ZERO(&cpuset);
     CPU_SET(global_state.nextcpu, &cpuset);
@@ -2846,16 +2991,35 @@ worker_assign_session(worker_t *w, session_t *s)
                 continue;
 
             rc = fi_poll_add(w->pollset[half], &s->cxn->cq->fid, 0);
+
             if (rc != 0)
                 bailout_for_ofi_ret(rc, "fi_poll_add");
+
+            if (!global_state.waitfd)
+                ;
+            else if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, s->cxn->cq_wait_fd,
+                &(struct epoll_event){
+                  .events = EPOLLIN
+                , .data = {.ptr = &s->cxn}
+                }) == -1) {
+                err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_ADD,)",
+                    __func__, __LINE__);
+            }
+
             atomic_fetch_add_explicit(&w->nsessions[half], 1,
                 memory_order_relaxed);
+
             *slot = *s;
             s->cxn->parent = slot;
+
             (void)pthread_mutex_unlock(mtx);
             return true;
         }
         (void)pthread_mutex_unlock(mtx);
+    }
+    if (global_state.waitfd && (rc = pthread_kill(w->thd, SIGUSR1)) != 0) {
+        errx(EXIT_FAILURE, "%s: could not signal thread for worker %p: %s",
+            __func__, (void *)w, strerror(rc));
     }
     return false;
 }
@@ -2961,6 +3125,12 @@ workers_join_all(void)
         if (w->failed || w->canceled != global_state.expect_cancellation)
             code = EXIT_FAILURE;
     }
+
+    for (i = 0; i < nworkers_allocated; i++) {
+        worker_t *w = &workers[i];
+        worker_stats_log(w);
+    }
+
     return code;
 }
 
@@ -3209,7 +3379,7 @@ post_initial_rx(struct fid_ep *ep, get_session_t *gs)
         , .desc = r->initial.desc
         , .iov_count = r->initial.niovs
         , .addr = r->cxn.peer_addr
-        , .context = gs
+        , .context = &gs->ctx
         , .data = 0
         }, FI_COMPLETION);
 
@@ -3317,6 +3487,17 @@ get_session_accept(get_state_t *gst)
     if ((rc = fi_cq_open(global_state.domain, &cq_attr, &r->cxn.cq,
                          &r->cxn)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
+
+    if (global_state.waitfd) {
+        int fd;
+
+        rc = fi_control(&r->cxn.cq->fid, FI_GETWAIT, &fd);
+
+        if (rc != 0)
+            bailout_for_ofi_ret(rc, "fi_control(,FI_GETWAIT,)");
+
+        r->cxn.cq_wait_fd = fd;
+    }
 
     if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.cq->fid,
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
@@ -3525,6 +3706,17 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
                          &x->cxn)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
+    if (global_state.waitfd) {
+        int fd;
+
+        rc = fi_control(&x->cxn.cq->fid, FI_GETWAIT, &fd);
+
+        if (rc != 0)
+            bailout_for_ofi_ret(rc, "fi_control(,FI_GETWAIT,)");
+
+        x->cxn.cq_wait_fd = fd;
+    }
+
     if ((rc = fi_eq_open(global_state.fabric, &eq_attr, &x->cxn.eq, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_eq_open");
 
@@ -3655,8 +3847,17 @@ usage(personality_t personality, const char *progname)
     exit(EXIT_FAILURE);
 }
 
+/* Handler for SIGUSR1, used to wake a thread from epoll(2) so that
+ * it can pick up new sessions.
+ */
 static void
-handler(int signum, siginfo_t *info, void *ucontext)
+handle_wakeup(int signum, siginfo_t *info, void *ucontext)
+{
+}
+
+/* Handler for SIG{HUP,INT,QUIT,TERM}, used to cancel the program. */
+static void
+handle_cancel(int signum, siginfo_t *info, void *ucontext)
 {
     cancelled = 1;
 }
@@ -3785,8 +3986,9 @@ main(int argc, char **argv)
     hlog_fast(params, "%d infos found", count_info(global_state.info));
 
     if ((global_state.info->mode & FI_CONTEXT) != 0) {
-        errx(EXIT_FAILURE,
-           "contexts should embed fi_context, but I don't do that, yet.");
+        hlog_fast(params,
+            "contexts must embed fi_context; good thing %s does that.",
+            progname);
     }
 
     rc = fi_fabric(global_state.info->fabric_attr, &global_state.fabric,
@@ -3850,21 +4052,34 @@ main(int argc, char **argv)
             err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
     }
 
+    if (sigaddset(&blockset, SIGUSR1) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+
     if ((rc = pthread_sigmask(SIG_BLOCK, &blockset, &oldset)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,
             strerror(rc));
     }
 
-    struct sigaction action = {.sa_sigaction = handler, .sa_flags = SA_SIGINFO};
+    struct sigaction cancel_action = {.sa_sigaction = handle_cancel,
+                                      .sa_flags = SA_SIGINFO};
 
-    if (sigemptyset(&action.sa_mask) == -1)
+    if (sigemptyset(&cancel_action.sa_mask) == -1)
         err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
     for (i = 0; i < arraycount(siglist); i++) {
-        if (sigaction(siglist[i].signum, &action,
+        if (sigaction(siglist[i].signum, &cancel_action,
                       &siglist[i].saved_action) == -1)
             err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
     }
+
+    struct sigaction wakeup_action = {.sa_sigaction = handle_wakeup,
+                                      .sa_flags = SA_SIGINFO};
+
+    if (sigemptyset(&wakeup_action.sa_mask) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
+
+    if (sigaction(SIGUSR1, &wakeup_action, &saved_wakeup_action) == -1)
+        err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
     if ((rc = pthread_sigmask(SIG_UNBLOCK, &blockset, NULL)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_sigmask: %s", __func__, __LINE__,

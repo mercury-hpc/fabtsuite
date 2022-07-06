@@ -119,6 +119,8 @@ env_for_flagset()
 			;;
 		reregister)
 			;;
+		wait)
+			;;
 		esac
 	done
 	echo $env
@@ -141,6 +143,8 @@ counterpart_cmd_for_flagset()
 		default)
 			;;
 		reregister)
+			;;
+		wait)
 			;;
 		esac
 	done
@@ -167,6 +171,9 @@ cmd_for_flagset()
 		reregister)
 			cmd="$cmd -r"
 			;;
+		wait)
+			cmd="$cmd -w"
+			;;
 		esac
 	done
 	echo $cmd
@@ -184,6 +191,7 @@ key:
       cacheless: env FI_MR_CACHE_MAX_SIZE=0, disable memory-registration cache
       contiguous: -g, RDMA conti(g)uous bytes, no scatter-gather
       reregister: -r, deregister/(r)eregister each RDMA buffer before reuse
+      wait: -w, wait for I/O using epoll_pwait(2) instead of fi_poll(3)
 
   duration: elapsed real time in seconds
 
@@ -238,7 +246,7 @@ fi
 
 test_host=$1
 
-generic_flagset="default cancel cacheless reregister cacheless,reregister"
+generic_flagset="default cancel cacheless reregister cacheless,reregister wait"
 fget_flagset=$generic_flagset
 fput_flagset="$generic_flagset contiguous contiguous,reregister"
 fput_flagset="$fput_flagset contiguous,reregister,cacheless"
