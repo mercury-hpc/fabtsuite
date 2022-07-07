@@ -2676,9 +2676,6 @@ worker_run_loop(worker_t *self)
                 bool terminal_full;
                 eof_state_t eof;
             }
-#if 0
-            before,
-#endif
             after;
 
             s = &session_half[i];
@@ -2697,11 +2694,6 @@ worker_run_loop(worker_t *self)
                    !c->sent_first || !fifo_empty(s->ready_for_terminal) ||
                    global_state.cancelled);
 
-#if 0
-            before.cxn_empty = fifo_empty(s->ready_for_cxn);
-            before.terminal_full = fifo_full(s->ready_for_terminal);
-            before.eof = c->eof;
-#endif
 
             loop_control_t ctl = session_loop(self, s);
 
@@ -2709,20 +2701,10 @@ worker_run_loop(worker_t *self)
             after.terminal_full = fifo_full(s->ready_for_terminal);
             after.eof = c->eof;
 
-#if 0
-            if (after.cxn_empty && !before.cxn_empty)
-                s->waitable = false;
-            else if (after.terminal_full && !before.terminal_full)
-                s->waitable = false;
-            else if (after.eof.local != before.eof.local ||
-                     after.eof.remote != before.eof.remote)
-                s->waitable = false;
-#else
             if (!fifo_empty(s->ready_for_terminal))
                 s->waitable = false;
             else if (after.eof.remote && !after.eof.local)
                 s->waitable = false;
-#endif
             else if (!c->sent_first)
                 s->waitable = false;
             else
