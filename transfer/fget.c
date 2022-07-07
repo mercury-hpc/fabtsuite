@@ -374,7 +374,6 @@ typedef struct {
 } get_session_t;
 
 typedef struct {
-    struct fid_eq *listen_eq;
     struct fid_ep *listen_ep;
     struct fid_cq *listen_cq;
     struct fid_av *av;
@@ -3580,13 +3579,6 @@ get_state_open(void)
     , .wait_cond = FI_CQ_COND_NONE
     , .wait_set = NULL
     };
-    struct fi_eq_attr eq_attr = {
-      .size = 128
-    , .flags = 0
-    , .wait_obj = FI_WAIT_UNSPEC
-    , .signaling_vector = 0     /* don't care */
-    , .wait_set = NULL          /* don't care */
-    };
     get_state_t *gst;
     int rc;
 
@@ -3607,10 +3599,6 @@ get_state_open(void)
                           &gst->listen_ep, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
-    if ((rc = fi_eq_open(global_state.fabric, &eq_attr, &gst->listen_eq,
-                         NULL)) != 0)
-        bailout_for_ofi_ret(rc, "fi_eq_open (listen)");
-
     if ((rc = fi_cq_open(global_state.domain, &cq_attr, &gst->listen_cq,
                          NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
@@ -3618,9 +3606,6 @@ get_state_open(void)
     if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_cq->fid,
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind (completion queue)");
-
-    if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_eq->fid, 0)) != 0)
-        bailout_for_ofi_ret(rc, "fi_ep_bind (event queue)");
 
     if ((rc = fi_ep_bind(gst->listen_ep, &gst->av->fid, 0)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind (address vector)");
