@@ -1,9 +1,10 @@
 # Running the tests
 
-To start a test sequence, start the test script, `scripts/run-suite <hostname>`, replacing
-`<hostname>` either with the name of the test host (e.g., `hostname`
-output) or with `localhost`.  The script will run silently for a few
-minutes and then print a report like this one:
+To start a test sequence, start the test script,
+`scripts/run-suite <hostname>`, replacing `<hostname>` either with the
+name of the test host (e.g., `hostname` output) or with `localhost`.
+The script will run silently for a few minutes and then print a report
+like this one:
 
 ```
 fget parameter set          duration (s) duration/default (%)     result
@@ -116,3 +117,6 @@ fully described here:
     Generally we expect for deregistering and re-registering buffers to
     be slower than registering all buffers just once.
 
+`wait`: each worker thread will sleep in `epoll_pwait(2)` until there
+    are new I/O completions to process.  The default behavior is to check
+    for new completions in a tight loop that calls `fi_poll(3)`.
