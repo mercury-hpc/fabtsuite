@@ -3918,11 +3918,11 @@ personality_to_name(personality_t p)
 static void
 usage(personality_t personality, const char *progname)
 {
-    const char *common = "[-n] [-p 'i - j' ] [-r] [-w]";
+    const char *common = "[-n <n>] [-p '<i> - <j>' ] [-r] [-w]";
 
     if (personality == put) {
-        fprintf(stderr, "usage: %s [-c] [-g] [-k] %s <address>\n", progname,
-            common);
+        fprintf(stderr, "usage: %s [-c] [-g] [-k <k>] %s <address>\n",
+            progname, common);
     } else {
         fprintf(stderr, "usage: %s [-b <address>] [-c] %s\n", progname, common);
     }
