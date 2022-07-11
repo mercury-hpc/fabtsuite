@@ -3,4 +3,4 @@ include(${CMAKE_CURRENT_LIST_DIR}/cmake/FindLIBFABRIC.cmake)
 project(fabtsuite)
 add_subdirectory(hlog)
 add_subdirectory(transfer)
-
+add_subdirectory(scripts)
