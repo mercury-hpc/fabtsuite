@@ -416,7 +416,8 @@ typedef struct {
     bool expect_cancellation;
     bool reregister;
     bool waitfd;
-    size_t nsessions;
+    size_t local_sessions;
+    size_t total_sessions;
     personality_t personality;
     int nextcpu;
     struct {
@@ -453,7 +454,8 @@ HLOG_OUTLET_SHORT_DEFN(worker_stats, all);
 static const char fget_fput_service_name[] = "4242";
 
 static state_t global_state = {.domain = NULL, .fabric = NULL, .info = NULL,
-                               .personality = NULL, .nsessions = 1,
+                               .personality = NULL, .local_sessions = 1,
+                               .total_sessions = 1,
                                .processors = {.first = 0, .last = INT_MAX},
                                .cancelled = 0};
 
@@ -3538,11 +3540,12 @@ get_session_accept(get_state_t *gst)
             completion.len, sizeof(r->initial.msg));
     }
 
-    if (r->initial.msg.nsources != global_state.nsessions ||
-        r->initial.msg.id > global_state.nsessions) {
+    if (r->initial.msg.nsources != global_state.total_sessions ||
+        r->initial.msg.id > global_state.total_sessions) {
         errx(EXIT_FAILURE,
             "received nsources %" PRIu32 ", id %" PRIu32 ", expected %zu, 0",
-            r->initial.msg.nsources, r->initial.msg.id, global_state.nsessions);
+            r->initial.msg.nsources, r->initial.msg.id,
+            global_state.total_sessions);
     }
 
     rc = fi_av_insert(r->cxn.av, r->initial.msg.addr, 1, &r->cxn.peer_addr,
@@ -3630,7 +3633,7 @@ put_state_open(void)
     if ((pst = calloc(1, sizeof(*pst))) == NULL)
         errx(EXIT_FAILURE, "%s: failed to allocate put state", __func__);
 
-    pst->session = calloc(global_state.nsessions, sizeof(*pst->session));
+    pst->session = calloc(global_state.local_sessions, sizeof(*pst->session));
 
     if (pst->session == NULL)
         errx(EXIT_FAILURE, "%s: failed to allocate sessions", __func__);
@@ -3678,7 +3681,7 @@ get_state_open(void)
     if ((gst = calloc(1, sizeof(*gst))) == NULL)
         errx(EXIT_FAILURE, "%s: failed to allocate get state", __func__);
 
-    gst->session = calloc(global_state.nsessions, sizeof(*gst->session));
+    gst->session = calloc(global_state.total_sessions, sizeof(*gst->session));
 
     if (gst->session == NULL)
         errx(EXIT_FAILURE, "%s: failed to allocate sessions", __func__);
@@ -3721,7 +3724,7 @@ get(void)
 
     gst = get_state_open();
 
-    for (i = 0; i < global_state.nsessions; i++) {
+    for (i = 0; i < global_state.total_sessions; i++) {
         gs = &gst->session[i];
 
         r = &gs->rcvr;
@@ -3733,7 +3736,7 @@ get(void)
         post_initial_rx(gst->listen_ep, gs);
     }
 
-    for (i = 0; i < global_state.nsessions; i++) {
+    for (i = 0; i < global_state.total_sessions; i++) {
         gs = get_session_accept(gst);
 
         r = &gs->rcvr;
@@ -3743,7 +3746,7 @@ get(void)
             errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
     }
 
-    for (i = 0; i < global_state.nsessions; i++) {
+    for (i = 0; i < global_state.total_sessions; i++) {
         gs = &gst->session[i];
 
         if ((w = workers_assign_session(gs->sess)) == NULL) {
@@ -3816,7 +3819,7 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
 
     /* Setup initial message. */
     memset(&x->initial.msg, 0, sizeof(x->initial.msg));
-    x->initial.msg.nsources = global_state.nsessions;
+    x->initial.msg.nsources = global_state.total_sessions;
     x->initial.msg.id = 0;
 
     x->initial.desc = fi_mr_desc(x->initial.mr);
@@ -3864,7 +3867,7 @@ put(void)
 
     pst = put_state_open();
 
-    for (i = 0; i < global_state.nsessions; i++) {
+    for (i = 0; i < global_state.local_sessions; i++) {
         ps = &pst->session[i];
         xmtr_t *x = &ps->xmtr;
         source_t *s = &ps->source;
@@ -3877,7 +3880,7 @@ put(void)
         put_session_setup(pst, ps);
     }
 
-    for (i = 0; i < global_state.nsessions; i++) {
+    for (i = 0; i < global_state.local_sessions; i++) {
         ps = &pst->session[i];
 
         if ((w = workers_assign_session(ps->sess)) == NULL) {
@@ -3918,7 +3921,8 @@ usage(personality_t personality, const char *progname)
     const char *common = "[-n] [-p 'i - j' ] [-r] [-w]";
 
     if (personality == put) {
-        fprintf(stderr, "usage: %s [-c] [-g] %s <address>\n", progname, common);
+        fprintf(stderr, "usage: %s [-c] [-g] [-k] %s <address>\n", progname,
+            common);
     } else {
         fprintf(stderr, "usage: %s [-b <address>] [-c] %s\n", progname, common);
     }
@@ -4007,15 +4011,36 @@ await_cancellation(void *arg)
     return NULL;
 }
 
+static size_t
+parse_nsessions(const char *s, char flagname)
+{
+    char *end;
+    uintmax_t n;
+
+    errno = 0;
+    n = strtoumax(s, &end, 0);
+    if (n < 1 || SIZE_MAX < n) {
+        errx(EXIT_FAILURE, "`-%c` parameter `%s` is out of range", flagname,
+            s);
+    }
+    if (end == s) {
+        errx(EXIT_FAILURE, "could not parse `-%c` parameter `%s`", flagname,
+            s);
+    }
+    return (size_t)n;
+}
+
 int
 main(int argc, char **argv)
 {
     sigset_t oldset, blockset, usr2set;
     struct fi_info *hints;
     const char *addr = NULL;
-    char *end, *progname, *tmp;
-    uintmax_t n;
+    char *progname, *tmp;
     int ecode, i, opt, ninput, rc;
+    struct {
+        bool k, n;
+    } set = {.k = false, .n = false};
 
     if ((tmp = strdup(argv[0])) == NULL)
         err(EXIT_FAILURE, "%s: strdup", __func__);
@@ -4032,7 +4057,7 @@ main(int argc, char **argv)
     }
 
     const char *optstring =
-        (global_state.personality == get) ? "b:cn:p:rw" : "cgn:p:rw";
+        (global_state.personality == get) ? "b:cn:p:rw" : "cgk:n:p:rw";
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
@@ -4045,18 +4070,13 @@ main(int argc, char **argv)
         case 'g':
             global_state.contiguous = true;
             break;
+        case 'k':
+            set.k = true;
+            global_state.local_sessions = parse_nsessions(optarg, 'k');
+            break;
         case 'n':
-            errno = 0;
-            n = strtoumax(optarg, &end, 0);
-            if (n < 1 || SIZE_MAX < n) {
-                errx(EXIT_FAILURE, "`-n` parameter `%s` is out of range",
-                    optarg);
-            }
-            if (end == optarg) {
-                errx(EXIT_FAILURE, "could not parse `-n` parameter `%s`",
-                    optarg);
-            }
-            global_state.nsessions = (size_t)n;
+            set.n = true;
+            global_state.total_sessions = parse_nsessions(optarg, 'n');
             break;
         case 'p':
             ninput = 0;
@@ -4091,6 +4111,17 @@ main(int argc, char **argv)
         addr = argv[0];
     } else if (argc != 0)
         usage(global_state.personality, progname);
+
+    if (!set.k && set.n) {
+        global_state.local_sessions = global_state.total_sessions;
+    } else if (set.k && !set.n) {
+        global_state.total_sessions = global_state.local_sessions;
+    } else if (set.k && set.n) {
+        if (global_state.total_sessions < global_state.local_sessions) {
+            warnx("-k argument must not exceed -n argument");
+            usage(global_state.personality, progname);
+        }
+    }
 
     workers_initialize();
 
