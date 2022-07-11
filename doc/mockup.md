@@ -1,3 +1,5 @@
+Mockup `scripts/run-suite` output and some implementation notes.
+ 
 ```
 fget parameter set          duration (s) duration/default (%)     result
 --------------------------------------------------------------------------
