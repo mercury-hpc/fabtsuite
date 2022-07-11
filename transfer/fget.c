@@ -445,7 +445,8 @@ static state_t global_state = {.domain = NULL, .fabric = NULL, .info = NULL,
                                .processors = {.first = 0, .last = INT_MAX}};
 static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
-static size_t nworkers_running;
+// static size_t nworkers_running;
+atomic_int nworkers_running;
 static size_t nworkers_allocated;
 static pthread_cond_t nworkers_cond = PTHREAD_COND_INITIALIZER;
 
@@ -1857,7 +1858,8 @@ vecbuf_is_wellformed(vecbuf_t *vb)
 {
     size_t len = vb->hdr.nused;
 
-    static const ptrdiff_t least_vector_msglen =
+    // static const ptrdiff_t least_vector_msglen =
+    const ptrdiff_t least_vector_msglen =
         (char *)&vb->msg.iov[0] - (char *)&vb->msg;
 
     const size_t niovs_space = (len - least_vector_msglen) /
