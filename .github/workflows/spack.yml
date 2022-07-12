@@ -22,4 +22,4 @@ jobs:
     - name: Run a multi-line script
       run: |
         ./spack/bin/spack install fabtsuite
-        spack load fabtsuite
+
