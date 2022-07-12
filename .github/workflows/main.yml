@@ -1,0 +1,52 @@
+name: fabtsuite
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+    - '.github/**'
+    - 'doc/**'
+    - 'LICENSE'
+    - '**.md'
+
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    strategy:
+      matrix:
+        name: ["Windows Latest MSVC", "Ubuntu Latest GCC", "Ubuntu Debug GCC", "macOS Latest Clang", "Ubuntu Autotools GCC", "Windows TS MSVC", "Ubuntu TS GCC", "TS Debug GCC", "macOS TS Clang", "TS Autotools GCC"]
+        include:
+          - name: "Ubuntu Latest GCC"
+            artifact: "Linux.tar.xz"
+            os: ubuntu-latest
+            build_type: "Release"
+            generator: "-G Ninja"
+
+    name: ${{ matrix.name }}
+    # The type of runner that the job will run on
+    runs-on: ${{ matrix.os }}
+    if: "!contains(github.event.head_commit.message, 'skip-ci')"
+          
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    - name: Install Dependencies (Linux)
+      run: sudo apt-get install ninja-build libfabric
+      if: matrix.os == 'ubuntu-latest'
+    
+    # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+    - name: Get Sources
+      uses: actions/checkout@v2
+
+    - name: Configure
+      run: |
+        mkdir "${{ runner.workspace }}/build"
+        cd "${{ runner.workspace }}/build"
+        cmake ${{ matrix.generator }} -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $GITHUB_WORKSPACE -CMAKE_INSTALL_PREFIX=.
+      shell: bash
+
+    - name: Build
+      run: cmake --build . --config ${{ matrix.build_type }}
+      working-directory: ${{ runner.workspace }}/build      
+
+    - name: Test
+      run: ./scripts/run-suite localhost
+      working-directory: ${{ runner.workspace }}/build

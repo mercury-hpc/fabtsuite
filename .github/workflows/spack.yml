@@ -1,0 +1,25 @@
+name: spack fabtsuite
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+    - 'doc/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Spack
+      uses: actions/checkout@v2
+      with:
+        repository: hyoklee/spack
+        path: ./spack
+
+    - name: Run a multi-line script
+      run: |
+        ./spack/bin/spack install fabtsuite
+        spack load fabtsuite
