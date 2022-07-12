@@ -3,7 +3,6 @@ on:
   workflow_dispatch:
   push:
     paths-ignore:
-    - '.github/**'
     - 'doc/**'
     - 'LICENSE'
     - '**.md'
