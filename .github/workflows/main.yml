@@ -29,7 +29,7 @@ jobs:
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
     - name: Install Dependencies (Linux)
-      run: sudo apt-get install ninja-build libfabric
+      run: sudo apt-get install ninja-build libfabric-devel
       if: matrix.os == 'ubuntu-latest'
     
     # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
