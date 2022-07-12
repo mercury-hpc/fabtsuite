@@ -19,7 +19,6 @@ jobs:
             artifact: "Linux.tar.xz"
             os: ubuntu-latest
             build_type: "Release"
-            generator: "-G Ninja"
 
     name: ${{ matrix.name }}
     # The type of runner that the job will run on
@@ -31,7 +30,6 @@ jobs:
     - name: Install Dependencies (Linux)
       run: |
         sudo apt-get update -y
-        sudo apt-get install ninja-build 
         sudo apt-get install libfabric-devel
       if: matrix.os == 'ubuntu-latest'
     
@@ -43,7 +41,7 @@ jobs:
       run: |
         mkdir "${{ runner.workspace }}/build"
         cd "${{ runner.workspace }}/build"
-        cmake ${{ matrix.generator }} -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $GITHUB_WORKSPACE -CMAKE_INSTALL_PREFIX=.
+        cmake -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $GITHUB_WORKSPACE -CMAKE_INSTALL_PREFIX=.
       shell: bash
 
     - name: Build
