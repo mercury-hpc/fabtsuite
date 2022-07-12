@@ -13,7 +13,7 @@ jobs:
   build:
     strategy:
       matrix:
-        name: ["Windows Latest MSVC", "Ubuntu Latest GCC", "Ubuntu Debug GCC", "macOS Latest Clang", "Ubuntu Autotools GCC", "Windows TS MSVC", "Ubuntu TS GCC", "TS Debug GCC", "macOS TS Clang", "TS Autotools GCC"]
+        name: ["Ubuntu Latest GCC"]
         include:
           - name: "Ubuntu Latest GCC"
             artifact: "Linux.tar.xz"

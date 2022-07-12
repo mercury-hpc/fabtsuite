@@ -2499,10 +2499,10 @@ extract_contexts_for_half(const session_t *session_half,
 {
     int i, ncontexts = 0;
     const session_t *from = session_half,
-                    *upto = &session_half[WORKER_SESSIONS_MAX / 2];
+                    *to = &session_half[WORKER_SESSIONS_MAX / 2];
 
     if (!waitable) {
-        for (i = 0; i < upto - from; i++) {
+        for (i = 0; i < to - from; i++) {
             if (from[i].cxn == NULL)
                 continue;
             context[ncontexts++] = from[i].cxn;
@@ -2518,7 +2518,7 @@ extract_contexts_for_half(const session_t *session_half,
         if (c->parent == NULL)
             continue;
 
-        if (c->parent < from || upto <= c->parent)
+        if (c->parent < from || to <= c->parent)
             continue;
 
         context[ncontexts++] = c;
