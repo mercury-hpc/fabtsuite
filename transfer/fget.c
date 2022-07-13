@@ -1873,9 +1873,7 @@ static bool
 vecbuf_is_wellformed(vecbuf_t *vb)
 {
     size_t len = vb->hdr.nused;
-
-    static const ptrdiff_t least_vector_msglen =
-        (char *)&vb->msg.iov[0] - (char *)&vb->msg;
+    static const ptrdiff_t least_vector_msglen = offsetof(vector_msg_t, iov[0]);
 
     const size_t niovs_space = (len - least_vector_msglen) /
         sizeof(vb->msg.iov[0]);
