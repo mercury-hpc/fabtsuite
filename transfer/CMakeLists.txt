@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
 project(fabtsuite_transfer)
+string(APPEND CMAKE_C_FLAGS "-D_GNU_SOURCE")
 include_directories(${LIBFABRIC_INCLUDE_DIRS} ../hlog)
 add_executable(fget fget.c)
 message(STATUS "LIBFABRIC_LIBDIR=${LIBFABRIC_LIBDIR}")
