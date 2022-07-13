@@ -46,21 +46,10 @@ jobs:
         . ./spack/share/spack/setup-env.sh
         spack install libfabric
         spack load libfabric
-    - name: Configure
-      run: |
         mkdir "${{ runner.workspace }}/build"
         cd "${{ runner.workspace }}/build"
         cmake -DCMAKE_INSTALL_PREFIX=. $GITHUB_WORKSPACE 
-      shell: bash
+        cmake --build .
+        make install
+        ./scripts/run-suite localhost
 
-    - name: Build
-      run: cmake --build .
-      working-directory: ${{ runner.workspace }}/build      
-
-    - name: Install
-      run: make install
-      working-directory: ${{ runner.workspace }}/build      
-
-    - name: Test
-      run: ./scripts/run-suite localhost
-      working-directory: ${{ runner.workspace }}/build
