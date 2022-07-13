@@ -17,7 +17,6 @@ jobs:
           - name: "Ubuntu Latest GCC"
             artifact: "Linux.tar.xz"
             os: ubuntu-latest
-            build_type: "Release"
 
     name: ${{ matrix.name }}
     # The type of runner that the job will run on
@@ -51,11 +50,15 @@ jobs:
       run: |
         mkdir "${{ runner.workspace }}/build"
         cd "${{ runner.workspace }}/build"
-        cmake -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $GITHUB_WORKSPACE -CMAKE_INSTALL_PREFIX=.
+        cmake -DCMAKE_INSTALL_PREFIX=. $GITHUB_WORKSPACE 
       shell: bash
 
     - name: Build
-      run: cmake --build . --config ${{ matrix.build_type }}
+      run: cmake --build .
+      working-directory: ${{ runner.workspace }}/build      
+
+    - name: Install
+      run: make install
       working-directory: ${{ runner.workspace }}/build      
 
     - name: Test
