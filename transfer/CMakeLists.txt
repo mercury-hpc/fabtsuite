@@ -8,7 +8,7 @@ message(STATUS "LIBFABRIC_LIBRARIES=${LIBFABRIC_LIBRARIES}")
 target_link_libraries(fget hlog ${LIBFABRIC_LIBRARIES})
 # ADD_CUSTOM_TARGET(link_target ALL
 #                  COMMAND ${CMAKE_COMMAND} -E create_symlink fget fput)
-install(PROGRAMS fget DESTINATION transfer)
+install(TARGETS fget RUNTIME DESTINATION transfer)
 install(CODE "execute_process(
     COMMAND bash -c \"set -e
     cd $DESTDIR/${CMAKE_INSTALL_PREFIX}/transfer/
