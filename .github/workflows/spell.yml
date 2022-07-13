@@ -1,7 +1,7 @@
 # GitHub Action to automate the identification of common misspellings in text files
 # https://github.com/codespell-project/codespell
 # https://github.com/codespell-project/actions-codespell
-name: codespell
+name: check spelling
 on: [push, pull_request]
 jobs:
   codespell:

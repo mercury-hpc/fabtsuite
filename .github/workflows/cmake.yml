@@ -1,4 +1,4 @@
-name: fabtsuite cmake
+name: cmake fabtsuite
 on:
   workflow_dispatch:
   push:
