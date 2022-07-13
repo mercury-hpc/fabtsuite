@@ -200,7 +200,6 @@ struct cxn {
     void (*cancel)(cxn_t *);
     bool (*cancellation_complete)(cxn_t *);
     struct fid_ep *ep;
-    struct fid_eq *eq;
     fi_addr_t peer_addr;
     struct fid_cq *cq;
     int cq_wait_fd;     /* if we're using FI_WAIT_FD, the descriptor  
@@ -3492,13 +3491,6 @@ get_session_accept(get_state_t *gst)
     , .wait_cond = FI_CQ_COND_NONE
     , .wait_set = NULL
     };
-    struct fi_eq_attr eq_attr = {
-      .size = 128
-    , .flags = 0
-    , .wait_obj = FI_WAIT_UNSPEC
-    , .signaling_vector = 0     /* don't care */
-    , .wait_set = NULL          /* don't care */
-    };
     struct fi_cq_msg_entry completion;
     get_session_t *gs;
     rcvr_t *r;
@@ -3571,12 +3563,6 @@ get_session_accept(get_state_t *gst)
     fi_freeinfo(hints);
 
     fi_freeinfo(ep_info);
-
-    if ((rc = fi_eq_open(global_state.fabric, &eq_attr, &r->cxn.eq, NULL)) != 0)
-        bailout_for_ofi_ret(rc, "fi_eq_open (active)");
-
-    if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.eq->fid, 0)) < 0)
-        bailout_for_ofi_ret(rc, "fi_ep_bind");
 
     if ((rc = fi_cq_open(global_state.domain, &cq_attr, &r->cxn.cq,
                          &r->cxn)) != 0)
@@ -3768,13 +3754,6 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
     , .wait_cond = FI_CQ_COND_NONE
     , .wait_set = NULL
     };
-    struct fi_eq_attr eq_attr = {
-      .size = 128
-    , .flags = 0
-    , .wait_obj = FI_WAIT_UNSPEC
-    , .signaling_vector = 0     /* don't care */
-    , .wait_set = NULL          /* don't care */
-    };
     xmtr_t *x = &ps->xmtr;
     int rc;
 
@@ -3796,12 +3775,6 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
 
         x->cxn.cq_wait_fd = fd;
     }
-
-    if ((rc = fi_eq_open(global_state.fabric, &eq_attr, &x->cxn.eq, NULL)) != 0)
-        bailout_for_ofi_ret(rc, "fi_eq_open");
-
-    if ((rc = fi_ep_bind(x->cxn.ep, &x->cxn.eq->fid, 0)) != 0)
-        bailout_for_ofi_ret(rc, "fi_ep_bind");
 
     if ((rc = fi_ep_bind(x->cxn.ep, &x->cxn.cq->fid,
         FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
