@@ -46,7 +46,7 @@ jobs:
         . ./spack/share/spack/setup-env.sh
         spack install libfabric
         spack load libfabric
-        sudo spack view copy /usr/local libfabric
+        spack view copy /tmp libfabric
         ls /usr/local/lib
         ls
         mkdir build
@@ -55,11 +55,14 @@ jobs:
         cmake ..
         ls
         make
-        sudo mkdir /usr/local/transfer
-        sudo mkdir /usr/local/scripts
-        sudo make install
-        cd /usr/local
-        env
-        sudo ./scripts/run-suite localhost
+        make DESTDIR=/tmp install
+        ls /tmp/
+        cd /tmp
+        ./scripts/run-suite localhost
+        # sudo mkdir /usr/local/transfer
+        # sudo mkdir /usr/local/scripts
+        # sudo make install
+        # cd /usr/local
+        # sudo ./scripts/run-suite localhost
       env:
-        LD_LIBRARY_PATH: /usr/local/lib
+        LD_LIBRARY_PATH: /tmp/lib
