@@ -48,9 +48,10 @@ jobs:
         spack load libfabric
         ls
         mkdir build
-        cd  build
-        ls ..
-        cmake "-DCMAKE_INSTALL_PREFIX=. .."
+        cd build
+        ls
+        cmake ..
+        ls
         make
         make install
         ./scripts/run-suite localhost
