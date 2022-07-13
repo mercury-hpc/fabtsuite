@@ -48,8 +48,8 @@ jobs:
         spack load libfabric
         mkdir "${{ runner.workspace }}/build"
         cd "${{ runner.workspace }}/build"
-        cmake -DCMAKE_INSTALL_PREFIX=. $GITHUB_WORKSPACE 
-        cmake --build .
+        cmake -DCMAKE_INSTALL_PREFIX=. ..
+        make
         make install
         ./scripts/run-suite localhost
 
