@@ -6,7 +6,7 @@
 
 [Spack](https://spack.io/) users can use `spack install libfabric`.
 
-See [building.md](building.md) for the manual installtion of libfabric.
+See [building.md](building.md) for the manual installation of libfabric.
 
 ## Build
 
