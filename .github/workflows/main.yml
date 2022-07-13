@@ -56,5 +56,6 @@ jobs:
         sudo mkdir /usr/local/transfer
         sudo mkdir /usr/local/scripts
         sudo make install
-        sudo /usr/local/scripts/run-suite localhost
+        cd /usr/local
+        sudo ./scripts/run-suite localhost
 
