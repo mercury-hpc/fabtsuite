@@ -256,7 +256,6 @@ for flagset in $fget_flagset; do
 	fgetcmd=$(cmd_for_flagset $flagset "./transfer/fget -b $test_host")
 
 	{
-		sleep 2
 		if env $fgetenv time -p /bin/sh -c "$fgetcmd 2>&3" 2>&1 && \
                    ! random_fail && [ ${timed_out:-no} = no ] ; then
 			echo ok
