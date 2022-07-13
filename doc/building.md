@@ -1,3 +1,7 @@
+# CMake Users
+
+See [Building with CMake](building_cmake.md).
+
 # Project dependencies 
 
 The project makefiles use the macros from
