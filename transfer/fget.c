@@ -26,6 +26,10 @@
 
 #define arraycount(a)   (sizeof(a) / sizeof(a[0]))
 
+#ifndef transfer_unused
+#define transfer_unused __attribute__((unused))
+#endif
+
 /*
  * Message definitions
  */
@@ -946,7 +950,7 @@ vecbuf_free(vecbuf_t *vb)
 }
 
 static bool
-worker_paybuflist_replenish(worker_t *w, uint64_t access, buflist_t *bl)
+paybuflist_replenish(keysource_t *keys, uint64_t access, buflist_t *bl)
 {
     size_t i, paylen;
     int rc;
@@ -986,7 +990,7 @@ worker_paybuflist_replenish(worker_t *w, uint64_t access, buflist_t *bl)
 
         if (!global_state.reregister &&
             (rc = buf_mr_reg(global_state.domain, access,
-                             keysource_next(&w->keys), &buf->hdr)) != 0) {
+                             keysource_next(keys), &buf->hdr)) != 0) {
             warn_about_ofi_ret(rc, "fi_mr_reg");
             free(buf);
             break;
@@ -1007,7 +1011,7 @@ worker_payload_txbuf_get(worker_t *w)
     bytebuf_t *b;
 
     while ((b = (bytebuf_t *)buflist_get(w->paybufs.tx)) == NULL &&
-           worker_paybuflist_replenish(w, payload_access.tx, w->paybufs.tx))
+           paybuflist_replenish(&w->keys, payload_access.tx, w->paybufs.tx))
         ;   // do nothing
 
     if (b != NULL)
@@ -1022,7 +1026,7 @@ worker_payload_rxbuf_get(worker_t *w)
     bytebuf_t *b;
 
     while ((b = (bytebuf_t *)buflist_get(w->paybufs.rx)) == NULL &&
-           worker_paybuflist_replenish(w, payload_access.rx, w->paybufs.rx))
+           paybuflist_replenish(&w->keys, payload_access.rx, w->paybufs.rx))
         ;   // do nothing
 
     if (b != NULL)
@@ -2826,7 +2830,7 @@ worker_outer_loop(void *arg)
 }
 
 static void
-worker_paybuflist_destroy(worker_t *w, buflist_t *bl)
+paybuflist_destroy(buflist_t *bl)
 {
     size_t i;
     int rc;
@@ -2865,8 +2869,8 @@ worker_paybuflist_create(worker_t *w, uint64_t access)
     if (bl == NULL)
         return NULL;
 
-    if (!worker_paybuflist_replenish(w, access, bl)) {
-        worker_paybuflist_destroy(w, bl);
+    if (!paybuflist_replenish(&w->keys, access, bl)) {
+        paybuflist_destroy(bl);
         return NULL;
     }
 
@@ -3907,18 +3911,20 @@ usage(personality_t personality, const char *progname)
  * it can pick up new sessions.
  */
 static void
-handle_wakeup(int signum, siginfo_t *info, void *ucontext)
+handle_wakeup(transfer_unused int signum, transfer_unused siginfo_t *info,
+    transfer_unused void *ucontext)
 {
 }
 
 /* Handler for SIG{HUP,INT,QUIT,TERM}, used to cancel the program. */
 static void
-handle_cancel(int signum, siginfo_t *info, void *ucontext)
+handle_cancel(transfer_unused int signum, transfer_unused siginfo_t *info,
+    transfer_unused void *ucontext)
 {
 }
 
 static void *
-await_cancellation(void *arg)
+await_cancellation(void transfer_unused *arg)
 {
     sigset_t cancelset;
     size_t i;
