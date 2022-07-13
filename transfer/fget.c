@@ -1035,7 +1035,7 @@ static size_t
 fibonacci_iov_setup(void *_buf, size_t len, struct iovec *iov, size_t niovs)
 {
     char *buf = _buf;
-    ssize_t i;
+    size_t i;
     struct fibo {
         size_t prev, curr;
     } state = {.prev = 0, .curr = 1}; // Fibonacci sequence state
@@ -1872,7 +1872,7 @@ static bool
 vecbuf_is_wellformed(vecbuf_t *vb)
 {
     size_t len = vb->hdr.nused;
-    static const ptrdiff_t least_vector_msglen = offsetof(vector_msg_t, iov[0]);
+    static const size_t least_vector_msglen = offsetof(vector_msg_t, iov[0]);
 
     const size_t niovs_space = (len - least_vector_msglen) /
         sizeof(vb->msg.iov[0]);
@@ -2132,8 +2132,8 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
 {
     bufhdr_t *first_h, *h, *head, *last_h = NULL;
     const size_t maxriovs = minsize(global_state.rma_maxsegs, x->nriovs);
-    size_t i, len, maxbytes, niovs, niovs_out = 0, nriovs_out = 0;
-    ssize_t nwritten, rc, total;
+    size_t i, len, maxbytes, niovs, niovs_out = 0, nriovs_out = 0, total;
+    ssize_t nwritten, rc;
 
     for (maxbytes = 0, i = 0; i < maxriovs; i++)
         maxbytes += ((!x->phase) ? x->riov : x->riov2)[i].len;
@@ -2233,7 +2233,7 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
         if (nwritten < 0)
             bailout_for_ofi_ret(nwritten, "write_fully");
 
-        if (nwritten != total || niovs_out != 0) {
+        if ((size_t)nwritten != total || niovs_out != 0) {
             hlog_fast(err, "%s: local I/O vectors were partially written, "
                 "nwritten %zu total %zu niovs_out %zu", __func__, nwritten,
                 total, niovs_out);
@@ -2458,7 +2458,7 @@ worker_waitable(worker_t *self)
 {
     struct fid *fid[WORKER_SESSIONS_MAX];
     size_t nfids = 0;
-    int i;
+    size_t i;
     bool waitable;
 
     self->stats.epoll_loops.total++;
@@ -2526,7 +2526,9 @@ extract_contexts_for_half(const session_t *session_half,
 static void
 worker_run_loop(worker_t *self)
 {
-    size_t half, i;
+    size_t half;
+    ptrdiff_t i;
+    const ptrdiff_t nsessions = arraycount(self->session);
     struct epoll_event events[WORKER_SESSIONS_MAX];
     int nevents;
     bool waitable;
@@ -2543,7 +2545,7 @@ worker_run_loop(worker_t *self)
         void *context[WORKER_SESSIONS_MAX];
         pthread_mutex_t *mtx = &self->mtx[half];
         session_t *session_half =
-            &self->session[half * arraycount(self->session) / 2];
+            &self->session[half * nsessions / 2];
         int ncontexts, rc;
 
         if (pthread_mutex_trylock(mtx) == EBUSY)
@@ -2580,7 +2582,7 @@ worker_run_loop(worker_t *self)
 
             ptrdiff_t sess_idx = s - session_half;
 
-            assert(0 <= sess_idx && sess_idx < arraycount(self->session) / 2);
+            assert(0 <= sess_idx && sess_idx < nsessions / 2);
 
             sessions_swap(s, &session_half[i]);
         }
@@ -2589,7 +2591,7 @@ worker_run_loop(worker_t *self)
         session_t *ready_up_to = io_ready_up_to;
 
         for (i = ready_up_to - session_half;
-             i < arraycount(self->session) / 2;
+             i < nsessions / 2;
              i++) {
             session_t *s = &session_half[i];
             cxn_t *c = s->cxn;
@@ -2627,7 +2629,7 @@ worker_run_loop(worker_t *self)
          * slots, point it one past the end of the session[] half.
          */
         for (i = active_up_to - session_half;
-             i < arraycount(self->session) / 2;
+             i < nsessions / 2;
              i++) {
             session_t *s = &session_half[i];
 
@@ -2754,7 +2756,7 @@ worker_is_idle(worker_t *self)
     if (self->nsessions[0] != 0 || self->nsessions[1] != 0)
         return false;
 
-    if (self_idx + 1 !=
+    if (self_idx + (size_t)1 !=
             atomic_load_explicit(&nworkers_running, memory_order_relaxed))
         return false;
 
@@ -2768,7 +2770,7 @@ worker_is_idle(worker_t *self)
 
     bool idle = (nlocked == 2 &&
                  self->nsessions[0] == 0 && self->nsessions[1] == 0 &&
-                 self_idx + 1 == nworkers_running);
+                 self_idx + (size_t)1 == nworkers_running);
 
     if (idle) {
         nworkers_running--;
@@ -2789,7 +2791,7 @@ worker_idle_loop(worker_t *self)
     const ptrdiff_t self_idx = self - &workers[0];
 
     (void)pthread_mutex_lock(&workers_mtx);
-    while (nworkers_running <= self_idx && !self->shutting_down &&
+    while (nworkers_running <= (size_t)self_idx && !self->shutting_down &&
            !self->canceled)
         pthread_cond_wait(&self->sleep, &workers_mtx);
     (void)pthread_mutex_unlock(&workers_mtx);
@@ -2932,7 +2934,8 @@ static bool
 worker_launch(worker_t *w)
 {
     pthread_attr_t attr;
-    int i, rc, create_rc;
+    size_t i;
+    int rc, create_rc;
     sigset_t oldset, blockset;
     cpu_set_t cpuset;
 
@@ -3038,7 +3041,7 @@ worker_create(void)
     if (!worker_launch(w)) {
         (void)pthread_mutex_lock(&workers_mtx);
 
-        if ((w - &workers[0]) + 1 != nworkers_allocated) {
+        if ((w - &workers[0]) + (size_t)1 != nworkers_allocated) {
             (void)pthread_mutex_unlock(&workers_mtx);
             errx(EXIT_FAILURE, "%s: worker launch failed irrecoverably",
                 __func__);
@@ -4008,7 +4011,8 @@ main(int argc, char **argv)
     struct fi_info *hints;
     const char *addr = NULL;
     char *progname, *tmp;
-    int ecode, i, opt, ninput, rc;
+    size_t i;
+    int ecode, opt, ninput, rc;
     struct {
         bool k, n;
     } set = {.k = false, .n = false};
