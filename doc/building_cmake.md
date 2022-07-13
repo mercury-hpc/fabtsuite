@@ -13,14 +13,14 @@ See [building.md](building.md) for the manual installtion of libfabric.
      mkdir build
      cd build
      cmake ..
-     make DESTDIR=/tmp/install
-     make install
+     make
+     make DESTDIR=/tmp/ install
 
 ## Test
 
-Let's assume that everything is installed under `/tmp/install`
-and you have write permssion on /tmp/install/.
+Let's assume that everything is installed under `/tmp/usr/local`
+and you have write permssion on /tmp/usr/local.
 
-    cd /tmp/install
+    cd /tmp/usr/local
     ./scripts/run-suite localhost
 
