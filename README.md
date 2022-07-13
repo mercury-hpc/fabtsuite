@@ -10,7 +10,7 @@ The major constituents of this project are the test program under
 under `doc/.`
 
 The test program, which lives under `transfer/`, assumes either
-a server or client personality, depending depending on the name by which
+a server or client personality, depending on the name by which
 it is invoked.  Invoked as `fget`, it is the test server, and as `fput`,
 the test client.
 
