@@ -460,7 +460,7 @@ static state_t global_state = {.domain = NULL, .fabric = NULL, .info = NULL,
 
 static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
-static size_t nworkers_running;
+static _Atomic size_t nworkers_running;
 static size_t nworkers_allocated;
 static pthread_cond_t nworkers_cond = PTHREAD_COND_INITIALIZER;
 
