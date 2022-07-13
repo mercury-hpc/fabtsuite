@@ -53,6 +53,8 @@ jobs:
         cmake ..
         ls
         make
-        make install
-        ./scripts/run-suite localhost
+        sudo mkdir /usr/local/transfer
+        sudo mkdir /usr/local/scripts
+        sudo make install
+        sudo /usr/local/scripts/run-suite localhost
 
