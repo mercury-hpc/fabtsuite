@@ -2530,11 +2530,10 @@ worker_run_loop(worker_t *self)
     ptrdiff_t i;
     const ptrdiff_t nsessions = arraycount(self->session);
     struct epoll_event events[WORKER_SESSIONS_MAX];
-    int nevents;
+    int nevents = 0;
     bool waitable;
 
-    if (global_state.waitfd &&
-        (waitable = worker_waitable(self)) &&
+    if ((waitable = global_state.waitfd && worker_waitable(self)) &&
         (nevents =
             epoll_pwait(self->epoll_fd, events, (int)arraycount(events), -1,
                         &self->epoll_sigset)) == -1 &&
@@ -4256,6 +4255,7 @@ main(int argc, char **argv)
 
     if ((rc = pthread_sigmask(SIG_UNBLOCK, &usr2set, NULL)) != 0) {
         warnx("%s.%d: pthread_sigmask: %s", __func__, __LINE__, strerror(rc));
+        ecode = EXIT_FAILURE;
         goto out;
     }
 
