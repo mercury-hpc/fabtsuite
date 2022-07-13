@@ -256,13 +256,14 @@ for flagset in $fget_flagset; do
 	fgetcmd=$(cmd_for_flagset $flagset "./transfer/fget -b $test_host")
 
 	{
-		if env $fgetenv time -p $fgetcmd 2>&1 && ! random_fail && \
-		   [ ${timed_out:-no} = no ] ; then
+		sleep 2
+		if env $fgetenv time -p /bin/sh -c "$fgetcmd 2>&3" 2>&1 && \
+                   ! random_fail && [ ${timed_out:-no} = no ] ; then
 			echo ok
 		else
 			echo fail
 		fi
-	} > $tmpdir/fget.${flagset}.result &
+	} > $tmpdir/fget.${flagset}.result 3>&2 &
 
 	fputcmd=$(counterpart_cmd_for_flagset $flagset ./transfer/fput)
 	if ! $fputcmd $test_host; then
@@ -284,12 +285,12 @@ for flagset in $fput_flagset; do
 	fgetcmd=$(counterpart_cmd_for_flagset $flagset \
 	    ./transfer/fget -b $test_host)
 	$fgetcmd &
-	if env $fputenv time -p $fputcmd $test_host 2>&1 && ! random_fail && \
+	{ if env $fputenv time -p /bin/sh -c "$fputcmd $test_host 2>&3" 2>&1 && ! random_fail && \
 	   [ ${timed_out:-no} = no ] ; then
 		echo ok
 	else
 		echo fail
-	fi > $tmpdir/fput.${flagset}.result
+	fi } > $tmpdir/fput.${flagset}.result 3>&2
 
 	while ! wait; do
 		:
