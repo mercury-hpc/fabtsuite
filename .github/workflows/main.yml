@@ -36,6 +36,17 @@ jobs:
     - name: Get Sources
       uses: actions/checkout@v2
 
+    - name: Checkout Spack
+      uses: actions/checkout@v2
+      with:
+        repository: hyoklee/spack
+        path: ./spack
+
+    - name: Run a multi-line script
+      run: |
+        . ./spack/share/spack/setup-env.sh
+        spack install libfabric
+        spack load libfabric
     - name: Configure
       run: |
         mkdir "${{ runner.workspace }}/build"
