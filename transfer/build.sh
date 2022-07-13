@@ -22,9 +22,8 @@ CPPFLAGS="${CPPFLAGS:-} -D_POSIX_C_SOURCE=200809L"
 LDADD="-pthread ${LIBFABRIC_LIBDIR} ${LIBHLOG_LIBDIR}"
 CFLAGS="${CFLAGS:-} ${LIBFABRIC_CFLAGS}"
 CFLAGS="${CFLAGS:-} -gdwarf-4 -std=c11"
-CFLAGS="${CFLAGS:-} -Wall -pedantic -Werror"
-#CFLAGS="${CFLAGS:-} -Wextra"
-#CFLAGS="${CFLAGS:-} -O3"
+CFLAGS="${CFLAGS} -Werror -pedantic -Wall -Wextra"
+CFLAGS="${CFLAGS:-} -O3"
 CC=gcc
 SRCS=fget.c
 
