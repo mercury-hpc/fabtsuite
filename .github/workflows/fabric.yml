@@ -1,0 +1,61 @@
+name: cmake libfabric
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+    - 'doc/**'
+    - 'LICENSE'
+    - '**.md'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        name: ["Ubuntu Latest GCC"]
+        include:
+          - name: "Ubuntu Latest GCC"
+            artifact: "Linux.tar.xz"
+            os: ubuntu-latest
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    if: "!contains(github.event.head_commit.message, 'skip-ci')"
+          
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    - name: Install Dependencies (Linux)
+      run: |
+        sudo apt-get update -y
+      if: matrix.os == 'ubuntu-latest'
+    
+    # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+    - name: Get Sources
+      uses: actions/checkout@v2
+
+    - name: Checkout Spack
+      uses: actions/checkout@v2
+      with:
+        repository: hyoklee/spack
+        path: ./spack
+
+    - name: Run a multi-line script
+      run: |
+        . ./spack/share/spack/setup-env.sh
+        spack install libfabric@main
+        spack load libfabric
+        spack view copy /tmp libfabric
+        ls /tmp/lib/
+        ls
+        mkdir build
+        cd build
+        ls
+        cmake ..
+        ls
+        make
+        make DESTDIR=/tmp install
+        ls /tmp/
+        cd /tmp/usr/local
+        env
+        ./scripts/run-suite localhost
+      env:
+        LD_LIBRARY_PATH: /tmp/lib
