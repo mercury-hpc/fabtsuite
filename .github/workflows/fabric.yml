@@ -43,7 +43,7 @@ jobs:
         . ./spack/share/spack/setup-env.sh
         spack install libfabric@develop
         spack load libfabric
-        spack view copy /tmp libfabric
+        spack view copy -i /tmp libfabric
         ls /tmp/lib/
         ls
         mkdir build
