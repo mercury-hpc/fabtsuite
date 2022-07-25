@@ -21,6 +21,7 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>    /* struct fi_msg_rma */
+#include <rdma/fi_tagged.h> /* struct fi_msg_tagged */
 
 #include "hlog.h"
 
@@ -177,9 +178,9 @@ typedef struct {
     size_t entirelen;
 } source_t;
 
-typedef struct keysource {
+typedef struct seqsource {
     uint64_t next_key;
-} keysource_t;
+} seqsource_t;
 
 /*
  * Communications state definitions
@@ -227,18 +228,22 @@ struct cxn {
      * sending it in `eof.local`.
      */
     eof_state_t eof;
-    keysource_t keys;
+    seqsource_t keys;
 };
 
 typedef struct {
     fifo_t *posted; // buffers posted for vector messages
     fifo_t *rcvd;   // buffers holding received vector messages
+    seqsource_t tags;
+    uint64_t ignore;
 } rxctl_t;
 
 typedef struct {
     fifo_t *ready;    // message buffers ready to transmit
     fifo_t *posted;     // buffers posted with messages
     buflist_t *pool;    // unused buffers
+    seqsource_t tags;
+    uint64_t ignore;
 } txctl_t;
 
 typedef struct {
@@ -373,7 +378,7 @@ struct worker {
         buflist_t *tx;
         buflist_t *rx;
     } paybufs;    /* Reservoirs for free payload buffers. */
-    keysource_t keys;
+    seqsource_t keys;
     worker_stats_t stats;
     int epoll_fd;   /* returned by epoll_create(2) */
 };
@@ -414,7 +419,7 @@ typedef struct {
     size_t rx_maxsegs;
     size_t tx_maxsegs;
     size_t rma_maxsegs;
-    keysource_t keys;
+    seqsource_t keys;
     bool contiguous;
     bool expect_cancellation;
     bool reregister;
@@ -504,6 +509,7 @@ completion_flags_to_string(const uint64_t flags, char * const buf,
     , {.flag = FI_MSG, .name = "msg"}
     , {.flag = FI_RMA, .name = "rma"}
     , {.flag = FI_WRITE, .name = "write"}
+    , {.flag = FI_TAGGED, .name = "tagged"}
     , {.flag = FI_COMPLETION, .name = "completion"}
     , {.flag = FI_DELIVERY_COMPLETE, .name = "delivery complete"}
     };
@@ -547,7 +553,8 @@ completion_flags_to_string(const uint64_t flags, char * const buf,
 }
 
 static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
-static const uint64_t desired_tx_flags = FI_SEND | FI_MSG;
+static const uint64_t desired_tagged_rx_flags = FI_RECV | FI_TAGGED;
+static const uint64_t desired_tagged_tx_flags = FI_SEND | FI_TAGGED;
 static const uint64_t desired_wr_flags =
     FI_RMA | FI_WRITE | FI_COMPLETION | FI_DELIVERY_COMPLETE;
 
@@ -831,13 +838,13 @@ session_init(session_t *s, cxn_t *c, terminal_t *t)
 }
 
 static void
-keysource_init(keysource_t *s)
+seqsource_init(seqsource_t *s)
 {
     memset(s, 0, sizeof(*s));
 }
 
 static uint64_t
-keysource_next(keysource_t *s)
+seqsource_get(seqsource_t *s)
 {
     if (s->next_key % 256 == 0) {
             s->next_key = atomic_fetch_add_explicit(&next_key_pool, 256,
@@ -845,6 +852,16 @@ keysource_next(keysource_t *s)
     }
 
     return s->next_key++;
+}
+
+static bool
+seqsource_unget(seqsource_t *s, uint64_t got)
+{
+    if (got + 1 != s->next_key)
+        return false;
+
+    s->next_key--;
+    return true;
 }
 
 static bufhdr_t *
@@ -950,7 +967,7 @@ vecbuf_free(vecbuf_t *vb)
 }
 
 static bool
-paybuflist_replenish(keysource_t *keys, uint64_t access, buflist_t *bl)
+paybuflist_replenish(seqsource_t *keys, uint64_t access, buflist_t *bl)
 {
     size_t i, paylen;
     int rc;
@@ -990,7 +1007,7 @@ paybuflist_replenish(keysource_t *keys, uint64_t access, buflist_t *bl)
 
         if (!global_state.reregister &&
             (rc = buf_mr_reg(global_state.domain, access,
-                             keysource_next(keys), &buf->hdr)) != 0) {
+                             seqsource_get(keys), &buf->hdr)) != 0) {
             warn_about_ofi_ret(rc, "fi_mr_reg");
             free(buf);
             break;
@@ -1074,7 +1091,7 @@ fibonacci_iov_setup(void *_buf, size_t len, struct iovec *iov, size_t niovs)
 static int
 mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
     size_t niovs, size_t maxsegs, uint64_t access, uint64_t offset,
-    keysource_t *keys, uint64_t flags, struct fid_mr **mrp,
+    seqsource_t *keys, uint64_t flags, struct fid_mr **mrp,
     void **descp, uint64_t *raddrp, void *context)
 {
     int rc;
@@ -1092,7 +1109,7 @@ mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
         hlog_fast(memreg, "%zu remaining I/O vectors", nleftover);
 
         rc = fi_mr_regv(domain, iov, nsegs,
-            access, offset, keysource_next(keys), flags, &mr, context);
+            access, offset, seqsource_get(keys), flags, &mr, context);
 
         if (rc != 0)
             goto err;
@@ -1120,11 +1137,19 @@ rxctl_complete(rxctl_t *rc, const completion_t *cmpl)
 {
     bufhdr_t *h;
 
-    if ((cmpl->flags & desired_rx_flags) != desired_rx_flags &&
+    if ((cmpl->flags & desired_tagged_rx_flags) != desired_tagged_rx_flags &&
         !cmpl->xfc->cancelled) {
+        char difference[128];
+
         errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, cmpl->flags & desired_rx_flags);
+            "%s: expected flags %" PRIu64
+            " differs from received flags %" PRIu64 " at %s",
+            __func__, desired_tagged_rx_flags,
+            cmpl->flags & desired_tagged_rx_flags,
+            completion_flags_to_string(
+                desired_tagged_rx_flags ^
+                (cmpl->flags & desired_tagged_rx_flags), difference,
+                sizeof(difference)));
     }
 
     if ((h = fifo_get(rc->posted)) == NULL) {
@@ -1150,18 +1175,24 @@ rxctl_post(cxn_t *c, rxctl_t *ctl, bufhdr_t *h)
 
     h->xfc.cancelled = 0;
 
-    rc = fi_recvmsg(c->ep, &(struct fi_msg){
+    const uint64_t tag = seqsource_get(&ctl->tags);
+
+    rc = fi_trecvmsg(c->ep, &(struct fi_msg_tagged){
           .msg_iov = &(struct iovec){.iov_base = &((bytebuf_t *)h)->payload[0],
                                      .iov_len = h->nallocated}
         , .desc = &h->desc
         , .iov_count = 1
         , .addr = c->peer_addr
+        , .tag = tag
+        , .ignore = ctl->ignore
         , .context = &h->xfc.ctx
         , .data = 0
         }, FI_COMPLETION);
 
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_recvmsg");
+    if (rc < 0) {
+        seqsource_unget(&ctl->tags, tag);
+        bailout_for_ofi_ret(rc, "fi_trecvmsg");
+    }
 
     (void)fifo_put(ctl->posted, h);
 }
@@ -1182,6 +1213,72 @@ fifo_cancel(struct fid_ep *ep, fifo_t *posted)
         if ((rc = fi_cancel(&ep->fid, &h->xfc.ctx)) != 0)
             bailout_for_ofi_ret(rc, "fi_cancel");
         (void)fifo_put(posted, h);
+    }
+}
+
+static buflist_t *
+buflist_create(size_t n)
+{
+    buflist_t *bl = malloc(offsetof(buflist_t, buf) + sizeof(bl->buf[0]) * n);
+
+    if (bl == NULL)
+        return NULL;
+
+    bl->nallocated = n;
+    bl->nfull = 0;
+
+    return bl;
+}
+
+static void
+rxctl_init(rxctl_t *ctl, size_t len)
+{
+    assert(size_is_power_of_2(len));
+
+    seqsource_init(&ctl->tags);
+    ctl->ignore = ~(uint64_t)(len - 1);
+
+    if ((ctl->posted = fifo_create(len)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create posted messages FIFO", __func__);
+    }
+    if ((ctl->rcvd = fifo_create(len)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create received messages FIFO", __func__);
+    }
+}
+
+static void
+txctl_init(txctl_t *ctl, size_t len, size_t nbufs,
+    bufhdr_t *(*create_and_register)(void))
+{
+    size_t i;
+
+    assert(size_is_power_of_2(len));
+
+    seqsource_init(&ctl->tags);
+    ctl->ignore = ~(uint64_t)(len - 1);
+
+    if ((ctl->ready = fifo_create(len)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create ready messages FIFO", __func__);
+    }
+
+    if ((ctl->posted = fifo_create(len)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create posted messages FIFO", __func__);
+    }
+
+    if ((ctl->pool = buflist_create(nbufs)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create tx buffer pool", __func__);
+    }
+
+    for (i = 0; i < nbufs; i++) {
+        bufhdr_t *h = create_and_register();
+
+        if (!buflist_put(ctl->pool, h))
+            errx(EXIT_FAILURE, "%s: vector buffer pool full", __func__);
     }
 }
 
@@ -1206,11 +1303,19 @@ txctl_complete(txctl_t *tc, const completion_t *cmpl)
 {
     bufhdr_t *h;
 
-    if ((cmpl->flags & desired_tx_flags) != desired_tx_flags &&
+    if ((cmpl->flags & desired_tagged_tx_flags) != desired_tagged_tx_flags &&
         !cmpl->xfc->cancelled) {
+        char difference[128];
+
         errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
-            __func__, desired_rx_flags, cmpl->flags & desired_rx_flags);
+            "%s: expected flags %" PRIu64
+            " differs from received flags %" PRIu64 " at %s",
+            __func__, desired_tagged_tx_flags,
+            cmpl->flags & desired_tagged_tx_flags,
+            completion_flags_to_string(
+                desired_tagged_tx_flags ^
+                (cmpl->flags & desired_tagged_tx_flags), difference,
+                sizeof(difference)));
     }
 
     if ((h = fifo_get(tc->posted)) == NULL) {
@@ -1236,13 +1341,16 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
     bufhdr_t *h;
 
     while ((h = fifo_peek(tc->ready)) != NULL && !fifo_full(tc->posted)) {
-        const int rc = fi_sendmsg(c->ep, &(struct fi_msg){
+        const uint64_t tag = seqsource_get(&tc->tags);
+        const int rc = fi_tsendmsg(c->ep, &(struct fi_msg_tagged){
               .msg_iov = &(struct iovec){
                   .iov_base = ((bytebuf_t *)h)->payload
                 , .iov_len = h->nused}
             , .desc = h->desc
             , .iov_count = 1
             , .addr = c->peer_addr
+            , .tag = tag
+            , .ignore = 0
             , .context = &h->xfc.ctx
             , .data = 0
             }, FI_COMPLETION);
@@ -1251,10 +1359,12 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
             (void)fifo_get(tc->ready);
             (void)fifo_put(tc->posted, h);
         } else if (rc == -FI_EAGAIN) {
+            seqsource_unget(&tc->tags, tag);
             hlog_fast(txdefer, "%s: deferred transmission", __func__);
             break;
         } else if (rc < 0) {
-            bailout_for_ofi_ret(rc, "fi_sendmsg");
+            seqsource_unget(&tc->tags, tag);
+            bailout_for_ofi_ret(rc, "fi_tsendmsg");
         }
     }
 }
@@ -1451,8 +1561,7 @@ rcvr_cq_process(rcvr_t *r)
             hlog_fast(err, "%s: read %zd errors, %s", __func__, nfailed,
                 fi_strerror(e.err));
             hlog_fast(err, "%s: context %p", __func__, (void *)e.op_context);
-            hlog_fast(err, "%s: completion flags %" PRIx64 " expected %" PRIx64,
-                __func__, e.flags, desired_rx_flags);
+            hlog_fast(err, "%s: completion flags %" PRIx64, __func__, e.flags);
             hlog_fast(err, "%s: symbolic flags %s", __func__,
                 completion_flags_to_string(e.flags, flagsbuf,
                 sizeof(flagsbuf)));
@@ -1527,7 +1636,7 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
 
             if (global_state.reregister &&
                 (rc = buf_mr_reg(global_state.domain, payload_access.rx,
-                                 keysource_next(&r->cxn.keys), h)) < 0)
+                                 seqsource_get(&r->cxn.keys), h)) < 0)
                 bailout_for_ofi_ret(rc, "payload memory registration failed");
 
             (void)fifo_put(r->tgtposted, h);
@@ -1725,7 +1834,7 @@ xmtr_ack_rx_process(xmtr_t *x, completion_t *cmpl)
         vecbuf_t *vb = vecbuf_alloc();
 
         rc = buf_mr_reg(global_state.domain, FI_RECV,
-            keysource_next(&x->cxn.keys), &vb->hdr);
+            seqsource_get(&x->cxn.keys), &vb->hdr);
 
         if (rc < 0)
             bailout_for_ofi_ret(rc, "buffer memory registration failed");
@@ -2176,7 +2285,7 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
 
         if (global_state.reregister && x->fragment.offset == 0 &&
             (rc = buf_mr_reg(global_state.domain, payload_access.tx,
-                             keysource_next(&x->cxn.keys), head)) < 0)
+                             seqsource_get(&x->cxn.keys), head)) < 0)
             bailout_for_ofi_ret(rc, "payload memory registration failed");
 
         if (oversize_load) {
@@ -2848,20 +2957,6 @@ paybuflist_destroy(buflist_t *bl)
 }
 
 static buflist_t *
-buflist_create(size_t n)
-{
-    buflist_t *bl = malloc(offsetof(buflist_t, buf) + sizeof(bl->buf[0]) * n);
-
-    if (bl == NULL)
-        return NULL;
-
-    bl->nallocated = n;
-    bl->nfull = 0;
-
-    return bl;
-}
-
-static buflist_t *
 worker_paybuflist_create(worker_t *w, uint64_t access)
 {
     buflist_t *bl = buflist_create(16);
@@ -2886,7 +2981,7 @@ worker_init(worker_t *w)
 
     w->shutting_down = false;
     w->failed = false;
-    keysource_init(&w->keys);
+    seqsource_init(&w->keys);
 
     if ((rc = pthread_cond_init(&w->sleep, NULL)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_cond_init: %s", __func__, __LINE__,
@@ -3243,7 +3338,7 @@ cxn_init(cxn_t *c, struct fid_av *av,
     c->started = false;
     c->cancelled = false;
     c->eof.local = c->eof.remote = false;
-    keysource_init(&c->keys);
+    seqsource_init(&c->keys);
 }
 
 static void
@@ -3253,30 +3348,44 @@ xmtr_memory_init(xmtr_t *x)
     int rc;
 
     rc = fi_mr_reg(global_state.domain, &x->initial.msg, sizeof(x->initial.msg),
-        FI_SEND, 0, keysource_next(&global_state.keys), 0, &x->initial.mr,
+        FI_SEND, 0, seqsource_get(&global_state.keys), 0, &x->initial.mr,
         NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_mr_reg(global_state.domain, &x->ack.msg, sizeof(x->ack.msg),
-        FI_RECV, 0, keysource_next(&global_state.keys), 0, &x->ack.mr, NULL);
+        FI_RECV, 0, seqsource_get(&global_state.keys), 0, &x->ack.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_mr_reg(global_state.domain, txbuf, txbuflen,
-        FI_WRITE, 0, keysource_next(&global_state.keys), 0, x->payload.mr,
+        FI_WRITE, 0, seqsource_get(&global_state.keys), 0, x->payload.mr,
         NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 }
 
+static bufhdr_t *
+progbuf_create_and_register(void)
+{
+    progbuf_t *pb = progbuf_alloc();
+    int rc;
+
+    rc = buf_mr_reg(global_state.domain, FI_SEND,
+        seqsource_get(&global_state.keys), &pb->hdr);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_mr_reg");
+
+    return &pb->hdr;
+}
+
 static void
 xmtr_init(xmtr_t *x, struct fid_av *av)
 {
-    const size_t nbufs = 16;
     const size_t maxposted = 64;
     size_t i;
 
@@ -3293,29 +3402,9 @@ xmtr_init(xmtr_t *x, struct fid_av *av)
         errx(EXIT_FAILURE,
             "%s: could not create posted RDMA writes FIFO", __func__);
     }
-    if ((x->vec.posted = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: could not create posted vectors FIFO", __func__);
-    }
-    if ((x->vec.rcvd = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: could not create received vectors FIFO", __func__);
-    }
+    rxctl_init(&x->vec, 64);
 
-    if ((x->progress.ready = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: could not create ready progress-buffers FIFO", __func__);
-    }
-
-    if ((x->progress.posted = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: could not create posted progress-buffers FIFO", __func__);
-    }
-
-    if ((x->progress.pool = buflist_create(nbufs)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: could not create progress-message tx buffer pool", __func__);
-    }
+    txctl_init(&x->progress, 64, 16, progbuf_create_and_register);
 
     if ((x->fragment.pool = buflist_create(maxposted)) == NULL) {
         errx(EXIT_FAILURE,
@@ -3327,20 +3416,6 @@ xmtr_init(xmtr_t *x, struct fid_av *av)
 
         if (!buflist_put(x->fragment.pool, &f->hdr))
             errx(EXIT_FAILURE, "%s: fragment pool full", __func__);
-    }
-
-    for (i = 0; i < nbufs; i++) {
-        progbuf_t *pb = progbuf_alloc();
-        int rc;
-
-        rc = buf_mr_reg(global_state.domain, FI_SEND,
-            keysource_next(&global_state.keys), &pb->hdr);
-
-        if (rc != 0)
-            bailout_for_ofi_ret(rc, "fi_mr_reg");
-
-        if (!buflist_put(x->progress.pool, &pb->hdr))
-            errx(EXIT_FAILURE, "%s: progress buffer pool full", __func__);
     }
 }
 
@@ -3407,12 +3482,24 @@ rcvr_memory_init(rcvr_t *r)
         bailout_for_ofi_ret(rc, "mr_regv_all");
 }
 
+static bufhdr_t *
+vecbuf_create_and_register(void)
+{
+    vecbuf_t *vb = vecbuf_alloc();
+    int rc;
+
+    rc = buf_mr_reg(global_state.domain, FI_SEND,
+        seqsource_get(&global_state.keys), &vb->hdr);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_mr_reg");
+
+    return &vb->hdr;
+}
+
 static void
 rcvr_init(rcvr_t *r, struct fid_av *av)
 {
-    const size_t nbufs = 16;
-    size_t i;
-
     memset(r, 0, sizeof(*r));
 
     cxn_init(&r->cxn, av, rcvr_loop, rcvr_cancel, rcvr_cancellation_complete);
@@ -3423,43 +3510,9 @@ rcvr_init(rcvr_t *r, struct fid_av *av)
             "%s: could not create RDMA targets FIFO", __func__);
     }
 
-    if ((r->progress.posted = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: could not create posted vectors FIFO", __func__);
-    }
-    if ((r->progress.rcvd = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: could not create received vectors FIFO", __func__);
-    }
+    rxctl_init(&r->progress, 64);
 
-    if ((r->vec.ready = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: could not create ready vectors FIFO", __func__);
-    }
-
-    if ((r->vec.posted = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: could not create posted vectors FIFO", __func__);
-    }
-
-    if ((r->vec.pool = buflist_create(nbufs)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: could not create vector-message tx buffer pool", __func__);
-    }
-
-    for (i = 0; i < nbufs; i++) {
-        vecbuf_t *vb = vecbuf_alloc();
-        int rc;
-
-        rc = buf_mr_reg(global_state.domain, FI_SEND,
-            keysource_next(&global_state.keys), &vb->hdr);
-
-        if (rc != 0)
-            bailout_for_ofi_ret(rc, "fi_mr_reg");
-
-        if (!buflist_put(r->vec.pool, &vb->hdr))
-            errx(EXIT_FAILURE, "%s: vector buffer pool full", __func__);
-    }
+    txctl_init(&r->vec, 64, 16, vecbuf_create_and_register);
 }
 
 /* Post a receive for the initial message for session `gs`
@@ -4105,7 +4158,7 @@ main(int argc, char **argv)
 
     workers_initialize();
 
-    keysource_init(&global_state.keys);
+    seqsource_init(&global_state.keys);
 
     hlog_fast(params,
         "%ld POSIX I/O vector items maximum", sysconf(_SC_IOV_MAX));
