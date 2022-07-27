@@ -1131,6 +1131,18 @@ err:
     return rc;
 }
 
+static inline bool
+rxctl_idle(rxctl_t *ctl)
+{
+    return fifo_empty(ctl->posted);
+}
+
+static inline bool
+rxctl_ready(rxctl_t *ctl)
+{
+    return !fifo_full(ctl->posted);
+}
+
 static bufhdr_t *
 rxctl_complete(rxctl_t *rc, const completion_t *cmpl)
 {
@@ -1247,6 +1259,30 @@ rxctl_init(rxctl_t *ctl, size_t len)
     }
 }
 
+static inline bool
+txctl_idle(txctl_t *ctl)
+{
+    return fifo_empty(ctl->posted);
+}
+
+static inline bool
+txctl_ready(txctl_t *ctl)
+{
+    return !fifo_full(ctl->posted);
+}
+
+static bool
+txctl_put(txctl_t *ctl, bufhdr_t *h)
+{
+    h->tag = seqsource_get(&ctl->tags);
+
+    if (fifo_put(ctl->ready, h))
+        return true;
+
+    seqsource_unget(&ctl->tags, h->tag);
+    return false;
+}
+
 static void
 txctl_init(txctl_t *ctl, size_t len, size_t nbufs,
     bufhdr_t *(*create_and_register)(void))
@@ -1339,8 +1375,8 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
 {
     bufhdr_t *h;
 
-    while ((h = fifo_peek(tc->ready)) != NULL && !fifo_full(tc->posted)) {
-        const uint64_t tag = seqsource_get(&tc->tags);
+    while ((h = fifo_peek(tc->ready)) != NULL && txctl_ready(tc)) {
+        h->xfc.cancelled = 0;
         const int rc = fi_tsendmsg(c->ep, &(struct fi_msg_tagged){
               .msg_iov = &(struct iovec){
                   .iov_base = ((bytebuf_t *)h)->payload
@@ -1348,7 +1384,7 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
             , .desc = h->desc
             , .iov_count = 1
             , .addr = c->peer_addr
-            , .tag = tag
+            , .tag = h->tag
             , .ignore = 0
             , .context = &h->xfc.ctx
             , .data = 0
@@ -1358,11 +1394,9 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
             (void)fifo_get(tc->ready);
             (void)fifo_put(tc->posted, h);
         } else if (rc == -FI_EAGAIN) {
-            seqsource_unget(&tc->tags, tag);
             hlog_fast(txdefer, "%s: deferred transmission", __func__);
             break;
         } else if (rc < 0) {
-            seqsource_unget(&tc->tags, tag);
             bailout_for_ofi_ret(rc, "fi_tsendmsg");
         }
     }
@@ -1375,7 +1409,7 @@ rcvr_start(worker_t *w, rcvr_t *r, fifo_t *ready_for_cxn)
 
     r->cxn.started = true;
 
-    while (!fifo_full(r->progress.posted)) {
+    while (rxctl_ready(&r->progress)) {
         progbuf_t *pb = progbuf_alloc();
 
         rxctl_post(&r->cxn, &r->progress, &pb->hdr);
@@ -1614,7 +1648,7 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
         memset(vb->msg.iov, 0, sizeof(vb->msg.iov));
         vb->msg.niovs = 0;
         vb->hdr.nused = (char *)&vb->msg.iov[0] - (char *)&vb->msg;
-        (void)fifo_put(r->vec.ready, &vb->hdr);
+        (void)txctl_put(&r->vec, &vb->hdr);
         r->cxn.eof.local = true;
         hlog_fast(proto_vector, "%s: rcvr %p enqueued local EOF", __func__,
             (void *)r);
@@ -1647,7 +1681,7 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
         vb->msg.niovs = i;
         vb->hdr.nused = (char *)&vb->msg.iov[i] - (char *)&vb->msg;
 
-        (void)fifo_put(r->vec.ready, &vb->hdr);
+        (void)txctl_put(&r->vec, &vb->hdr);
         hlog_fast(proto_vector, "%s: rcvr %p enqueued vector", __func__,
             (void *)r);
     }
@@ -1738,7 +1772,7 @@ rcvr_cancellation_complete(cxn_t *cxn)
 {
     rcvr_t *r = (rcvr_t *)cxn;
 
-    return fifo_empty(r->progress.posted) && fifo_empty(r->vec.posted);
+    return rxctl_idle(&r->progress) && txctl_idle(&r->vec);
 }
 
 static loop_control_t
@@ -1770,7 +1804,7 @@ rcvr_loop(worker_t *w, session_t *s)
     rcvr_targets_read(s->ready_for_terminal, r);
 
     if (fifo_eoget(s->ready_for_terminal) &&
-        r->cxn.eof.remote && r->cxn.eof.local && fifo_empty(r->vec.posted))
+        r->cxn.eof.remote && r->cxn.eof.local && txctl_idle(&r->vec))
         return loop_end;
 
     return loop_continue;
@@ -1829,7 +1863,7 @@ xmtr_ack_rx_process(xmtr_t *x, completion_t *cmpl)
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p", x->ack.msg.addr);
 
-    while (!fifo_full(x->vec.posted)) {
+    while (rxctl_ready(&x->vec)) {
         vecbuf_t *vb = vecbuf_alloc();
 
         rc = buf_mr_reg(global_state.domain, FI_RECV,
@@ -2393,7 +2427,7 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
 
     x->bytes_progress = 0;
 
-    (void)fifo_put(x->progress.ready, &pb->hdr);
+    (void)txctl_put(&x->progress, &pb->hdr);
 
     if (reached_eof) {
         hlog_fast(proto_progress, "%s: enqueued local EOF", __func__);
@@ -2416,7 +2450,7 @@ xmtr_cancellation_complete(cxn_t *cxn)
 {
     xmtr_t *x = (xmtr_t *)cxn;
 
-    return fifo_empty(x->progress.posted) && fifo_empty(x->vec.posted) &&
+    return txctl_idle(&x->progress) && rxctl_idle(&x->vec) &&
            fifo_empty(x->wrposted);
 }
 
@@ -2461,7 +2495,7 @@ xmtr_loop(worker_t *w, session_t *s)
         vecbuf_free(vb);
     }
 
-    if (x->cxn.eof.remote && fifo_empty(x->progress.posted))
+    if (x->cxn.eof.remote && txctl_idle(&x->progress))
         return loop_end;
 
     return loop_continue;
