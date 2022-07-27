@@ -299,7 +299,6 @@ typedef struct {
         struct fid_mr *mr[12];
         uint64_t raddr[12];
         ssize_t niovs;
-        struct fi_context context;
     } payload;
     struct {
         buflist_t *pool;    // unused fragment headers
