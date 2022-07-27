@@ -241,7 +241,7 @@ typedef struct {
 } rxctl_t;
 
 typedef struct {
-    fifo_t *ready;    // message buffers ready to transmit
+    fifo_t *ready;      // message buffers ready to transmit
     fifo_t *posted;     // buffers posted with messages
     buflist_t *pool;    // unused buffers
     seqsource_t tags;
@@ -943,7 +943,8 @@ buf_mr_reg(struct fid_domain *dom, uint64_t access, uint64_t key,
     int rc;
     bytebuf_t *b = (bytebuf_t *)h;
 
-    rc = fi_mr_reg(dom, b->payload, h->nallocated, access, 0, key, 0, &h->mr, NULL);
+    rc = fi_mr_reg(dom, &b->payload[0], h->nallocated, access, 0, key, 0,
+        &h->mr, NULL);
 
     if (rc != 0)
         return rc;
@@ -1379,7 +1380,7 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
         h->xfc.cancelled = 0;
         const int rc = fi_tsendmsg(c->ep, &(struct fi_msg_tagged){
               .msg_iov = &(struct iovec){
-                  .iov_base = ((bytebuf_t *)h)->payload
+                  .iov_base = &((bytebuf_t *)h)->payload[0]
                 , .iov_len = h->nused}
             , .desc = h->desc
             , .iov_count = 1
