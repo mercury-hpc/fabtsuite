@@ -870,12 +870,10 @@ buf_alloc(size_t paylen)
 {
     bufhdr_t *h;
 
-    if ((h = malloc(offsetof(bytebuf_t, payload[0]) + paylen)) == NULL)
+    if ((h = calloc(1, offsetof(bytebuf_t, payload[0]) + paylen)) == NULL)
         return NULL;
 
     h->nallocated = paylen;
-    h->nused = 0;
-    h->raddr = 0;
 
     return h;
 }
