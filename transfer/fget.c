@@ -312,6 +312,8 @@ typedef struct {
                          * an acknowledgement from its peer for the initial
                          * message
                          */
+    unsigned split_progress_countdown;  // counts down to 0, then resets
+                                        // to split_progress_interval
 } xmtr_t;
 
 /* On each loop, a worker checks its poll set for any completions.
@@ -461,6 +463,8 @@ HLOG_OUTLET_SHORT_DEFN(completion, all);
 HLOG_OUTLET_SHORT_DEFN(worker_stats, all);
 
 static const char fget_fput_service_name[] = "4242";
+
+static const unsigned split_progress_interval = 2047;
 
 static state_t global_state = {.domain = NULL, .fabric = NULL, .info = NULL,
                                .personality = NULL, .local_sessions = 1,
@@ -2398,6 +2402,7 @@ static void
 xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
 {
     progbuf_t *pb;
+    size_t progress;
 
     /* If the terminal reached EOF, ready_for_cxn and wrposted
      * are empty, and nleftover == 0 has not previously been sent
@@ -2416,17 +2421,29 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
     if ((pb = (progbuf_t *)buflist_get(x->progress.pool)) == NULL)
         return;
 
+    if (x->split_progress_countdown == 0) {
+        if (x->bytes_progress >= 2) {
+            progress = x->bytes_progress / 2;
+            x->bytes_progress -= progress;
+            x->split_progress_countdown = split_progress_interval;
+        } else {
+            progress = x->bytes_progress;
+            x->bytes_progress = 0;
+        }
+    } else {
+        x->split_progress_countdown--;
+        progress = x->bytes_progress;
+        x->bytes_progress = 0;
+    }
     pb->hdr.xfc.owner = xfo_nic;
     pb->hdr.nused = pb->hdr.nallocated;
 
-    pb->msg.nfilled = x->bytes_progress;
+    pb->msg.nfilled = progress;
     pb->msg.nleftover = reached_eof ? 0 : 1;
 
     hlog_fast(proto_progress, "%s: sending progress message, %"
         PRIu64 " filled, %" PRIu64 " leftover", __func__,
         pb->msg.nfilled, pb->msg.nleftover);
-
-    x->bytes_progress = 0;
 
     (void)txctl_put(&x->progress, &pb->hdr);
 
@@ -2434,6 +2451,9 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
         hlog_fast(proto_progress, "%s: enqueued local EOF", __func__);
         x->cxn.eof.local = true;
     }
+
+    if (x->bytes_progress > 0)
+        xmtr_progress_update(ready_for_cxn, x);
 }
 
 static void
