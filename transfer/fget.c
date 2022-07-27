@@ -102,32 +102,34 @@ typedef struct completion {
 } completion_t;
 
 typedef struct bufhdr {
+    xfer_context_t xfc;
     uint64_t raddr;
     size_t nused;
     size_t nallocated;
     struct fid_mr *mr;
     void *desc;
-    xfer_context_t xfc;
+    uint64_t tag;
+    max_align_t pad;
 } bufhdr_t;
 
 typedef struct fragment {
     bufhdr_t hdr;
-    bufhdr_t alignas(max_align_t) * parent;
+    bufhdr_t *parent;
 } fragment_t;
 
 typedef struct bytebuf {
     bufhdr_t hdr;
-    char alignas(max_align_t) payload[];
+    char payload[];
 } bytebuf_t;
 
 typedef struct progbuf {
     bufhdr_t hdr;
-    progress_msg_t alignas(max_align_t) msg;
+    progress_msg_t msg;
 } progbuf_t;
 
 typedef struct vecbuf {
     bufhdr_t hdr;
-    vector_msg_t alignas(max_align_t) msg;
+    vector_msg_t msg;
 } vecbuf_t;
 
 typedef struct fifo {
