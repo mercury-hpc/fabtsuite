@@ -463,7 +463,6 @@ HLOG_OUTLET_SHORT_DEFN(completion, all);
 HLOG_OUTLET_SHORT_DEFN(worker_stats, all);
 HLOG_OUTLET_SHORT_DEFN(multitx, all);
 HLOG_OUTLET_SHORT_DEFN(session, all);
-HLOG_OUTLET_SHORT_DEFN(cancel, all);
 
 static const char fget_fput_service_name[] = "4242";
 
