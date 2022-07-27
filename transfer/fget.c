@@ -461,6 +461,9 @@ HLOG_OUTLET_SHORT_DEFN(paybuf, all);
 HLOG_OUTLET_SHORT_DEFN(paybuflist, paybuf);
 HLOG_OUTLET_SHORT_DEFN(completion, all);
 HLOG_OUTLET_SHORT_DEFN(worker_stats, all);
+HLOG_OUTLET_SHORT_DEFN(multitx, all);
+HLOG_OUTLET_SHORT_DEFN(session, all);
+HLOG_OUTLET_SHORT_DEFN(cancel, all);
 
 static const char fget_fput_service_name[] = "4242";
 
@@ -1379,6 +1382,7 @@ static void
 txctl_transmit(cxn_t *c, txctl_t *tc)
 {
     bufhdr_t *h;
+    size_t nsent = 0;
 
     while ((h = fifo_peek(tc->ready)) != NULL && txctl_ready(tc)) {
         h->xfc.cancelled = 0;
@@ -1398,6 +1402,7 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
         if (rc == 0) {
             (void)fifo_get(tc->ready);
             (void)fifo_put(tc->posted, h);
+            nsent++;
         } else if (rc == -FI_EAGAIN) {
             hlog_fast(txdefer, "%s: deferred transmission", __func__);
             break;
@@ -1405,6 +1410,8 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
             bailout_for_ofi_ret(rc, "fi_tsendmsg");
         }
     }
+    if (nsent > 1)
+        hlog_fast(multitx, "%s: posted %zu transmissions", __func__, nsent);
 }
 
 static loop_control_t
@@ -3708,6 +3715,8 @@ get_session_accept(get_state_t *gst)
         bailout_for_ofi_ret(rc, "fi_getname");
 
     r->ack.msg.addrlen = (uint32_t)addrlen;
+
+    hlog_fast(session, "%s: accepted session %p", __func__, (void *)gs);
 
     return gs;
 }
