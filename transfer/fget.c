@@ -1345,8 +1345,10 @@ txctl_complete(txctl_t *tc, const completion_t *cmpl)
 {
     bufhdr_t *h;
 
-    if ((cmpl->flags & desired_tagged_tx_flags) != desired_tagged_tx_flags &&
-        !cmpl->xfc->cancelled) {
+    if (cmpl->xfc->cancelled) {
+        cmpl->xfc->cancelled = 0;
+    } else if ((cmpl->flags & desired_tagged_tx_flags) !=
+               desired_tagged_tx_flags) {
         char difference[128];
 
         errx(EXIT_FAILURE,
@@ -1384,7 +1386,6 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
     size_t nsent = 0;
 
     while ((h = fifo_peek(tc->ready)) != NULL && txctl_ready(tc)) {
-        h->xfc.cancelled = 0;
         const int rc = fi_tsendmsg(c->ep, &(struct fi_msg_tagged){
               .msg_iov = &(struct iovec){
                   .iov_base = &((bytebuf_t *)h)->payload[0]
