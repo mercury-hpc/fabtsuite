@@ -2431,16 +2431,13 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
     if (x->split_progress_countdown == 0) {
         if (x->bytes_progress >= 2) {
             progress = x->bytes_progress / 2;
-            x->bytes_progress -= progress;
             x->split_progress_countdown = split_progress_interval;
         } else {
             progress = x->bytes_progress;
-            x->bytes_progress = 0;
         }
     } else {
         x->split_progress_countdown--;
         progress = x->bytes_progress;
-        x->bytes_progress = 0;
     }
     pb->hdr.xfc.owner = xfo_nic;
     pb->hdr.nused = pb->hdr.nallocated;
@@ -2451,6 +2448,8 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
     hlog_fast(proto_progress, "%s: sending progress message, %"
         PRIu64 " filled, %" PRIu64 " leftover", __func__,
         pb->msg.nfilled, pb->msg.nleftover);
+
+    x->bytes_progress -= progress;
 
     (void)txctl_put(&x->progress, &pb->hdr);
 
