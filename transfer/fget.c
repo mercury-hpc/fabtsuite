@@ -209,7 +209,7 @@ struct cxn {
     struct fid_ep *ep;
     fi_addr_t peer_addr;
     struct fid_cq *cq;
-    int cq_wait_fd;     /* if we're using FI_WAIT_FD, the descriptor  
+    int cq_wait_fd;     /* if we're using FI_WAIT_FD, the descriptor
                          * to use with epoll(2) to sleep until I/O is
                          * ready
                          */
