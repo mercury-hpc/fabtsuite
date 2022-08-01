@@ -246,6 +246,8 @@ typedef struct {
     buflist_t *pool;    // unused buffers
     seqsource_t tags;
     uint64_t ignore;
+    unsigned rotate_ready_countdown;    // counts down to 0, then resets
+                                        // to rotate_ready_interval
 } txctl_t;
 
 typedef struct {
@@ -271,6 +273,8 @@ typedef struct {
     } initial;
     txctl_t vec;
     rxctl_t progress;
+    unsigned split_vector_countdown;  // counts down to 0, then resets
+                                      // to split_vector_interval
 } rcvr_t;
 
 typedef struct {
@@ -463,10 +467,13 @@ HLOG_OUTLET_SHORT_DEFN(completion, all);
 HLOG_OUTLET_SHORT_DEFN(worker_stats, all);
 HLOG_OUTLET_SHORT_DEFN(multitx, all);
 HLOG_OUTLET_SHORT_DEFN(session, all);
+HLOG_OUTLET_SHORT_DEFN(ooo, all);
 
 static const char fget_fput_service_name[] = "4242";
 
 static const unsigned split_progress_interval = 2047;
+static const unsigned split_vector_interval = 15;
+static const unsigned rotate_ready_interval = 3;
 
 static state_t global_state = {.domain = NULL, .fabric = NULL, .info = NULL,
                                .personality = NULL, .local_sessions = 1,
@@ -740,6 +747,18 @@ static inline bool
 fifo_empty(fifo_t *f)
 {
     return fifo_eoget(f) || fifo_alt_empty(f);
+}
+
+static inline size_t
+fifo_nfull(fifo_t *f)
+{
+    return f->insertions - f->removals;
+}
+
+static inline size_t
+fifo_nempty(fifo_t *f)
+{
+    return f->index_mask + 1 - fifo_nfull(f);
 }
 
 /* Return NULL if the FIFO is empty or if the FIFO has been read up to
@@ -1153,10 +1172,23 @@ rxctl_ready(rxctl_t *ctl)
 static bufhdr_t *
 rxctl_complete(rxctl_t *rc, const completion_t *cmpl)
 {
-    bufhdr_t *h;
+    bufhdr_t *h, *head;
 
-    if ((cmpl->flags & desired_tagged_rx_flags) != desired_tagged_rx_flags &&
-        !cmpl->xfc->cancelled) {
+    head = fifo_peek(rc->posted);
+
+    if (cmpl == NULL) {
+        goto out;
+    } else if (head == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: received a completion, but no Rx was posted", __func__);
+    }
+
+    cmpl->xfc->owner = xfo_program;
+
+    if (cmpl->xfc->cancelled) {
+        cmpl->xfc->cancelled = 0;
+    } else if ((cmpl->flags & desired_tagged_rx_flags) !=
+               desired_tagged_rx_flags) {
         char difference[128];
 
         errx(EXIT_FAILURE,
@@ -1170,20 +1202,20 @@ rxctl_complete(rxctl_t *rc, const completion_t *cmpl)
                 sizeof(difference)));
     }
 
-    if ((h = fifo_get(rc->posted)) == NULL) {
-        errx(EXIT_FAILURE,
-            "%s: received a message, but no Rx was posted", __func__);
-        return NULL;
-    }
+    h = (bufhdr_t *)((char *)cmpl->xfc - offsetof(bufhdr_t, xfc));
+    h->nused = cmpl->len;
 
-    if (cmpl->xfc != &h->xfc) {
-        errx(EXIT_FAILURE, "%s: expected context %p received %p",
+    if (cmpl != NULL && cmpl->xfc != &head->xfc) {
+        hlog_fast(ooo,
+            "%s: out-of-order completion: context %p at head, received %p",
             __func__, (void *)&h->xfc.ctx, (void *)cmpl->xfc);
     }
 
-    h->nused = cmpl->len;
+out:
+    if (head == NULL || head->xfc.owner != xfo_program)
+        return NULL;
 
-    return h;
+    return fifo_get(rc->posted);
 }
 
 static void
@@ -1192,6 +1224,7 @@ rxctl_post(cxn_t *c, rxctl_t *ctl, bufhdr_t *h)
     int rc;
 
     h->xfc.cancelled = 0;
+    h->xfc.owner = xfo_nic;
 
     const uint64_t tag = seqsource_get(&ctl->tags);
 
@@ -1385,6 +1418,19 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
     bufhdr_t *h;
     size_t nsent = 0;
 
+    /* Periodically induce an out-of-order message transmission by
+     * "rotating" the tx-ready FIFO: if more than one buffer is on the
+     * FIFO, then move the buffer at the front of the FIFO to the back.
+     */
+    if (tc->rotate_ready_countdown == 0) {
+        if (fifo_nfull(tc->ready) > 1 && fifo_nempty(tc->posted) > 1) {
+            (void)fifo_put(tc->ready, fifo_get(tc->ready));
+            tc->rotate_ready_countdown = rotate_ready_interval;
+        }
+    } else {
+        tc->rotate_ready_countdown--;
+    }
+
     while ((h = fifo_peek(tc->ready)) != NULL && txctl_ready(tc)) {
         const int rc = fi_tsendmsg(c->ep, &(struct fi_msg_tagged){
               .msg_iov = &(struct iovec){
@@ -1544,20 +1590,17 @@ progbuf_is_wellformed(progbuf_t *pb)
  * irrecoverable error.
  */
 static int
-rcvr_progress_rx_process(rcvr_t *r, const completion_t *cmpl)
+rcvr_progress_rx_process(rcvr_t *r, bufhdr_t *h)
 {
-    progbuf_t *pb;
+    progbuf_t *pb = (progbuf_t *)h;
 
-    if ((pb = (progbuf_t *)rxctl_complete(&r->progress, cmpl)) == NULL)
-        return -1;
-
-    if (pb->hdr.xfc.cancelled) {
-        buf_free(&pb->hdr);
+    if (h->xfc.cancelled) {
+        buf_free(h);
         return 0;
     }
 
     if (!progbuf_is_wellformed(pb)) {
-        rxctl_post(&r->cxn, &r->progress, &pb->hdr);
+        rxctl_post(&r->cxn, &r->progress, h);
         return 0;
     }
 
@@ -1572,7 +1615,7 @@ rcvr_progress_rx_process(rcvr_t *r, const completion_t *cmpl)
         r->cxn.eof.remote = true;
     }
 
-    rxctl_post(&r->cxn, &r->progress, &pb->hdr);
+    rxctl_post(&r->cxn, &r->progress, h);
 
     return 1;
 }
@@ -1584,7 +1627,9 @@ static int
 rcvr_cq_process(rcvr_t *r)
 {
     struct fi_cq_msg_entry fcmpl;
-    completion_t cmpl;
+    completion_t cmpl, *cmplp;
+    bufhdr_t *h;
+    size_t nprocessed;
     ssize_t ncompleted;
 
     if ((ncompleted = fi_cq_read(r->cxn.cq, &fcmpl, 1)) == -FI_EAGAIN)
@@ -1631,7 +1676,21 @@ rcvr_cq_process(rcvr_t *r)
     switch (cmpl.xfc->type) {
     case xft_progress:
         hlog_fast(completion, "%s: read a progress rx completion", __func__);
-        return rcvr_progress_rx_process(r, &cmpl);
+
+        for (nprocessed = 0, cmplp = &cmpl;
+             (h = rxctl_complete(&r->progress, cmplp)) != NULL;
+             cmplp = NULL) {
+            switch (rcvr_progress_rx_process(r, h)) {
+            case 1:
+                nprocessed++;
+                break;
+            case 0:
+                break;
+            default:
+                return -1;
+            }
+        }
+        return (nprocessed > 0) ? 1 : 0;
     case xft_vector:
         hlog_fast(completion, "%s: read a vector tx completion", __func__);
         return txctl_complete(&r->vec, &cmpl);
@@ -1671,11 +1730,22 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
 
     while (!fifo_full(r->vec.ready) && !fifo_empty(ready_for_cxn) &&
            (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
+        size_t maxniovs;
 
-        for (i = 0;
-             i < arraycount(vb->msg.iov) &&
-                 (h = fifo_get(ready_for_cxn)) != NULL;
-             i++) {
+        if (r->split_vector_countdown == 0) {
+            if (fifo_nfull(ready_for_cxn) > 1) {
+                maxniovs = minsize(fifo_nfull(ready_for_cxn),
+                                   arraycount(vb->msg.iov)) / 2;
+                r->split_vector_countdown = split_vector_interval;
+            } else {
+                maxniovs = arraycount(vb->msg.iov);
+            }
+        } else {
+            r->split_vector_countdown--;
+            maxniovs = arraycount(vb->msg.iov);
+        }
+
+        for (i = 0; i < maxniovs && (h = fifo_get(ready_for_cxn)) != NULL; i++){
 
             h->nused = 0;
 
@@ -2054,22 +2124,23 @@ vecbuf_is_wellformed(vecbuf_t *vb)
     return false;
 }
 
-static void
+static bool
 xmtr_vecbuf_unload(xmtr_t *x)
 {
     vecbuf_t *vb;
     struct fi_rma_iov *riov;
     size_t i;
 
-    if ((vb = (vecbuf_t *)fifo_peek(x->vec.rcvd)) == NULL)
-        return;
-
-    riov = (!x->phase) ? x->riov : x->riov2;
+    if ((vb = (vecbuf_t *)fifo_peek(x->vec.rcvd)) == NULL ||
+        x->nriovs == arraycount(x->riov))
+        return false;
 
     if (!x->cxn.eof.remote && vb->msg.niovs == 0) {
         hlog_fast(proto_vector, "%s: received remote EOF", __func__);
         x->cxn.eof.remote = true;
     }
+
+    riov = (!x->phase) ? x->riov : x->riov2;
 
     for (i = x->next_riov;
          i < vb->msg.niovs && x->nriovs < arraycount(x->riov);
@@ -2092,6 +2163,8 @@ xmtr_vecbuf_unload(xmtr_t *x)
         x->next_riov = 0;
     } else
         x->next_riov = i;
+
+    return true;
 }
 
 /* Process completed vector-message reception.  Return 0 if no
@@ -2099,25 +2172,22 @@ xmtr_vecbuf_unload(xmtr_t *x)
  * irrecoverable error.
  */
 static int
-xmtr_vector_rx_process(xmtr_t *x, const completion_t *cmpl)
+xmtr_vector_rx_process(xmtr_t *x, bufhdr_t *h)
 {
-    vecbuf_t *vb;
+    vecbuf_t *vb = (vecbuf_t *)h;
 
-    if ((vb = (vecbuf_t *)rxctl_complete(&x->vec, cmpl)) == NULL)
-        return -1;
-
-    if (vb->hdr.xfc.cancelled) {
-        buf_free(&vb->hdr);
+    if (h->xfc.cancelled) {
+        buf_free(h);
         return 0;
     }
 
     if (!vecbuf_is_wellformed(vb)) {
         hlog_fast(err, "%s: rx'd malformed vector message", __func__);
-        rxctl_post(&x->cxn, &x->vec, &vb->hdr);
+        rxctl_post(&x->cxn, &x->vec, h);
         return 0;
     }
 
-    if (!fifo_put(x->vec.rcvd, &vb->hdr))
+    if (!fifo_put(x->vec.rcvd, h))
         errx(EXIT_FAILURE, "%s: received vectors FIFO was full", __func__);
 
     return 1;
@@ -2130,8 +2200,9 @@ static int
 xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
 {
     struct fi_cq_msg_entry fcmpl;
-    completion_t cmpl;
+    completion_t cmpl, *cmplp;
     bufhdr_t *h;
+    size_t nprocessed;
     ssize_t ncompleted;
 
     if ((ncompleted = fi_cq_read(x->cxn.cq, &fcmpl, 1)) == -FI_EAGAIN)
@@ -2181,7 +2252,21 @@ xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
     switch (cmpl.xfc->type) {
     case xft_vector:
         hlog_fast(completion, "%s: read a vector rx completion", __func__);
-        return xmtr_vector_rx_process(x, &cmpl);
+
+        for (nprocessed = 0, cmplp = &cmpl;
+             (h = rxctl_complete(&x->vec, cmplp)) != NULL;
+             cmplp = NULL) {
+            switch (xmtr_vector_rx_process(x, h)) {
+            case 1:
+                nprocessed++;
+                break;
+            case 0:
+                break;
+            default:
+                return -1;
+            }
+        }
+        return (nprocessed > 0) ? 1 : 0;
     case xft_fragment:
     case xft_rdma_write:
         hlog_fast(completion, "%s: read an RDMA-write completion", __func__);
@@ -2500,7 +2585,8 @@ xmtr_loop(worker_t *w, session_t *s)
     if (!x->rcvd_ack)
         return loop_continue;
 
-    xmtr_vecbuf_unload(x);
+    while (xmtr_vecbuf_unload(x))
+        ; // do nothing
 
     if (xmtr_targets_write(s->ready_for_cxn, x) == loop_error)
         return loop_error;
