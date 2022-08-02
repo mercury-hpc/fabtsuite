@@ -1673,6 +1673,9 @@ rcvr_cq_process(rcvr_t *r)
         , .len = fcmpl.len
         , .flags = fcmpl.flags
         };
+        // fi_cancel races with completion, so it's not safe to
+        // assert that the cancelled flag is false:
+        // assert(!cmpl.xfc->cancelled);
     }
 
     switch (cmpl.xfc->type) {
