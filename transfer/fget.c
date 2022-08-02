@@ -1186,7 +1186,9 @@ rxctl_complete(rxctl_t *rc, const completion_t *cmpl)
     cmpl->xfc->owner = xfo_program;
 
     if (cmpl->xfc->cancelled) {
-        cmpl->xfc->cancelled = 0;
+        ;   /* do nothing; leave cancelled flag set, it's needed by
+             * higher-level processing---e.g., in xmtr_vector_rx_process
+             */
     } else if ((cmpl->flags & desired_tagged_rx_flags) !=
                desired_tagged_rx_flags) {
         char difference[128];
