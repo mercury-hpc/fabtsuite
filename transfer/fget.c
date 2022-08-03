@@ -4081,8 +4081,10 @@ count_info(const struct fi_info *first)
     int count;
     const struct fi_info *info;
 
-    for (info = first, count = 1; (info = info->next) != NULL; count++)
-        ;
+    for (info = first, count = 1; (info = info->next) != NULL; count++) {
+        hlog_fast(params, "%s: info %d provider \"%s\"",
+            __func__, count, info->fabric_attr->prov_name);
+    }
 
     return count;
 }
