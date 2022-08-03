@@ -8,5 +8,6 @@
 #SBATCH -J w_h
 #SBATCH -o %x-%j.out
 #SBATCH -t 00:00:10
-#SBATCH -N 8
-srun -n8 --ntasks-per-node=1 ./w_h.sh
+#SBATCH -N 2
+##SBATCH -N 8
+srun -n2 --ntasks-per-node=1 ./w_h.sh
