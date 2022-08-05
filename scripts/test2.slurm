@@ -12,6 +12,6 @@
 srun -N1 -n1 ./fget1.sh &
 srun -N1 -n1 ./fget2.sh &
 srun -N2 -n2 ./fput1.sh &
-## srun -N2 -n2 ./fput2.sh &
+srun -N2 -n2 ./fput2.sh &
 sleep 20
 
