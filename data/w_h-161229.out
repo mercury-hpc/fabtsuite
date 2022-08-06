@@ -1,0 +1,14 @@
+Running fget.
+crusher156
+Running fget.
+crusher159
+/ccs/proj/csc332/fget_host1.txt exists. Running fput.
+/ccs/proj/csc332/fget_host1.txt exists. Running fput.
+/ccs/proj/csc332/fget_host2.txt exists. Running fput.
+/ccs/proj/csc332/fget_host2.txt exists. Running fput.
+real 10.39
+user 3.09
+sys 5.24
+real 10.82
+user 3.34
+sys 5.37
