@@ -3696,7 +3696,7 @@ get_session_accept(get_state_t *gst)
       .size = 128
     , .flags = 0
     , .format = FI_CQ_FORMAT_MSG
-    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC
+    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_NONE
     , .signaling_vector = 0
     , .wait_cond = FI_CQ_COND_NONE
     , .wait_set = NULL
@@ -3709,9 +3709,11 @@ get_session_accept(get_state_t *gst)
 
     /* Await initial message. */
     do {
-        ncompleted = fi_cq_sread(gst->listen_cq, &completion, 1, NULL, -1);
+        ncompleted = global_state.waitfd
+            ? fi_cq_sread(gst->listen_cq, &completion, 1, NULL, -1)
+            : fi_cq_read(gst->listen_cq, &completion, 1);
         if (ncompleted == -FI_EINTR)
-            hlog_fast(signal, "%s: fi_cq_sread interrupted", __func__);
+            hlog_fast(signal, "%s: fi_cq_{,s}read interrupted", __func__);
     } while (ncompleted == -FI_EAGAIN ||
              (ncompleted == -FI_EINTR && !global_state.cancelled));
 
@@ -3719,7 +3721,7 @@ get_session_accept(get_state_t *gst)
         errx(EXIT_FAILURE, "caught a signal, exiting.");
 
     if (ncompleted < 0)
-        bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
+        bailout_for_ofi_ret(ncompleted, "fi_cq_{,s}read");
 
     if (ncompleted != 1) {
         errx(EXIT_FAILURE,
@@ -3866,7 +3868,7 @@ get_state_open(void)
       .size = 128
     , .flags = 0
     , .format = FI_CQ_FORMAT_MSG
-    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC
+    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_NONE
     , .signaling_vector = 0
     , .wait_cond = FI_CQ_COND_NONE
     , .wait_set = NULL
@@ -3961,7 +3963,7 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
       .size = 128
     , .flags = 0
     , .format = FI_CQ_FORMAT_MSG
-    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC
+    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_NONE
     , .signaling_vector = 0
     , .wait_cond = FI_CQ_COND_NONE
     , .wait_set = NULL
