@@ -17,7 +17,7 @@ The output of `real` in seconds was used for the following table.
 |3|4:2|10.19|9.43,10.07|
 |6|4:2|10.97,11.58|8.36,8.69,8.97,9.58|
 
-## Contigous (-g)
+## Contiguos (-g)
 
 |N|n:k|fget|fput |
 |-|----|----|-----|
