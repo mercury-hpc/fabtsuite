@@ -1,12 +1,12 @@
 #include <assert.h>
 #include <err.h>
-#include <inttypes.h> /* PRIu32 */
-#include <libgen.h>   /* basename(3) */
-#include <limits.h>   /* INT_MAX */
-#include <sched.h>    /* CPU_SET(3) */
+#include <libgen.h> /* basename(3) */
+#include <limits.h> /* INT_MAX */
+#include <inttypes.h>   /* PRIu32 */
+#include <sched.h>  /* CPU_SET(3) */
 #include <signal.h>
-#include <stdalign.h>
 #include <stdarg.h>
+#include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -17,17 +17,18 @@
 #include <sys/epoll.h>
 
 #include <rdma/fabric.h>
-#include <rdma/fi_cm.h> /* fi_listen, fi_getname */
+#include <rdma/fi_cm.h>     /* fi_listen, fi_getname */
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
-#include <rdma/fi_rma.h> /* struct fi_msg_rma */
+#include <rdma/fi_rma.h>    /* struct fi_msg_rma */
+#include <rdma/fi_tagged.h> /* struct fi_msg_tagged */
 
 #include "hlog.h"
 
-#define arraycount(a) (sizeof(a) / sizeof(a[0]))
+#define arraycount(a)   (sizeof(a) / sizeof(a[0]))
 
 #ifndef transfer_unused
-#    define transfer_unused __attribute__((unused))
+#define transfer_unused __attribute__((unused))
 #endif
 
 /*
@@ -66,26 +67,32 @@ typedef struct progress_msg {
 /* Communication buffers */
 
 typedef enum {
-    xft_ack,
-    xft_fragment,
-    xft_initial,
-    xft_progress,
-    xft_rdma_write,
-    xft_vector
+  xft_ack
+, xft_fragment
+, xft_initial
+, xft_progress
+, xft_rdma_write
+, xft_vector
 } xfc_type_t;
 
-typedef enum { xfp_first = 0x1, xfp_last = 0x2 } xfc_place_t;
+typedef enum {
+    xfp_first = 0x1
+,   xfp_last = 0x2
+} xfc_place_t;
 
-typedef enum { xfo_program = 0, xfo_nic = 1 } xfc_owner_t;
+typedef enum {
+    xfo_program = 0
+,   xfo_nic = 1
+} xfc_owner_t;
 
 typedef struct {
-    struct fi_context ctx; // this has to be the first member
-    uint32_t type : 4;
-    uint32_t owner : 1;
-    uint32_t place : 2;
-    uint32_t nchildren : 8;
-    uint32_t cancelled : 1;
-    uint32_t unused : 16;
+    struct fi_context ctx;  // this has to be the first member
+    uint32_t type:4;
+    uint32_t owner:1;
+    uint32_t place:2;
+    uint32_t nchildren:8;
+    uint32_t cancelled:1;
+    uint32_t unused:16;
 } xfer_context_t;
 
 typedef struct completion {
@@ -95,41 +102,43 @@ typedef struct completion {
 } completion_t;
 
 typedef struct bufhdr {
+    xfer_context_t xfc;
     uint64_t raddr;
     size_t nused;
     size_t nallocated;
     struct fid_mr *mr;
     void *desc;
-    xfer_context_t xfc;
+    uint64_t tag;
+    max_align_t pad;
 } bufhdr_t;
 
 typedef struct fragment {
     bufhdr_t hdr;
-    bufhdr_t alignas(max_align_t) * parent;
+    bufhdr_t *parent;
 } fragment_t;
 
 typedef struct bytebuf {
     bufhdr_t hdr;
-    char alignas(max_align_t) payload[];
+    char payload[];
 } bytebuf_t;
 
 typedef struct progbuf {
     bufhdr_t hdr;
-    progress_msg_t alignas(max_align_t) msg;
+    progress_msg_t msg;
 } progbuf_t;
 
 typedef struct vecbuf {
     bufhdr_t hdr;
-    vector_msg_t alignas(max_align_t) msg;
+    vector_msg_t msg;
 } vecbuf_t;
 
 typedef struct fifo {
     uint64_t insertions;
     uint64_t removals;
-    size_t index_mask; // for some integer n > 0, 2^n - 1 == index_mask
-    uint64_t closed;   /* close position: no insertions or removals may
-                        * take place at or after this position.
-                        */
+    size_t index_mask;  // for some integer n > 0, 2^n - 1 == index_mask
+    uint64_t closed;    /* close position: no insertions or removals may
+                         * take place at or after this position.
+                         */
     bufhdr_t *hdr[];
 } fifo_t;
 
@@ -143,10 +152,10 @@ typedef struct buflist {
 /* Communication terminals: sources and sinks */
 
 typedef enum {
-    loop_continue,
-    loop_end,
-    loop_error,
-    loop_canceled
+    loop_continue
+,   loop_end
+,   loop_error
+,   loop_canceled
 } loop_control_t;
 
 struct terminal;
@@ -171,9 +180,9 @@ typedef struct {
     size_t entirelen;
 } source_t;
 
-typedef struct keysource {
+typedef struct seqsource {
     uint64_t next_key;
-} keysource_t;
+} seqsource_t;
 
 /*
  * Communications state definitions
@@ -200,19 +209,19 @@ struct cxn {
     struct fid_ep *ep;
     fi_addr_t peer_addr;
     struct fid_cq *cq;
-    int cq_wait_fd; /* if we're using FI_WAIT_FD, the descriptor
-                     * to use with epoll(2) to sleep until I/O is
-                     * ready
-                     */
+    int cq_wait_fd;     /* if we're using FI_WAIT_FD, the descriptor
+                         * to use with epoll(2) to sleep until I/O is
+                         * ready
+                         */
     struct fid_av *av;
-    session_t *parent; // pointer to the connection's current session_t
-    bool sent_first;   /* receiving: set to `true` once this receiver sends an
-                        * acknowledgement for the transmitter's original
-                        * message
-                        *
-                        * transmitting: set to `true` once this transmitter
-                        * sends an initial message to its peer
-                        */
+    session_t *parent;  // pointer to the connection's current session_t
+    bool sent_first;    /* receiving: set to `true` once this receiver sends an
+                         * acknowledgement for the transmitter's original
+                         * message
+                         *
+                         * transmitting: set to `true` once this transmitter
+                         * sends an initial message to its peer
+                         */
     bool cancelled;
     bool started;
     /* Receiver needs to send an empty vector.msg.niovs == 0 to close,
@@ -221,18 +230,24 @@ struct cxn {
      * sending it in `eof.local`.
      */
     eof_state_t eof;
-    keysource_t keys;
+    seqsource_t keys;
 };
 
 typedef struct {
     fifo_t *posted; // buffers posted for vector messages
     fifo_t *rcvd;   // buffers holding received vector messages
+    seqsource_t tags;
+    uint64_t ignore;
 } rxctl_t;
 
 typedef struct {
-    fifo_t *ready;   // message buffers ready to transmit
-    fifo_t *posted;  // buffers posted with messages
-    buflist_t *pool; // unused buffers
+    fifo_t *ready;      // message buffers ready to transmit
+    fifo_t *posted;     // buffers posted with messages
+    buflist_t *pool;    // unused buffers
+    seqsource_t tags;
+    uint64_t ignore;
+    unsigned rotate_ready_countdown;    // counts down to 0, then resets
+                                        // to rotate_ready_interval
 } txctl_t;
 
 typedef struct {
@@ -258,11 +273,13 @@ typedef struct {
     } initial;
     txctl_t vec;
     rxctl_t progress;
+    unsigned split_vector_countdown;  // counts down to 0, then resets
+                                      // to split_vector_interval
 } rcvr_t;
 
 typedef struct {
     cxn_t cxn;
-    fifo_t *wrposted; // posted RDMA writes in order of issuance
+    fifo_t *wrposted;  // posted RDMA writes in order of issuance
     size_t bytes_progress;
     rxctl_t vec;
     txctl_t progress;
@@ -286,20 +303,21 @@ typedef struct {
         struct fid_mr *mr[12];
         uint64_t raddr[12];
         ssize_t niovs;
-        struct fi_context context;
     } payload;
     struct {
-        buflist_t *pool; // unused fragment headers
-        size_t offset;   // offset into buffer at head of ready_for_cxn
+        buflist_t *pool;    // unused fragment headers
+        size_t offset;      // offset into buffer at head of ready_for_cxn
     } fragment;
     struct fi_rma_iov riov[12], riov2[12];
     size_t nriovs;
     size_t next_riov;
     bool phase;
-    bool rcvd_ack; /* set to `true` once this transmitter receives
-                    * an acknowledgement from its peer for the initial
-                    * message
-                    */
+    bool rcvd_ack;      /* set to `true` once this transmitter receives
+                         * an acknowledgement from its peer for the initial
+                         * message
+                         */
+    unsigned split_progress_countdown;  // counts down to 0, then resets
+                                        // to split_progress_interval
 } xmtr_t;
 
 /* On each loop, a worker checks its poll set for any completions.
@@ -321,8 +339,8 @@ typedef struct {
 } load_t;
 
 #define WORKER_SESSIONS_MAX 8
-#define WORKERS_MAX         128
-#define SESSIONS_MAX        (WORKER_SESSIONS_MAX * WORKERS_MAX)
+#define WORKERS_MAX 128
+#define SESSIONS_MAX (WORKER_SESSIONS_MAX * WORKERS_MAX)
 
 struct session {
     terminal_t *terminal;
@@ -352,8 +370,8 @@ struct worker {
     load_t load;
     terminal_t *term[WORKER_SESSIONS_MAX];
     session_t session[WORKER_SESSIONS_MAX];
-    volatile _Atomic size_t nsessions[2]; // number of sessions in each half
-                                          // of session[]
+    volatile _Atomic size_t nsessions[2];   // number of sessions in each half
+                                            // of session[]
     struct fid_poll *pollset[2];
     pthread_mutex_t mtx[2]; /* mtx[0] protects pollset[0] and the first half
                              * of session[]; mtx[1], pollset[1] and the second
@@ -366,14 +384,14 @@ struct worker {
     struct {
         buflist_t *tx;
         buflist_t *rx;
-    } paybufs; /* Reservoirs for free payload buffers. */
-    keysource_t keys;
+    } paybufs;    /* Reservoirs for free payload buffers. */
+    seqsource_t keys;
     worker_stats_t stats;
-    int epoll_fd; /* returned by epoll_create(2) */
+    int epoll_fd;   /* returned by epoll_create(2) */
 };
 
 typedef struct {
-    struct fi_context ctx; // this has to be the first member
+    struct fi_context ctx;  // this has to be the first member
     sink_t sink;
     rcvr_t rcvr;
     session_t sess;
@@ -408,7 +426,7 @@ typedef struct {
     size_t rx_maxsegs;
     size_t tx_maxsegs;
     size_t rma_maxsegs;
-    keysource_t keys;
+    seqsource_t keys;
     bool contiguous;
     bool expect_cancellation;
     bool reregister;
@@ -442,22 +460,26 @@ HLOG_OUTLET_SHORT_DEFN(txdefer, all);
 HLOG_OUTLET_SHORT_DEFN(memreg, all);
 HLOG_OUTLET_SHORT_DEFN(msg, all);
 HLOG_OUTLET_SHORT_DEFN(payverify, all);
-HLOG_OUTLET_FLAGS_DEFN(payload, all, HLOG_F_NO_PREFIX | HLOG_F_NO_SUFFIX);
+HLOG_OUTLET_FLAGS_DEFN(payload, all, HLOG_F_NO_PREFIX|HLOG_F_NO_SUFFIX);
 HLOG_OUTLET_SHORT_DEFN(paybuf, all);
 HLOG_OUTLET_SHORT_DEFN(paybuflist, paybuf);
 HLOG_OUTLET_SHORT_DEFN(completion, all);
 HLOG_OUTLET_SHORT_DEFN(worker_stats, all);
+HLOG_OUTLET_SHORT_DEFN(multitx, all);
+HLOG_OUTLET_SHORT_DEFN(session, all);
+HLOG_OUTLET_SHORT_DEFN(ooo, all);
 
 static const char fget_fput_service_name[] = "4242";
 
-static state_t global_state = {.domain = NULL,
-    .fabric = NULL,
-    .info = NULL,
-    .personality = NULL,
-    .local_sessions = 1,
-    .total_sessions = 1,
-    .processors = {.first = 0, .last = INT_MAX},
-    .cancelled = 0};
+static const unsigned split_progress_interval = 2047;
+static const unsigned split_vector_interval = 15;
+static const unsigned rotate_ready_interval = 3;
+
+static state_t global_state = {.domain = NULL, .fabric = NULL, .info = NULL,
+                               .personality = NULL, .local_sessions = 1,
+                               .total_sessions = 1,
+                               .processors = {.first = 0, .last = INT_MAX},
+                               .cancelled = 0};
 
 static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
@@ -470,8 +492,12 @@ static bool workers_assignment_suspended = false;
 static struct {
     int signum;
     struct sigaction saved_action;
-} siglist[] = {{.signum = SIGHUP}, {.signum = SIGINT}, {.signum = SIGQUIT},
-    {.signum = SIGTERM}};
+} siglist[] = {
+  {.signum = SIGHUP}
+, {.signum = SIGINT}
+, {.signum = SIGQUIT}
+, {.signum = SIGTERM}
+};
 
 static struct sigaction saved_wakeup1_action;
 static struct sigaction saved_wakeup2_action;
@@ -481,22 +507,26 @@ static const struct {
     uint64_t tx;
 } payload_access = {.rx = FI_RECV | FI_REMOTE_WRITE, .tx = FI_SEND};
 
-static int
-get(void);
+static int get(void);
 
 static char *
-completion_flags_to_string(
-    const uint64_t flags, char *const buf, const size_t bufsize)
+completion_flags_to_string(const uint64_t flags, char * const buf,
+    const size_t bufsize)
 {
     char *next = buf;
     static const struct {
         uint64_t flag;
         const char *name;
-    } flag_to_name[] = {{.flag = FI_RECV, .name = "recv"},
-        {.flag = FI_SEND, .name = "send"}, {.flag = FI_MSG, .name = "msg"},
-        {.flag = FI_RMA, .name = "rma"}, {.flag = FI_WRITE, .name = "write"},
-        {.flag = FI_COMPLETION, .name = "completion"},
-        {.flag = FI_DELIVERY_COMPLETE, .name = "delivery complete"}};
+    } flag_to_name[] = {
+      {.flag = FI_RECV, .name = "recv"}
+    , {.flag = FI_SEND, .name = "send"}
+    , {.flag = FI_MSG, .name = "msg"}
+    , {.flag = FI_RMA, .name = "rma"}
+    , {.flag = FI_WRITE, .name = "write"}
+    , {.flag = FI_TAGGED, .name = "tagged"}
+    , {.flag = FI_COMPLETION, .name = "completion"}
+    , {.flag = FI_DELIVERY_COMPLETE, .name = "delivery complete"}
+    };
     size_t i;
     size_t bufleft = bufsize;
     uint64_t found = 0, residue;
@@ -514,10 +544,10 @@ completion_flags_to_string(
         found |= curflag;
         int nprinted = snprintf(next, bufleft, "%s%s", delim, name);
         delim = ",";
-        if (nprinted < 0 || (size_t) nprinted >= bufleft)
+        if (nprinted < 0 || (size_t)nprinted >= bufleft)
             continue;
         next += nprinted;
-        bufleft -= (size_t) nprinted;
+        bufleft -= (size_t)nprinted;
     }
     residue = flags & ~found;
     while (residue != 0) {
@@ -526,35 +556,37 @@ completion_flags_to_string(
         uint64_t lsb = oresidue ^ residue;
         int nprinted = snprintf(next, bufleft, "%s0x%" PRIx64, delim, lsb);
         delim = ",";
-        if (nprinted < 0 || (size_t) nprinted >= bufleft)
+        if (nprinted < 0 || (size_t)nprinted >= bufleft)
             continue;
         next += nprinted;
-        bufleft -= (size_t) nprinted;
+        bufleft -= (size_t)nprinted;
     }
     if (next != buf)
-        (void) snprintf(next, bufleft, ">");
+        (void)snprintf(next, bufleft, ">");
     return buf;
 }
 
 static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
-static const uint64_t desired_tx_flags = FI_SEND | FI_MSG;
+static const uint64_t desired_tagged_rx_flags = FI_RECV | FI_TAGGED;
+static const uint64_t desired_tagged_tx_flags = FI_SEND | FI_TAGGED;
 static const uint64_t desired_wr_flags =
     FI_RMA | FI_WRITE | FI_COMPLETION | FI_DELIVERY_COMPLETE;
 
 static uint64_t _Atomic next_key_pool = 512;
 
-static char txbuf[] = "If this message was received in error then please "
-                      "print it out and shred it.";
+static char txbuf[] =
+    "If this message was received in error then please "
+    "print it out and shred it.";
 
-#define bailout_for_ofi_ret(ret, ...)                                          \
-    bailout_for_ofi_ret_impl(ret, __func__, __LINE__, __VA_ARGS__)
+#define bailout_for_ofi_ret(ret, ...)                          \
+        bailout_for_ofi_ret_impl(ret, __func__, __LINE__, __VA_ARGS__)
 
-#define warn_about_ofi_ret(ret, ...)                                           \
-    warn_about_ofi_ret_impl(ret, __func__, __LINE__, __VA_ARGS__)
+#define warn_about_ofi_ret(ret, ...)                          \
+        warn_about_ofi_ret_impl(ret, __func__, __LINE__, __VA_ARGS__)
 
 static void
-warnv_about_ofi_ret_impl(
-    int ret, const char *fn, int lineno, const char *fmt, va_list ap)
+warnv_about_ofi_ret_impl(int ret, const char *fn, int lineno,
+    const char *fmt, va_list ap)
 {
     fprintf(stderr, "%s.%d: ", fn, lineno);
     vfprintf(stderr, fmt, ap);
@@ -562,8 +594,8 @@ warnv_about_ofi_ret_impl(
 }
 
 static void
-warn_about_ofi_ret_impl(
-    int ret, const char *fn, int lineno, const char *fmt, ...)
+warn_about_ofi_ret_impl(int ret, const char *fn, int lineno,
+    const char *fmt, ...)
 {
     va_list ap;
 
@@ -573,8 +605,8 @@ warn_about_ofi_ret_impl(
 }
 
 static void
-bailout_for_ofi_ret_impl(
-    int ret, const char *fn, int lineno, const char *fmt, ...)
+bailout_for_ofi_ret_impl(int ret, const char *fn, int lineno,
+    const char *fmt, ...)
 {
     va_list ap;
 
@@ -680,7 +712,7 @@ fifo_alt_get(fifo_t *f)
     if (f->insertions == f->removals)
         return NULL;
 
-    bufhdr_t *h = f->hdr[f->removals & (uint64_t) f->index_mask];
+    bufhdr_t *h = f->hdr[f->removals & (uint64_t)f->index_mask];
     f->removals++;
 
     return h;
@@ -717,6 +749,18 @@ fifo_empty(fifo_t *f)
     return fifo_eoget(f) || fifo_alt_empty(f);
 }
 
+static inline size_t
+fifo_nfull(fifo_t *f)
+{
+    return f->insertions - f->removals;
+}
+
+static inline size_t
+fifo_nempty(fifo_t *f)
+{
+    return f->index_mask + 1 - fifo_nfull(f);
+}
+
 /* Return NULL if the FIFO is empty or if the FIFO has been read up to
  * the close position.  Otherwise, return the next item on the FIFO without
  * removing it.
@@ -729,7 +773,7 @@ fifo_peek(fifo_t *f)
     if (fifo_empty(f))
         return NULL;
 
-    return f->hdr[f->removals & (uint64_t) f->index_mask];
+    return f->hdr[f->removals & (uint64_t)f->index_mask];
 }
 
 /* See `fifo_full`: this is a variant that does not respect the close
@@ -761,7 +805,7 @@ fifo_alt_put(fifo_t *f, bufhdr_t *h)
     if (f->insertions - f->removals > f->index_mask)
         return false;
 
-    f->hdr[f->insertions & (uint64_t) f->index_mask] = h;
+    f->hdr[f->insertions & (uint64_t)f->index_mask] = h;
     f->insertions++;
 
     return true;
@@ -820,20 +864,30 @@ session_init(session_t *s, cxn_t *c, terminal_t *t)
 }
 
 static void
-keysource_init(keysource_t *s)
+seqsource_init(seqsource_t *s)
 {
     memset(s, 0, sizeof(*s));
 }
 
 static uint64_t
-keysource_next(keysource_t *s)
+seqsource_get(seqsource_t *s)
 {
     if (s->next_key % 256 == 0) {
-        s->next_key = atomic_fetch_add_explicit(
-            &next_key_pool, 256, memory_order_relaxed);
+            s->next_key = atomic_fetch_add_explicit(&next_key_pool, 256,
+                memory_order_relaxed);
     }
 
     return s->next_key++;
+}
+
+static bool
+seqsource_unget(seqsource_t *s, uint64_t got)
+{
+    if (got + 1 != s->next_key)
+        return false;
+
+    s->next_key--;
+    return true;
 }
 
 static bufhdr_t *
@@ -841,12 +895,10 @@ buf_alloc(size_t paylen)
 {
     bufhdr_t *h;
 
-    if ((h = malloc(offsetof(bytebuf_t, payload[0]) + paylen)) == NULL)
+    if ((h = calloc(1, offsetof(bytebuf_t, payload[0]) + paylen)) == NULL)
         return NULL;
 
     h->nallocated = paylen;
-    h->nused = 0;
-    h->raddr = 0;
 
     return h;
 }
@@ -860,7 +912,7 @@ buf_free(bufhdr_t *h)
 static bytebuf_t *
 bytebuf_alloc(size_t paylen)
 {
-    return (bytebuf_t *) buf_alloc(paylen);
+    return (bytebuf_t *)buf_alloc(paylen);
 }
 
 static fragment_t *
@@ -872,7 +924,7 @@ fragment_alloc(void)
     if ((h = buf_alloc(sizeof(*f) - sizeof(bufhdr_t))) == NULL)
         return NULL;
 
-    f = (fragment_t *) h;
+    f = (fragment_t *)h;
     h->xfc.type = xft_fragment;
 
     return f;
@@ -887,7 +939,7 @@ progbuf_alloc(void)
     if ((h = buf_alloc(sizeof(*pb) - sizeof(bufhdr_t))) == NULL)
         return NULL;
 
-    pb = (progbuf_t *) h;
+    pb = (progbuf_t *)h;
     h->xfc.type = xft_progress;
 
     return pb;
@@ -902,7 +954,7 @@ vecbuf_alloc(void)
     if ((h = buf_alloc(sizeof(*vb) - sizeof(bufhdr_t))) == NULL)
         return NULL;
 
-    vb = (vecbuf_t *) h;
+    vb = (vecbuf_t *)h;
     vb->msg.pad = 0;
     h->xfc.type = xft_vector;
 
@@ -910,13 +962,14 @@ vecbuf_alloc(void)
 }
 
 static int
-buf_mr_reg(struct fid_domain *dom, uint64_t access, uint64_t key, bufhdr_t *h)
+buf_mr_reg(struct fid_domain *dom, uint64_t access, uint64_t key,
+    bufhdr_t *h)
 {
     int rc;
-    bytebuf_t *b = (bytebuf_t *) h;
+    bytebuf_t *b = (bytebuf_t *)h;
 
-    rc = fi_mr_reg(
-        dom, b->payload, h->nallocated, access, 0, key, 0, &h->mr, NULL);
+    rc = fi_mr_reg(dom, &b->payload[0], h->nallocated, access, 0, key, 0,
+        &h->mr, NULL);
 
     if (rc != 0)
         return rc;
@@ -939,7 +992,7 @@ vecbuf_free(vecbuf_t *vb)
 }
 
 static bool
-paybuflist_replenish(keysource_t *keys, uint64_t access, buflist_t *bl)
+paybuflist_replenish(seqsource_t *keys, uint64_t access, buflist_t *bl)
 {
     size_t i, paylen;
     int rc;
@@ -954,22 +1007,22 @@ paybuflist_replenish(keysource_t *keys, uint64_t access, buflist_t *bl)
 
         // paylen cycle: -> 23 -> 29 -> 31 -> 37 -> 23
         switch (paylen) {
-            case 0:
-            default:
-                paylen = 23;
-                break;
-            case 23:
-                paylen = 29;
-                break;
-            case 29:
-                paylen = 31;
-                break;
-            case 31:
-                paylen = 37;
-                break;
-            case 37:
-                paylen = 23;
-                break;
+        case 0:
+        default:
+            paylen = 23;
+            break;
+        case 23:
+            paylen = 29;
+            break;
+        case 29:
+            paylen = 31;
+            break;
+        case 31:
+            paylen = 37;
+            break;
+        case 37:
+            paylen = 23;
+            break;
         }
         buf = bytebuf_alloc(paylen);
         if (buf == NULL)
@@ -978,15 +1031,15 @@ paybuflist_replenish(keysource_t *keys, uint64_t access, buflist_t *bl)
         buf->hdr.xfc.type = xft_rdma_write;
 
         if (!global_state.reregister &&
-            (rc = buf_mr_reg(global_state.domain, access, keysource_next(keys),
-                 &buf->hdr)) != 0) {
+            (rc = buf_mr_reg(global_state.domain, access,
+                             seqsource_get(keys), &buf->hdr)) != 0) {
             warn_about_ofi_ret(rc, "fi_mr_reg");
             free(buf);
             break;
         }
 
-        hlog_fast(paybuflist, "%s: pushing %zu-byte buffer", __func__,
-            buf->hdr.nallocated);
+        hlog_fast(paybuflist,
+            "%s: pushing %zu-byte buffer", __func__, buf->hdr.nallocated);
         bl->buf[i] = &buf->hdr;
     }
     bl->nfull = i;
@@ -999,9 +1052,9 @@ worker_payload_txbuf_get(worker_t *w)
 {
     bytebuf_t *b;
 
-    while ((b = (bytebuf_t *) buflist_get(w->paybufs.tx)) == NULL &&
+    while ((b = (bytebuf_t *)buflist_get(w->paybufs.tx)) == NULL &&
            paybuflist_replenish(&w->keys, payload_access.tx, w->paybufs.tx))
-        ; // do nothing
+        ;   // do nothing
 
     if (b != NULL)
         hlog_fast(paybuf, "%s: buf length %zu", __func__, b->hdr.nallocated);
@@ -1014,9 +1067,9 @@ worker_payload_rxbuf_get(worker_t *w)
 {
     bytebuf_t *b;
 
-    while ((b = (bytebuf_t *) buflist_get(w->paybufs.rx)) == NULL &&
+    while ((b = (bytebuf_t *)buflist_get(w->paybufs.rx)) == NULL &&
            paybuflist_replenish(&w->keys, payload_access.rx, w->paybufs.rx))
-        ; // do nothing
+        ;   // do nothing
 
     if (b != NULL)
         hlog_fast(paybuf, "%s: buf length %zu", __func__, b->hdr.nallocated);
@@ -1044,8 +1097,8 @@ fibonacci_iov_setup(void *_buf, size_t len, struct iovec *iov, size_t niovs)
         iov[i].iov_base = buf;
         len -= iov[i].iov_len;
         buf += iov[i].iov_len;
-        state =
-            (struct fibo){.prev = state.curr, .curr = state.prev + state.curr};
+        state = (struct fibo){.prev = state.curr,
+                              .curr = state.prev + state.curr};
     }
     if (len > 0) {
         iov[i].iov_len = len;
@@ -1061,16 +1114,17 @@ fibonacci_iov_setup(void *_buf, size_t len, struct iovec *iov, size_t niovs)
  * more than `maxsegs` segments in a single `fi_mr_regv` call.
  */
 static int
-mr_regv_all(struct fid_domain *domain, const struct iovec *iov, size_t niovs,
-    size_t maxsegs, uint64_t access, uint64_t offset, keysource_t *keys,
-    uint64_t flags, struct fid_mr **mrp, void **descp, uint64_t *raddrp,
-    void *context)
+mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
+    size_t niovs, size_t maxsegs, uint64_t access, uint64_t offset,
+    seqsource_t *keys, uint64_t flags, struct fid_mr **mrp,
+    void **descp, uint64_t *raddrp, void *context)
 {
     int rc;
     size_t i, j, nregs = (niovs + maxsegs - 1) / maxsegs;
     size_t nleftover;
 
-    for (nleftover = niovs, i = 0; i < nregs;
+    for (nleftover = niovs, i = 0;
+         i < nregs;
          iov += maxsegs, nleftover -= maxsegs, i++) {
         struct fid_mr *mr;
         uint64_t raddr = 0;
@@ -1079,8 +1133,8 @@ mr_regv_all(struct fid_domain *domain, const struct iovec *iov, size_t niovs,
 
         hlog_fast(memreg, "%zu remaining I/O vectors", nleftover);
 
-        rc = fi_mr_regv(domain, iov, nsegs, access, offset,
-            keysource_next(keys), flags, &mr, context);
+        rc = fi_mr_regv(domain, iov, nsegs,
+            access, offset, seqsource_get(keys), flags, &mr, context);
 
         if (rc != 0)
             goto err;
@@ -1098,37 +1152,72 @@ mr_regv_all(struct fid_domain *domain, const struct iovec *iov, size_t niovs,
 
 err:
     for (j = 0; j < i; j++)
-        (void) fi_close(&mrp[j]->fid);
+        (void)fi_close(&mrp[j]->fid);
 
     return rc;
+}
+
+static inline bool
+rxctl_idle(rxctl_t *ctl)
+{
+    return fifo_empty(ctl->posted);
+}
+
+static inline bool
+rxctl_ready(rxctl_t *ctl)
+{
+    return !fifo_full(ctl->posted);
 }
 
 static bufhdr_t *
 rxctl_complete(rxctl_t *rc, const completion_t *cmpl)
 {
-    bufhdr_t *h;
+    bufhdr_t *h, *head;
 
-    if ((cmpl->flags & desired_rx_flags) != desired_rx_flags &&
-        !cmpl->xfc->cancelled) {
+    head = fifo_peek(rc->posted);
+
+    if (cmpl == NULL) {
+        goto out;
+    } else if (head == NULL) {
         errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64, __func__,
-            desired_rx_flags, cmpl->flags & desired_rx_flags);
+            "%s: received a completion, but no Rx was posted", __func__);
     }
 
-    if ((h = fifo_get(rc->posted)) == NULL) {
-        errx(EXIT_FAILURE, "%s: received a message, but no Rx was posted",
-            __func__);
-        return NULL;
+    cmpl->xfc->owner = xfo_program;
+
+    if (cmpl->xfc->cancelled) {
+        ;   /* do nothing; leave cancelled flag set, it's needed by
+             * higher-level processing---e.g., in xmtr_vector_rx_process
+             */
+    } else if ((cmpl->flags & desired_tagged_rx_flags) !=
+               desired_tagged_rx_flags) {
+        char difference[128];
+
+        errx(EXIT_FAILURE,
+            "%s: expected flags %" PRIu64
+            " differs from received flags %" PRIu64 " at %s",
+            __func__, desired_tagged_rx_flags,
+            cmpl->flags & desired_tagged_rx_flags,
+            completion_flags_to_string(
+                desired_tagged_rx_flags ^
+                (cmpl->flags & desired_tagged_rx_flags), difference,
+                sizeof(difference)));
     }
 
-    if (cmpl->xfc != &h->xfc) {
-        errx(EXIT_FAILURE, "%s: expected context %p received %p", __func__,
-            (void *) &h->xfc.ctx, (void *) cmpl->xfc);
-    }
-
+    h = (bufhdr_t *)((char *)cmpl->xfc - offsetof(bufhdr_t, xfc));
     h->nused = cmpl->len;
 
-    return h;
+    if (cmpl != NULL && cmpl->xfc != &head->xfc) {
+        hlog_fast(ooo,
+            "%s: out-of-order completion: context %p at head, received %p",
+            __func__, (void *)&h->xfc.ctx, (void *)cmpl->xfc);
+    }
+
+out:
+    if (head == NULL || head->xfc.owner != xfo_program)
+        return NULL;
+
+    return fifo_get(rc->posted);
 }
 
 static void
@@ -1137,23 +1226,28 @@ rxctl_post(cxn_t *c, rxctl_t *ctl, bufhdr_t *h)
     int rc;
 
     h->xfc.cancelled = 0;
+    h->xfc.owner = xfo_nic;
 
-    rc = fi_recvmsg(c->ep,
-        &(struct fi_msg){
-            .msg_iov =
-                &(struct iovec){.iov_base = &((bytebuf_t *) h)->payload[0],
-                    .iov_len = h->nallocated},
-            .desc = &h->desc,
-            .iov_count = 1,
-            .addr = c->peer_addr,
-            .context = &h->xfc.ctx,
-            .data = 0},
-        FI_COMPLETION);
+    const uint64_t tag = seqsource_get(&ctl->tags);
 
-    if (rc < 0)
-        bailout_for_ofi_ret(rc, "fi_recvmsg");
+    rc = fi_trecvmsg(c->ep, &(struct fi_msg_tagged){
+          .msg_iov = &(struct iovec){.iov_base = &((bytebuf_t *)h)->payload[0],
+                                     .iov_len = h->nallocated}
+        , .desc = &h->desc
+        , .iov_count = 1
+        , .addr = c->peer_addr
+        , .tag = tag
+        , .ignore = ctl->ignore
+        , .context = &h->xfc.ctx
+        , .data = 0
+        }, FI_COMPLETION);
 
-    (void) fifo_put(ctl->posted, h);
+    if (rc < 0) {
+        seqsource_unget(&ctl->tags, tag);
+        bailout_for_ofi_ret(rc, "fi_trecvmsg");
+    }
+
+    (void)fifo_put(ctl->posted, h);
 }
 
 static void
@@ -1165,13 +1259,103 @@ fifo_cancel(struct fid_ep *ep, fifo_t *posted)
     while ((h = fifo_peek(posted)) != NULL) {
         if (h == first)
             break;
-        (void) fifo_get(posted);
+        (void)fifo_get(posted);
         if (first == NULL)
             first = h;
         h->xfc.cancelled = 1;
         if ((rc = fi_cancel(&ep->fid, &h->xfc.ctx)) != 0)
             bailout_for_ofi_ret(rc, "fi_cancel");
-        (void) fifo_put(posted, h);
+        (void)fifo_put(posted, h);
+    }
+}
+
+static buflist_t *
+buflist_create(size_t n)
+{
+    buflist_t *bl = malloc(offsetof(buflist_t, buf) + sizeof(bl->buf[0]) * n);
+
+    if (bl == NULL)
+        return NULL;
+
+    bl->nallocated = n;
+    bl->nfull = 0;
+
+    return bl;
+}
+
+static void
+rxctl_init(rxctl_t *ctl, size_t len)
+{
+    assert(size_is_power_of_2(len));
+
+    seqsource_init(&ctl->tags);
+    ctl->ignore = ~(uint64_t)(len - 1);
+
+    if ((ctl->posted = fifo_create(len)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create posted messages FIFO", __func__);
+    }
+    if ((ctl->rcvd = fifo_create(len)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create received messages FIFO", __func__);
+    }
+}
+
+static inline bool
+txctl_idle(txctl_t *ctl)
+{
+    return fifo_empty(ctl->posted);
+}
+
+static inline bool
+txctl_ready(txctl_t *ctl)
+{
+    return !fifo_full(ctl->posted);
+}
+
+static bool
+txctl_put(txctl_t *ctl, bufhdr_t *h)
+{
+    h->tag = seqsource_get(&ctl->tags);
+
+    if (fifo_put(ctl->ready, h))
+        return true;
+
+    seqsource_unget(&ctl->tags, h->tag);
+    return false;
+}
+
+static void
+txctl_init(txctl_t *ctl, size_t len, size_t nbufs,
+    bufhdr_t *(*create_and_register)(void))
+{
+    size_t i;
+
+    assert(size_is_power_of_2(len));
+
+    seqsource_init(&ctl->tags);
+    ctl->ignore = ~(uint64_t)(len - 1);
+
+    if ((ctl->ready = fifo_create(len)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create ready messages FIFO", __func__);
+    }
+
+    if ((ctl->posted = fifo_create(len)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create posted messages FIFO", __func__);
+    }
+
+    if ((ctl->pool = buflist_create(nbufs)) == NULL) {
+        errx(EXIT_FAILURE,
+            "%s: could not create tx buffer pool", __func__);
+    }
+
+    for (i = 0; i < nbufs; i++) {
+        bufhdr_t *h = create_and_register();
+
+        if (!buflist_put(ctl->pool, h))
+            errx(EXIT_FAILURE, "%s: vector buffer pool full", __func__);
     }
 }
 
@@ -1196,22 +1380,32 @@ txctl_complete(txctl_t *tc, const completion_t *cmpl)
 {
     bufhdr_t *h;
 
-    if ((cmpl->flags & desired_tx_flags) != desired_tx_flags &&
-        !cmpl->xfc->cancelled) {
+    if (cmpl->xfc->cancelled) {
+        cmpl->xfc->cancelled = 0;
+    } else if ((cmpl->flags & desired_tagged_tx_flags) !=
+               desired_tagged_tx_flags) {
+        char difference[128];
+
         errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64, __func__,
-            desired_rx_flags, cmpl->flags & desired_rx_flags);
+            "%s: expected flags %" PRIu64
+            " differs from received flags %" PRIu64 " at %s",
+            __func__, desired_tagged_tx_flags,
+            cmpl->flags & desired_tagged_tx_flags,
+            completion_flags_to_string(
+                desired_tagged_tx_flags ^
+                (cmpl->flags & desired_tagged_tx_flags), difference,
+                sizeof(difference)));
     }
 
     if ((h = fifo_get(tc->posted)) == NULL) {
-        hlog_fast(
-            txctl, "%s: message Tx completed, but no Tx was posted", __func__);
+        hlog_fast(txctl,
+            "%s: message Tx completed, but no Tx was posted", __func__);
         return -1;
     }
 
     if (cmpl->xfc != &h->xfc) {
-        errx(EXIT_FAILURE, "%s: expected context %p received %p", __func__,
-            (void *) &h->xfc.ctx, (void *) cmpl->xfc);
+        errx(EXIT_FAILURE, "%s: expected context %p received %p",
+            __func__, (void *)&h->xfc.ctx, (void *)cmpl->xfc);
     }
 
     if (!buflist_put(tc->pool, h))
@@ -1224,30 +1418,48 @@ static void
 txctl_transmit(cxn_t *c, txctl_t *tc)
 {
     bufhdr_t *h;
+    size_t nsent = 0;
 
-    while ((h = fifo_peek(tc->ready)) != NULL && !fifo_full(tc->posted)) {
-        const int rc = fi_sendmsg(c->ep,
-            &(struct fi_msg){
-                .msg_iov =
-                    &(struct iovec){.iov_base = ((bytebuf_t *) h)->payload,
-                        .iov_len = h->nused},
-                .desc = h->desc,
-                .iov_count = 1,
-                .addr = c->peer_addr,
-                .context = &h->xfc.ctx,
-                .data = 0},
-            FI_COMPLETION);
+    /* Periodically induce an out-of-order message transmission by
+     * "rotating" the tx-ready FIFO: if more than one buffer is on the
+     * FIFO, then move the buffer at the front of the FIFO to the back.
+     */
+    if (tc->rotate_ready_countdown == 0) {
+        if (fifo_nfull(tc->ready) > 1 && fifo_nempty(tc->posted) > 1) {
+            (void)fifo_put(tc->ready, fifo_get(tc->ready));
+            tc->rotate_ready_countdown = rotate_ready_interval;
+        }
+    } else {
+        tc->rotate_ready_countdown--;
+    }
+
+    while ((h = fifo_peek(tc->ready)) != NULL && txctl_ready(tc)) {
+        const int rc = fi_tsendmsg(c->ep, &(struct fi_msg_tagged){
+              .msg_iov = &(struct iovec){
+                  .iov_base = &((bytebuf_t *)h)->payload[0]
+                , .iov_len = h->nused}
+            , .desc = h->desc
+            , .iov_count = 1
+            , .addr = c->peer_addr
+            , .tag = h->tag
+            , .ignore = 0
+            , .context = &h->xfc.ctx
+            , .data = 0
+            }, FI_COMPLETION);
 
         if (rc == 0) {
-            (void) fifo_get(tc->ready);
-            (void) fifo_put(tc->posted, h);
+            (void)fifo_get(tc->ready);
+            (void)fifo_put(tc->posted, h);
+            nsent++;
         } else if (rc == -FI_EAGAIN) {
             hlog_fast(txdefer, "%s: deferred transmission", __func__);
             break;
         } else if (rc < 0) {
-            bailout_for_ofi_ret(rc, "fi_sendmsg");
+            bailout_for_ofi_ret(rc, "fi_tsendmsg");
         }
     }
+    if (nsent > 1)
+        hlog_fast(multitx, "%s: posted %zu transmissions", __func__, nsent);
 }
 
 static loop_control_t
@@ -1257,13 +1469,13 @@ rcvr_start(worker_t *w, rcvr_t *r, fifo_t *ready_for_cxn)
 
     r->cxn.started = true;
 
-    while (!fifo_full(r->progress.posted)) {
+    while (rxctl_ready(&r->progress)) {
         progbuf_t *pb = progbuf_alloc();
 
         rxctl_post(&r->cxn, &r->progress, &pb->hdr);
     }
 
-    for (nleftover = sizeof(txbuf), nloaded = 0; nleftover > 0;) {
+    for (nleftover = sizeof(txbuf), nloaded = 0; nleftover > 0; ) {
         bytebuf_t *b = worker_payload_rxbuf_get(w);
 
         if (b == NULL) {
@@ -1289,14 +1501,14 @@ rcvr_start(worker_t *w, rcvr_t *r, fifo_t *ready_for_cxn)
 static loop_control_t
 source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 {
-    source_t *s = (source_t *) t;
+    source_t *s = (source_t *)t;
     bufhdr_t *h;
 
     if (fifo_eoput(completed))
         return loop_end;
 
     while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
-        bytebuf_t *b = (bytebuf_t *) h;
+        bytebuf_t *b = (bytebuf_t *)h;
         size_t len, ofs;
 
         if (s->idx == s->entirelen) {
@@ -1309,11 +1521,11 @@ source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
             size_t txbuf_ofs = (s->idx + ofs) % s->txbuflen;
             len = minsize(h->nused - ofs, s->txbuflen - txbuf_ofs);
             memcpy(&b->payload[ofs], &txbuf[txbuf_ofs], len);
-            hlog_fast(payload, "%.*s", (int) len, &b->payload[ofs]);
+            hlog_fast(payload, "%.*s", (int)len, &b->payload[ofs]);
         }
 
-        (void) fifo_get(ready);
-        (void) fifo_alt_put(completed, h);
+        (void)fifo_get(ready);
+        (void)fifo_alt_put(completed, h);
 
         s->idx += h->nused;
     }
@@ -1331,7 +1543,7 @@ source_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 static loop_control_t
 sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 {
-    sink_t *s = (sink_t *) t;
+    sink_t *s = (sink_t *)t;
     bufhdr_t *h;
 
     if (fifo_eoget(ready)) {
@@ -1341,7 +1553,7 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
     }
 
     while ((h = fifo_peek(ready)) != NULL && !fifo_full(completed)) {
-        bytebuf_t *b = (bytebuf_t *) h;
+        bytebuf_t *b = (bytebuf_t *)h;
         size_t len, ofs;
 
         if (h->nused + s->idx > s->entirelen)
@@ -1350,13 +1562,13 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
         for (ofs = 0; ofs < h->nused; ofs += len) {
             size_t txbuf_ofs = (s->idx + ofs) % s->txbuflen;
             len = minsize(h->nused - ofs, s->txbuflen - txbuf_ofs);
-            hlog_fast(payload, "%.*s", (int) len, &b->payload[ofs]);
+            hlog_fast(payload, "%.*s", (int)len, &b->payload[ofs]);
             if (memcmp(&b->payload[ofs], &txbuf[txbuf_ofs], len) != 0)
                 goto fail;
         }
 
-        (void) fifo_get(ready);
-        (void) fifo_put(completed, h);
+        (void)fifo_get(ready);
+        (void)fifo_put(completed, h);
         s->idx += h->nused;
     }
     if (s->idx != s->entirelen)
@@ -1380,27 +1592,23 @@ progbuf_is_wellformed(progbuf_t *pb)
  * irrecoverable error.
  */
 static int
-rcvr_progress_rx_process(rcvr_t *r, const completion_t *cmpl)
+rcvr_progress_rx_process(rcvr_t *r, bufhdr_t *h)
 {
-    progbuf_t *pb;
+    progbuf_t *pb = (progbuf_t *)h;
 
-    if ((pb = (progbuf_t *) rxctl_complete(&r->progress, cmpl)) == NULL)
-        return -1;
-
-    if (pb->hdr.xfc.cancelled) {
-        buf_free(&pb->hdr);
+    if (h->xfc.cancelled) {
+        buf_free(h);
         return 0;
     }
 
     if (!progbuf_is_wellformed(pb)) {
-        rxctl_post(&r->cxn, &r->progress, &pb->hdr);
+        rxctl_post(&r->cxn, &r->progress, h);
         return 0;
     }
 
-    hlog_fast(msg,
-        "%s: received progress message, %" PRIu64 " bytes filled, %" PRIu64
-        " bytes leftover.",
-        __func__, pb->msg.nfilled, pb->msg.nleftover);
+    hlog_fast(msg, "%s: received progress message, %"
+        PRIu64 " bytes filled, %" PRIu64 " bytes leftover.", __func__,
+        pb->msg.nfilled, pb->msg.nleftover);
 
     r->nfull += pb->msg.nfilled;
 
@@ -1409,7 +1617,7 @@ rcvr_progress_rx_process(rcvr_t *r, const completion_t *cmpl)
         r->cxn.eof.remote = true;
     }
 
-    rxctl_post(&r->cxn, &r->progress, &pb->hdr);
+    rxctl_post(&r->cxn, &r->progress, h);
 
     return 1;
 }
@@ -1421,7 +1629,9 @@ static int
 rcvr_cq_process(rcvr_t *r)
 {
     struct fi_cq_msg_entry fcmpl;
-    completion_t cmpl;
+    completion_t cmpl, *cmplp;
+    bufhdr_t *h;
+    size_t nprocessed;
     ssize_t ncompleted;
 
     if ((ncompleted = fi_cq_read(r->cxn.cq, &fcmpl, 1)) == -FI_EAGAIN)
@@ -1433,17 +1643,20 @@ rcvr_cq_process(rcvr_t *r)
         char flagsbuf[256];
         ssize_t nfailed = fi_cq_readerr(r->cxn.cq, &e, 0);
 
-        cmpl = (completion_t){.xfc = e.op_context, .len = 0, .flags = 0};
+        cmpl = (completion_t){
+          .xfc = e.op_context
+        , .len = 0
+        , .flags = 0
+        };
 
         if (e.err != FI_ECANCELED || !cmpl.xfc->cancelled) {
             hlog_fast(err, "%s: read %zd errors, %s", __func__, nfailed,
                 fi_strerror(e.err));
-            hlog_fast(err, "%s: context %p", __func__, (void *) e.op_context);
-            hlog_fast(err, "%s: completion flags %" PRIx64 " expected %" PRIx64,
-                __func__, e.flags, desired_rx_flags);
+            hlog_fast(err, "%s: context %p", __func__, (void *)e.op_context);
+            hlog_fast(err, "%s: completion flags %" PRIx64, __func__, e.flags);
             hlog_fast(err, "%s: symbolic flags %s", __func__,
-                completion_flags_to_string(
-                    e.flags, flagsbuf, sizeof(flagsbuf)));
+                completion_flags_to_string(e.flags, flagsbuf,
+                sizeof(flagsbuf)));
             hlog_fast(err, "%s: provider error %s", __func__,
                 fi_cq_strerror(r->cxn.cq, e.prov_errno, e.err_data, errbuf,
                     sizeof(errbuf)));
@@ -1452,27 +1665,46 @@ rcvr_cq_process(rcvr_t *r)
     } else if (ncompleted < 0) {
         bailout_for_ofi_ret(ncompleted, "fi_cq_read");
     } else if (ncompleted != 1) {
-        errx(EXIT_FAILURE, "%s: expected 1 completion, read %zd", __func__,
-            ncompleted);
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
     } else {
         cmpl = (completion_t){
-            .xfc = fcmpl.op_context, .len = fcmpl.len, .flags = fcmpl.flags};
+          .xfc = fcmpl.op_context
+        , .len = fcmpl.len
+        , .flags = fcmpl.flags
+        };
+        // fi_cancel races with completion, so it's not safe to
+        // assert that the cancelled flag is false:
+        // assert(!cmpl.xfc->cancelled);
     }
 
     switch (cmpl.xfc->type) {
-        case xft_progress:
-            hlog_fast(
-                completion, "%s: read a progress rx completion", __func__);
-            return rcvr_progress_rx_process(r, &cmpl);
-        case xft_vector:
-            hlog_fast(completion, "%s: read a vector tx completion", __func__);
-            return txctl_complete(&r->vec, &cmpl);
-        case xft_ack:
-            hlog_fast(completion, "%s: read an ack tx completion", __func__);
-            return 1;
-        default:
-            hlog_fast(completion, "%s: unexpected xfer context type", __func__);
-            return -1;
+    case xft_progress:
+        hlog_fast(completion, "%s: read a progress rx completion", __func__);
+
+        for (nprocessed = 0, cmplp = &cmpl;
+             (h = rxctl_complete(&r->progress, cmplp)) != NULL;
+             cmplp = NULL) {
+            switch (rcvr_progress_rx_process(r, h)) {
+            case 1:
+                nprocessed++;
+                break;
+            case 0:
+                break;
+            default:
+                return -1;
+            }
+        }
+        return (nprocessed > 0) ? 1 : 0;
+    case xft_vector:
+        hlog_fast(completion, "%s: read a vector tx completion", __func__);
+        return txctl_complete(&r->vec, &cmpl);
+    case xft_ack:
+        hlog_fast(completion, "%s: read an ack tx completion", __func__);
+        return 1;
+    default:
+        hlog_fast(completion, "%s: unexpected xfer context type", __func__);
+        return -1;
     }
 }
 
@@ -1486,46 +1718,59 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
 
     /* Transmit vector. */
 
-    if (r->cxn.eof.remote && !r->cxn.eof.local && !fifo_full(r->vec.ready) &&
-        (vb = (vecbuf_t *) buflist_get(r->vec.pool)) != NULL) {
+    if (r->cxn.eof.remote && !r->cxn.eof.local &&
+        !fifo_full(r->vec.ready) &&
+        (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
         memset(vb->msg.iov, 0, sizeof(vb->msg.iov));
         vb->msg.niovs = 0;
-        vb->hdr.nused = (char *) &vb->msg.iov[0] - (char *) &vb->msg;
-        (void) fifo_put(r->vec.ready, &vb->hdr);
+        vb->hdr.nused = (char *)&vb->msg.iov[0] - (char *)&vb->msg;
+        (void)txctl_put(&r->vec, &vb->hdr);
         r->cxn.eof.local = true;
         hlog_fast(proto_vector, "%s: rcvr %p enqueued local EOF", __func__,
-            (void *) r);
+            (void *)r);
         return;
     } else if (r->cxn.eof.remote) {
-        return; // send no more non-empty vectors after remote sends EOF
+        return;   // send no more non-empty vectors after remote sends EOF
     }
 
     while (!fifo_full(r->vec.ready) && !fifo_empty(ready_for_cxn) &&
-           (vb = (vecbuf_t *) buflist_get(r->vec.pool)) != NULL) {
+           (vb = (vecbuf_t *)buflist_get(r->vec.pool)) != NULL) {
+        size_t maxniovs;
 
-        for (i = 0; i < arraycount(vb->msg.iov) &&
-                    (h = fifo_get(ready_for_cxn)) != NULL;
-             i++) {
+        if (r->split_vector_countdown == 0) {
+            if (fifo_nfull(ready_for_cxn) > 1) {
+                maxniovs = minsize(fifo_nfull(ready_for_cxn),
+                                   arraycount(vb->msg.iov)) / 2;
+                r->split_vector_countdown = split_vector_interval;
+            } else {
+                maxniovs = arraycount(vb->msg.iov);
+            }
+        } else {
+            r->split_vector_countdown--;
+            maxniovs = arraycount(vb->msg.iov);
+        }
+
+        for (i = 0; i < maxniovs && (h = fifo_get(ready_for_cxn)) != NULL; i++){
 
             h->nused = 0;
 
             if (global_state.reregister &&
                 (rc = buf_mr_reg(global_state.domain, payload_access.rx,
-                     keysource_next(&r->cxn.keys), h)) < 0)
+                                 seqsource_get(&r->cxn.keys), h)) < 0)
                 bailout_for_ofi_ret(rc, "payload memory registration failed");
 
-            (void) fifo_put(r->tgtposted, h);
+            (void)fifo_put(r->tgtposted, h);
 
             vb->msg.iov[i].addr = 0;
             vb->msg.iov[i].len = h->nallocated;
             vb->msg.iov[i].key = fi_mr_key(h->mr);
         }
         vb->msg.niovs = i;
-        vb->hdr.nused = (char *) &vb->msg.iov[i] - (char *) &vb->msg;
+        vb->hdr.nused = (char *)&vb->msg.iov[i] - (char *)&vb->msg;
 
-        (void) fifo_put(r->vec.ready, &vb->hdr);
-        hlog_fast(
-            proto_vector, "%s: rcvr %p enqueued vector", __func__, (void *) r);
+        (void)txctl_put(&r->vec, &vb->hdr);
+        hlog_fast(proto_vector, "%s: rcvr %p enqueued vector", __func__,
+            (void *)r);
     }
 }
 
@@ -1535,20 +1780,21 @@ rcvr_targets_read(fifo_t *ready_for_terminal, rcvr_t *r)
     bufhdr_t *h;
     int rc;
 
-    while (r->nfull > 0 && (h = fifo_peek(r->tgtposted)) != NULL &&
-           !fifo_alt_full(ready_for_terminal)) {
+    while (r->nfull > 0 &&
+          (h = fifo_peek(r->tgtposted)) != NULL &&
+          !fifo_alt_full(ready_for_terminal)) {
         if (h->nused + r->nfull < h->nallocated) {
             h->nused += r->nfull;
             r->nfull = 0;
         } else {
             r->nfull -= (h->nallocated - h->nused);
             h->nused = h->nallocated;
-            (void) fifo_get(r->tgtposted);
+            (void)fifo_get(r->tgtposted);
 
             if (global_state.reregister && (rc = fi_close(&h->mr->fid)) != 0)
                 warn_about_ofi_ret(rc, "fi_close");
 
-            (void) fifo_alt_put(ready_for_terminal, h);
+            (void)fifo_alt_put(ready_for_terminal, h);
         }
     }
 
@@ -1558,12 +1804,12 @@ rcvr_targets_read(fifo_t *ready_for_terminal, rcvr_t *r)
      */
     if (r->cxn.eof.remote && (h = fifo_peek(r->tgtposted)) != NULL &&
         h->nused != 0) {
-        (void) fifo_get(r->tgtposted);
+        (void)fifo_get(r->tgtposted);
 
         if (global_state.reregister && (rc = fi_close(&h->mr->fid)) != 0)
             warn_about_ofi_ret(rc, "fi_close");
 
-        (void) fifo_alt_put(ready_for_terminal, h);
+        (void)fifo_alt_put(ready_for_terminal, h);
     }
 }
 
@@ -1578,14 +1824,14 @@ rcvr_ack_send(rcvr_t *r)
     xfc->nchildren = 0;
     xfc->cancelled = 0;
 
-    const int rc = fi_sendmsg(r->cxn.ep,
-        &(struct fi_msg){.msg_iov = r->ack.iov,
-            .desc = r->ack.desc,
-            .iov_count = r->ack.niovs,
-            .addr = r->cxn.peer_addr,
-            .context = xfc,
-            .data = 0},
-        FI_COMPLETION);
+    const int rc = fi_sendmsg(r->cxn.ep, &(struct fi_msg){
+          .msg_iov = r->ack.iov
+        , .desc = r->ack.desc
+        , .iov_count = r->ack.niovs
+        , .addr = r->cxn.peer_addr
+        , .context = xfc
+        , .data = 0
+        }, FI_COMPLETION);
 
     if (rc == -FI_EAGAIN) {
         hlog_fast(txdefer, "%s: deferred transmission", __func__);
@@ -1602,7 +1848,7 @@ rcvr_ack_send(rcvr_t *r)
 static void
 rcvr_cancel(cxn_t *cxn)
 {
-    rcvr_t *r = (rcvr_t *) cxn;
+    rcvr_t *r = (rcvr_t *)cxn;
 
     rxctl_cancel(r->cxn.ep, &r->progress);
     txctl_cancel(r->cxn.ep, &r->vec);
@@ -1611,25 +1857,25 @@ rcvr_cancel(cxn_t *cxn)
 static bool
 rcvr_cancellation_complete(cxn_t *cxn)
 {
-    rcvr_t *r = (rcvr_t *) cxn;
+    rcvr_t *r = (rcvr_t *)cxn;
 
-    return fifo_empty(r->progress.posted) && fifo_empty(r->vec.posted);
+    return rxctl_idle(&r->progress) && txctl_idle(&r->vec);
 }
 
 static loop_control_t
 rcvr_loop(worker_t *w, session_t *s)
 {
-    rcvr_t *r = (rcvr_t *) s->cxn;
+    rcvr_t *r = (rcvr_t *)s->cxn;
 
     switch (r->cxn.sent_first ? loop_end : rcvr_ack_send(r)) {
-        case loop_end:
-            break;
-        case loop_continue:
-            if (rcvr_cq_process(r) == -1)
-                return loop_error;
-            return loop_continue;
-        default:
+    case loop_end:
+        break;
+    case loop_continue:
+        if (rcvr_cq_process(r) == -1)
             return loop_error;
+        return loop_continue;
+    default:
+        return loop_error;
     }
 
     if (!r->cxn.started)
@@ -1644,8 +1890,8 @@ rcvr_loop(worker_t *w, session_t *s)
 
     rcvr_targets_read(s->ready_for_terminal, r);
 
-    if (fifo_eoget(s->ready_for_terminal) && r->cxn.eof.remote &&
-        r->cxn.eof.local && fifo_empty(r->vec.posted))
+    if (fifo_eoget(s->ready_for_terminal) &&
+        r->cxn.eof.remote && r->cxn.eof.local && txctl_idle(&r->vec))
         return loop_end;
 
     return loop_continue;
@@ -1662,15 +1908,15 @@ xmtr_initial_send(xmtr_t *x)
     xfc->nchildren = 0;
     xfc->cancelled = 0;
 
-    const int rc = fi_sendmsg(x->cxn.ep,
-        &(struct fi_msg){.msg_iov = &(struct iovec){.iov_base = &x->initial.msg,
-                             .iov_len = sizeof(x->initial.msg)},
-            .desc = &x->initial.desc,
-            .iov_count = 1,
-            .addr = x->cxn.peer_addr,
-            .context = xfc,
-            .data = 0},
-        FI_COMPLETION);
+    const int rc = fi_sendmsg(x->cxn.ep, &(struct fi_msg){
+          .msg_iov = &(struct iovec){.iov_base = &x->initial.msg,
+                                     .iov_len = sizeof(x->initial.msg)}
+        , .desc = &x->initial.desc
+        , .iov_count = 1
+        , .addr = x->cxn.peer_addr
+        , .context = xfc
+        , .data = 0
+        }, FI_COMPLETION);
 
     if (rc == -FI_EAGAIN) {
         hlog_fast(txdefer, "%s: deferred transmission", __func__);
@@ -1691,24 +1937,24 @@ xmtr_ack_rx_process(xmtr_t *x, completion_t *cmpl)
 
     if ((cmpl->flags & desired_rx_flags) != desired_rx_flags) {
         errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64, __func__,
-            desired_rx_flags, cmpl->flags & desired_rx_flags);
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, cmpl->flags & desired_rx_flags);
     }
 
     if (cmpl->len != sizeof(x->ack.msg))
         errx(EXIT_FAILURE, "%s: ack is incorrect size", __func__);
 
-    rc =
-        fi_av_insert(x->cxn.av, x->ack.msg.addr, 1, &x->cxn.peer_addr, 0, NULL);
+    rc = fi_av_insert(x->cxn.av, x->ack.msg.addr, 1, &x->cxn.peer_addr,
+        0, NULL);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p", x->ack.msg.addr);
 
-    while (!fifo_full(x->vec.posted)) {
+    while (rxctl_ready(&x->vec)) {
         vecbuf_t *vb = vecbuf_alloc();
 
         rc = buf_mr_reg(global_state.domain, FI_RECV,
-            keysource_next(&x->cxn.keys), &vb->hdr);
+            seqsource_get(&x->cxn.keys), &vb->hdr);
 
         if (rc < 0)
             bailout_for_ofi_ret(rc, "buffer memory registration failed");
@@ -1768,7 +2014,7 @@ write_fully(const write_fully_params_t p)
         size_t local;
         size_t remote;
     } maxsegs = {.local = minsize(p.maxsegs, p.niovs),
-        .remote = minsize(p.maxsegs, p.nriovs)},
+                 .remote = minsize(p.maxsegs, p.nriovs)},
       nsegs = {.local = 0, .remote = 0}, sumlen = {.local = 0, .remote = 0};
 
     for (i = 0; i < maxsegs.local; i++)
@@ -1777,8 +2023,8 @@ write_fully(const write_fully_params_t p)
     for (i = 0; i < maxsegs.remote; i++)
         sumlen.remote += p.riov_in[i].len;
 
-    const size_t len = minsize(
-        minsize(sumlen.local, sumlen.remote), minsize(p.len, SSIZE_MAX));
+    const size_t len = minsize(minsize(sumlen.local, sumlen.remote),
+                               minsize(p.len, SSIZE_MAX));
 
     for (i = 0, nremaining = len; 0 < nremaining && i < maxsegs.local; i++) {
         p.iov_out[i] = p.iov_in[i];
@@ -1805,14 +2051,16 @@ write_fully(const write_fully_params_t p)
 
     nsegs.remote = i;
 
-    struct fi_msg_rma mrma = {.msg_iov = p.iov_out,
-        .desc = p.desc_out,
-        .iov_count = nsegs.local,
-        .addr = p.addr,
-        .rma_iov = p.riov_out,
-        .rma_iov_count = nsegs.remote,
-        .context = p.context,
-        .data = 0};
+    struct fi_msg_rma mrma = {
+      .msg_iov = p.iov_out
+    , .desc = p.desc_out
+    , .iov_count = nsegs.local
+    , .addr = p.addr
+    , .rma_iov = p.riov_out
+    , .rma_iov_count = nsegs.remote
+    , .context = p.context
+    , .data = 0
+    };
 
     rc = fi_writemsg(p.ep, &mrma, p.flags);
 
@@ -1828,7 +2076,7 @@ write_fully(const write_fully_params_t p)
         p.iov_out[j] = p.iov_in[i];
         if (nremaining > 0) {
             p.iov_out[j].iov_len -= nremaining;
-            p.iov_out[j].iov_base = (char *) p.iov_out[j].iov_base + nremaining;
+            p.iov_out[j].iov_base = (char *)p.iov_out[j].iov_base + nremaining;
             nremaining = 0;
         }
         j++;
@@ -1859,65 +2107,69 @@ vecbuf_is_wellformed(vecbuf_t *vb)
     size_t len = vb->hdr.nused;
     static const size_t least_vector_msglen = offsetof(vector_msg_t, iov[0]);
 
-    const size_t niovs_space =
-        (len - least_vector_msglen) / sizeof(vb->msg.iov[0]);
+    const size_t niovs_space = (len - least_vector_msglen) /
+        sizeof(vb->msg.iov[0]);
 
     if (len < least_vector_msglen) {
-        hlog_fast(err, "%s: expected >= %zu bytes, received %zu", __func__,
-            least_vector_msglen, len);
+        hlog_fast(err, "%s: expected >= %zu bytes, received %zu",
+            __func__, least_vector_msglen, len);
     } else if ((len - least_vector_msglen) % sizeof(vb->msg.iov[0]) != 0) {
         hlog_fast(err,
             "%s: %zu-byte vector message did not end on vector boundary, "
-            "disconnecting...",
-            __func__, len);
+            "disconnecting...", __func__, len);
     } else if (niovs_space < vb->msg.niovs) {
-        hlog_fast(
-            err, "%s: peer sent truncated vectors, disconnecting...", __func__);
+        hlog_fast(err,
+            "%s: peer sent truncated vectors, disconnecting...", __func__);
     } else if (vb->msg.niovs > arraycount(vb->msg.iov)) {
-        hlog_fast(
-            err, "%s: peer sent too many vectors, disconnecting...", __func__);
+        hlog_fast(err,
+            "%s: peer sent too many vectors, disconnecting...", __func__);
     } else
         return true;
 
     return false;
 }
 
-static void
+static bool
 xmtr_vecbuf_unload(xmtr_t *x)
 {
     vecbuf_t *vb;
     struct fi_rma_iov *riov;
     size_t i;
 
-    if ((vb = (vecbuf_t *) fifo_peek(x->vec.rcvd)) == NULL)
-        return;
-
-    riov = (!x->phase) ? x->riov : x->riov2;
+    if ((vb = (vecbuf_t *)fifo_peek(x->vec.rcvd)) == NULL ||
+        x->nriovs == arraycount(x->riov))
+        return false;
 
     if (!x->cxn.eof.remote && vb->msg.niovs == 0) {
         hlog_fast(proto_vector, "%s: received remote EOF", __func__);
         x->cxn.eof.remote = true;
     }
 
-    for (i = x->next_riov; i < vb->msg.niovs && x->nriovs < arraycount(x->riov);
+    riov = (!x->phase) ? x->riov : x->riov2;
+
+    for (i = x->next_riov;
+         i < vb->msg.niovs && x->nriovs < arraycount(x->riov);
          i++) {
-        hlog_fast(proto_vector,
-            "%s: received vector %zu "
+        hlog_fast(proto_vector, "%s: received vector %zu "
             "addr %" PRIu64 " len %" PRIu64 " key %" PRIx64,
             __func__, i, vb->msg.iov[i].addr, vb->msg.iov[i].len,
             vb->msg.iov[i].key);
 
-        riov[x->nriovs++] = (struct fi_rma_iov){.len = vb->msg.iov[i].len,
-            .addr = vb->msg.iov[i].addr,
-            .key = vb->msg.iov[i].key};
+        riov[x->nriovs++] = (struct fi_rma_iov){
+          .len = vb->msg.iov[i].len
+        , .addr = vb->msg.iov[i].addr
+        , .key = vb->msg.iov[i].key
+        };
     }
 
     if (i == vb->msg.niovs) {
-        (void) fifo_get(x->vec.rcvd);
+        (void)fifo_get(x->vec.rcvd);
         rxctl_post(&x->cxn, &x->vec, &vb->hdr);
         x->next_riov = 0;
     } else
         x->next_riov = i;
+
+    return true;
 }
 
 /* Process completed vector-message reception.  Return 0 if no
@@ -1925,25 +2177,22 @@ xmtr_vecbuf_unload(xmtr_t *x)
  * irrecoverable error.
  */
 static int
-xmtr_vector_rx_process(xmtr_t *x, const completion_t *cmpl)
+xmtr_vector_rx_process(xmtr_t *x, bufhdr_t *h)
 {
-    vecbuf_t *vb;
+    vecbuf_t *vb = (vecbuf_t *)h;
 
-    if ((vb = (vecbuf_t *) rxctl_complete(&x->vec, cmpl)) == NULL)
-        return -1;
-
-    if (vb->hdr.xfc.cancelled) {
-        buf_free(&vb->hdr);
+    if (h->xfc.cancelled) {
+        buf_free(h);
         return 0;
     }
 
     if (!vecbuf_is_wellformed(vb)) {
         hlog_fast(err, "%s: rx'd malformed vector message", __func__);
-        rxctl_post(&x->cxn, &x->vec, &vb->hdr);
+        rxctl_post(&x->cxn, &x->vec, h);
         return 0;
     }
 
-    if (!fifo_put(x->vec.rcvd, &vb->hdr))
+    if (!fifo_put(x->vec.rcvd, h))
         errx(EXIT_FAILURE, "%s: received vectors FIFO was full", __func__);
 
     return 1;
@@ -1956,8 +2205,9 @@ static int
 xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
 {
     struct fi_cq_msg_entry fcmpl;
-    completion_t cmpl;
+    completion_t cmpl, *cmplp;
     bufhdr_t *h;
+    size_t nprocessed;
     ssize_t ncompleted;
 
     if ((ncompleted = fi_cq_read(x->cxn.cq, &fcmpl, 1)) == -FI_EAGAIN)
@@ -1969,100 +2219,118 @@ xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
         char flagsbuf[256];
         ssize_t nfailed = fi_cq_readerr(x->cxn.cq, &e, 0);
 
-        cmpl = (completion_t){.xfc = e.op_context, .flags = 0, .len = 0};
+        cmpl = (completion_t){
+          .xfc = e.op_context
+        , .flags = 0
+        , .len = 0
+        };
 
         if (e.err != FI_ECANCELED || !cmpl.xfc->cancelled) {
             hlog_fast(err, "%s: read %zd errors, %s", __func__, nfailed,
                 fi_strerror(e.err));
-            hlog_fast(err, "%s: context %p", __func__, (void *) e.op_context);
+            hlog_fast(err, "%s: context %p", __func__, (void *)e.op_context);
             hlog_fast(err, "%s: completion flags %" PRIx64 " expected %" PRIx64,
                 __func__, e.flags, desired_wr_flags);
             hlog_fast(err, "%s: symbolic flags %s", __func__,
-                completion_flags_to_string(
-                    e.flags, flagsbuf, sizeof(flagsbuf)));
+                completion_flags_to_string(e.flags, flagsbuf,
+                sizeof(flagsbuf)));
             hlog_fast(err, "%s: provider error %s", __func__,
                 fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
-                    sizeof(errbuf)));
+                sizeof(errbuf)));
             return -1;
         }
     } else if (ncompleted < 0) {
         bailout_for_ofi_ret(ncompleted, "fi_cq_read");
     } else if (ncompleted != 1) {
-        errx(EXIT_FAILURE, "%s: expected 1 completion, read %zd", __func__,
-            ncompleted);
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
     } else {
         cmpl = (completion_t){
-            .xfc = fcmpl.op_context, .flags = fcmpl.flags, .len = fcmpl.len};
+          .xfc = fcmpl.op_context
+        , .flags = fcmpl.flags
+        , .len = fcmpl.len
+        };
     }
 
     cmpl.xfc->owner = xfo_program;
 
     switch (cmpl.xfc->type) {
-        case xft_vector:
-            hlog_fast(completion, "%s: read a vector rx completion", __func__);
-            return xmtr_vector_rx_process(x, &cmpl);
-        case xft_fragment:
-        case xft_rdma_write:
-            hlog_fast(
-                completion, "%s: read an RDMA-write completion", __func__);
-            /* If the head of `wrposted` is marked `xfo_program`, then dequeue
-             * the txbuffers at the head of `wrposted` through the last one
-             * marked `xfo_program`.
-             */
-            if ((h = fifo_peek(x->wrposted)) == NULL) {
-                hlog_fast(
-                    err, "%s: no RDMA-write completions expected", __func__);
+    case xft_vector:
+        hlog_fast(completion, "%s: read a vector rx completion", __func__);
+
+        for (nprocessed = 0, cmplp = &cmpl;
+             (h = rxctl_complete(&x->vec, cmplp)) != NULL;
+             cmplp = NULL) {
+            switch (xmtr_vector_rx_process(x, h)) {
+            case 1:
+                nprocessed++;
+                break;
+            case 0:
+                break;
+            default:
                 return -1;
             }
-            /* XXX This can fail if `ready_for_terminal` ever fills
-             * to capacity, in the loop below.  That should not happen
-             * unless we accidentally put more buffers into circulation
-             * than there are slots in `ready_for_terminal`.
-             */
-            if ((h->xfc.place & xfp_first) == 0) {
-                hlog_fast(
-                    err, "%s: expected `first` context at head", __func__);
-                return -1;
-            }
-            while ((h = fifo_peek(x->wrposted)) != NULL &&
-                   h->xfc.owner == xfo_program && h->xfc.type == xft_fragment) {
-                fragment_t *f = (fragment_t *) h;
-                (void) fifo_get(x->wrposted);
-
-                assert(f->parent->xfc.nchildren > 0);
-                f->parent->xfc.nchildren--;
-
-                (void) buflist_put(x->fragment.pool, h);
-            }
-            while ((h = fifo_peek(x->wrposted)) != NULL &&
-                   h->xfc.owner == xfo_program &&
-                   h->xfc.type == xft_rdma_write && h->xfc.nchildren == 0 &&
-                   !fifo_full(ready_for_terminal)) {
-                int rc;
-
-                (void) fifo_get(x->wrposted);
-
-                if (reregister && (rc = fi_close(&h->mr->fid)) != 0)
-                    warn_about_ofi_ret(rc, "fi_close");
-
-                x->bytes_progress += h->nused;
-                (void) fifo_alt_put(ready_for_terminal, h);
-            }
-            return 1;
-        case xft_progress:
-            hlog_fast(
-                completion, "%s: read a progress tx completion", __func__);
-            return txctl_complete(&x->progress, &cmpl);
-        case xft_ack:
-            hlog_fast(completion, "%s: read an ack rx completion", __func__);
-            return xmtr_ack_rx_process(x, &cmpl);
-        case xft_initial:
-            hlog_fast(
-                completion, "%s: read an initial tx completion", __func__);
-            return 1;
-        default:
-            hlog_fast(completion, "%s: unexpected xfer context type", __func__);
+        }
+        return (nprocessed > 0) ? 1 : 0;
+    case xft_fragment:
+    case xft_rdma_write:
+        hlog_fast(completion, "%s: read an RDMA-write completion", __func__);
+        /* If the head of `wrposted` is marked `xfo_program`, then dequeue the
+         * txbuffers at the head of `wrposted` through the last one marked
+         * `xfo_program`.
+         */
+        if ((h = fifo_peek(x->wrposted)) == NULL) {
+            hlog_fast(err, "%s: no RDMA-write completions expected", __func__);
             return -1;
+        }
+        /* XXX This can fail if `ready_for_terminal` ever fills
+         * to capacity, in the loop below.  That should not happen
+         * unless we accidentally put more buffers into circulation
+         * than there are slots in `ready_for_terminal`.
+         */
+        if ((h->xfc.place & xfp_first) == 0) {
+            hlog_fast(err, "%s: expected `first` context at head", __func__);
+            return -1;
+        }
+        while ((h = fifo_peek(x->wrposted)) != NULL &&
+               h->xfc.owner == xfo_program &&
+               h->xfc.type == xft_fragment) {
+            fragment_t *f = (fragment_t *)h;
+            (void)fifo_get(x->wrposted);
+
+            assert(f->parent->xfc.nchildren > 0);
+            f->parent->xfc.nchildren--;
+
+            (void)buflist_put(x->fragment.pool, h);
+        }
+        while ((h = fifo_peek(x->wrposted)) != NULL &&
+               h->xfc.owner == xfo_program &&
+               h->xfc.type == xft_rdma_write &&
+               h->xfc.nchildren == 0 &&
+               !fifo_full(ready_for_terminal)) {
+            int rc;
+
+            (void)fifo_get(x->wrposted);
+
+            if (reregister && (rc = fi_close(&h->mr->fid)) != 0)
+                warn_about_ofi_ret(rc, "fi_close");
+
+            x->bytes_progress += h->nused;
+            (void)fifo_alt_put(ready_for_terminal, h);
+        }
+        return 1;
+    case xft_progress:
+        hlog_fast(completion, "%s: read a progress tx completion", __func__);
+        return txctl_complete(&x->progress, &cmpl);
+    case xft_ack:
+        hlog_fast(completion, "%s: read an ack rx completion", __func__);
+        return xmtr_ack_rx_process(x, &cmpl);
+    case xft_initial:
+        hlog_fast(completion, "%s: read an initial tx completion", __func__);
+        return 1;
+    default:
+        hlog_fast(completion, "%s: unexpected xfer context type", __func__);
+        return -1;
     }
 }
 
@@ -2078,7 +2346,7 @@ xmtr_buf_split(xmtr_t *x, bufhdr_t *parent, size_t len)
     if ((h = buflist_get(x->fragment.pool)) == NULL)
         errx(EXIT_FAILURE, "%s: out of fragment headers", __func__);
 
-    f = (fragment_t *) h;
+    f = (fragment_t *)h;
 
     h->raddr = x->fragment.offset;
     h->nused = len;
@@ -2124,8 +2392,9 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
     const bool riovs_maxed_out = x->nriovs >= global_state.rma_maxsegs;
 
     for (i = 0, total = 0, first_h = last_h = NULL;
-         i < maxriovs && (head = fifo_peek(ready_for_cxn)) != NULL &&
-         total < maxbytes && !fifo_full(x->wrposted);
+         i < maxriovs &&
+             (head = fifo_peek(ready_for_cxn)) != NULL &&
+             total < maxbytes && !fifo_full(x->wrposted);
          i++, last_h = h, total += len) {
         const bool oversize_load =
             head->nused - x->fragment.offset > maxbytes - total;
@@ -2133,8 +2402,9 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
         hlog_fast(write,
             "%s: head %p nchildren %" PRIu32 " offset %zu nused %zu "
             "total %zu maxbytes %zu nriovs %zu maxsegs %zu",
-            __func__, (void *) head, head->xfc.nchildren, x->fragment.offset,
-            head->nused, total, maxbytes, x->nriovs, global_state.rma_maxsegs);
+            __func__, (void *)head, head->xfc.nchildren,
+            x->fragment.offset, head->nused, total, maxbytes,
+            x->nriovs, global_state.rma_maxsegs);
 
         /* Fragment oversize loads unless more RDMA vectors will arrive. */
         if (oversize_load && !riovs_maxed_out)
@@ -2150,17 +2420,17 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
 
         if (global_state.reregister && x->fragment.offset == 0 &&
             (rc = buf_mr_reg(global_state.domain, payload_access.tx,
-                 keysource_next(&x->cxn.keys), head)) < 0)
+                             seqsource_get(&x->cxn.keys), head)) < 0)
             bailout_for_ofi_ret(rc, "payload memory registration failed");
 
         if (oversize_load) {
             h = xmtr_buf_split(x, head, len);
         } else {
-            (void) fifo_get(ready_for_cxn);
+            (void)fifo_get(ready_for_cxn);
             h = head;
         }
 
-        (void) fifo_put(x->wrposted, h);
+        (void)fifo_put(x->wrposted, h);
 
         if (last_h == NULL)
             first_h = h;
@@ -2168,10 +2438,12 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
         h->xfc.owner = xfo_program;
         h->xfc.place = 0;
 
-        bytebuf_t *b = (bytebuf_t *) head;
+        bytebuf_t *b = (bytebuf_t *)head;
 
         ((!x->phase) ? x->payload.iov : x->payload.iov2)[i] = (struct iovec){
-            .iov_len = len, .iov_base = &b->payload[x->fragment.offset]};
+          .iov_len = len
+        , .iov_base = &b->payload[x->fragment.offset]
+        };
         ((!x->phase) ? x->payload.desc : x->payload.desc2)[i] = h->desc;
         if (oversize_load) {
             x->fragment.offset += len;
@@ -2209,11 +2481,10 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
         if (nwritten < 0)
             bailout_for_ofi_ret(nwritten, "write_fully");
 
-        if ((size_t) nwritten != total || niovs_out != 0) {
-            hlog_fast(err,
-                "%s: local I/O vectors were partially written, "
-                "nwritten %zu total %zu niovs_out %zu",
-                __func__, nwritten, total, niovs_out);
+        if ((size_t)nwritten != total || niovs_out != 0) {
+            hlog_fast(err, "%s: local I/O vectors were partially written, "
+                "nwritten %zu total %zu niovs_out %zu", __func__, nwritten,
+                total, niovs_out);
             return loop_error;
         }
 
@@ -2228,14 +2499,15 @@ static void
 xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
 {
     progbuf_t *pb;
+    size_t progress;
 
     /* If the terminal reached EOF, ready_for_cxn and wrposted
      * are empty, and nleftover == 0 has not previously been sent
      * (!x->cxn.eof.local), then send nleftover == 0; on a successful
      * transmission, set x->cxn.eof.local to true.
      */
-    bool reached_eof = (fifo_eoget(ready_for_cxn) && fifo_empty(x->wrposted) &&
-                        !x->cxn.eof.local);
+    bool reached_eof = (fifo_eoget(ready_for_cxn) &&
+        fifo_empty(x->wrposted) && !x->cxn.eof.local);
 
     if (x->bytes_progress == 0 && !reached_eof)
         return;
@@ -2243,34 +2515,47 @@ xmtr_progress_update(fifo_t *ready_for_cxn, xmtr_t *x)
     if (fifo_full(x->progress.ready))
         return;
 
-    if ((pb = (progbuf_t *) buflist_get(x->progress.pool)) == NULL)
+    if ((pb = (progbuf_t *)buflist_get(x->progress.pool)) == NULL)
         return;
 
+    if (x->split_progress_countdown == 0) {
+        if (x->bytes_progress >= 2) {
+            progress = x->bytes_progress / 2;
+            x->split_progress_countdown = split_progress_interval;
+        } else {
+            progress = x->bytes_progress;
+        }
+    } else {
+        x->split_progress_countdown--;
+        progress = x->bytes_progress;
+    }
     pb->hdr.xfc.owner = xfo_nic;
     pb->hdr.nused = pb->hdr.nallocated;
 
-    pb->msg.nfilled = x->bytes_progress;
+    pb->msg.nfilled = progress;
     pb->msg.nleftover = reached_eof ? 0 : 1;
 
-    hlog_fast(proto_progress,
-        "%s: sending progress message, %" PRIu64 " filled, %" PRIu64
-        " leftover",
-        __func__, pb->msg.nfilled, pb->msg.nleftover);
+    hlog_fast(proto_progress, "%s: sending progress message, %"
+        PRIu64 " filled, %" PRIu64 " leftover", __func__,
+        pb->msg.nfilled, pb->msg.nleftover);
 
-    x->bytes_progress = 0;
+    x->bytes_progress -= progress;
 
-    (void) fifo_put(x->progress.ready, &pb->hdr);
+    (void)txctl_put(&x->progress, &pb->hdr);
 
     if (reached_eof) {
         hlog_fast(proto_progress, "%s: enqueued local EOF", __func__);
         x->cxn.eof.local = true;
     }
+
+    if (x->bytes_progress > 0)
+        xmtr_progress_update(ready_for_cxn, x);
 }
 
 static void
 xmtr_cancel(cxn_t *cxn)
 {
-    xmtr_t *x = (xmtr_t *) cxn;
+    xmtr_t *x = (xmtr_t *)cxn;
 
     txctl_cancel(x->cxn.ep, &x->progress);
     rxctl_cancel(x->cxn.ep, &x->vec);
@@ -2280,9 +2565,9 @@ xmtr_cancel(cxn_t *cxn)
 static bool
 xmtr_cancellation_complete(cxn_t *cxn)
 {
-    xmtr_t *x = (xmtr_t *) cxn;
+    xmtr_t *x = (xmtr_t *)cxn;
 
-    return fifo_empty(x->progress.posted) && fifo_empty(x->vec.posted) &&
+    return txctl_idle(&x->progress) && rxctl_idle(&x->vec) &&
            fifo_empty(x->wrposted);
 }
 
@@ -2290,10 +2575,10 @@ static loop_control_t
 xmtr_loop(worker_t *w, session_t *s)
 {
     vecbuf_t *vb;
-    xmtr_t *x = (xmtr_t *) s->cxn;
+    xmtr_t *x = (xmtr_t *)s->cxn;
 
-    if (xmtr_cq_process(x, s->ready_for_terminal, global_state.reregister) ==
-        -1)
+    if (xmtr_cq_process(x, s->ready_for_terminal,
+                        global_state.reregister) == -1)
         return loop_error;
 
     if (!x->cxn.sent_first)
@@ -2305,7 +2590,8 @@ xmtr_loop(worker_t *w, session_t *s)
     if (!x->rcvd_ack)
         return loop_continue;
 
-    xmtr_vecbuf_unload(x);
+    while (xmtr_vecbuf_unload(x))
+        ; // do nothing
 
     if (xmtr_targets_write(s->ready_for_cxn, x) == loop_error)
         return loop_error;
@@ -2314,20 +2600,20 @@ xmtr_loop(worker_t *w, session_t *s)
 
     txctl_transmit(&x->cxn, &x->progress);
 
-    if (!(fifo_eoget(s->ready_for_cxn) && fifo_empty(x->wrposted) &&
-            x->bytes_progress == 0 && x->cxn.eof.local))
+    if (!(fifo_eoget(s->ready_for_cxn) &&
+        fifo_empty(x->wrposted) && x->bytes_progress == 0 && x->cxn.eof.local))
         return loop_continue;
 
     /* Hunt for remote EOF. */
     while (!x->cxn.eof.remote &&
-           (vb = (vecbuf_t *) fifo_get(x->vec.rcvd)) != NULL) {
+           (vb = (vecbuf_t *)fifo_get(x->vec.rcvd)) != NULL) {
         if (vb->msg.niovs == 0)
             x->cxn.eof.remote = true;
         buf_mr_dereg(&vb->hdr);
         vecbuf_free(vb);
     }
 
-    if (x->cxn.eof.remote && fifo_empty(x->progress.posted))
+    if (x->cxn.eof.remote && txctl_idle(&x->progress))
         return loop_end;
 
     return loop_continue;
@@ -2341,27 +2627,27 @@ cxn_loop(worker_t *w, session_t *s)
     const loop_control_t ctl = cxn->loop(w, s);
 
     switch (ctl) {
-        case loop_end:
-        case loop_error:
-            if ((rc = fi_close(&cxn->ep->fid)) < 0)
-                bailout_for_ofi_ret(rc, "fi_close");
-            hlog_fast(close, "%s: closed.", __func__);
-            break;
-        case loop_continue:
-            if (cxn->cancelled) {
-                if (cxn->cancellation_complete(cxn)) {
-                    if ((rc = fi_close(&cxn->ep->fid)) < 0)
-                        bailout_for_ofi_ret(rc, "fi_close");
-                    hlog_fast(close, "%s: closed.", __func__);
-                    return loop_canceled;
-                }
-            } else if (global_state.cancelled) {
-                cxn->cancel(cxn);
-                cxn->cancelled = true;
+    case loop_end:
+    case loop_error:
+        if ((rc = fi_close(&cxn->ep->fid)) < 0)
+            bailout_for_ofi_ret(rc, "fi_close");
+        hlog_fast(close, "%s: closed.", __func__);
+        break;
+    case loop_continue:
+        if (cxn->cancelled) {
+            if (cxn->cancellation_complete(cxn)) {
+                if ((rc = fi_close(&cxn->ep->fid)) < 0)
+                    bailout_for_ofi_ret(rc, "fi_close");
+                hlog_fast(close, "%s: closed.", __func__);
+                return loop_canceled;
             }
-            break;
-        default:
-            break;
+        } else if (global_state.cancelled) {
+            cxn->cancel(cxn);
+            cxn->cancelled = true;
+        }
+        break;
+    default:
+        break;
     }
     return ctl;
 }
@@ -2411,16 +2697,19 @@ worker_update_load(load_t *load, int nready)
         load->loops_since_mark++;
     } else {
         // MARK
-        load->average = (load->average + 256 * load->ctxs_serviced_since_mark /
-                                             (UINT16_MAX + 1)) /
-                        2;
-        hlog_fast(average, "%s: average %" PRIuFAST16 "x%" PRIuFAST16, __func__,
-            load->average / (uint_fast16_t) 256,
-            load->average % (uint_fast16_t) 256);
-        hlog_fast(average, "%s: %" PRIu32 " contexts in %" PRIuFAST16 " loops",
-            __func__, load->ctxs_serviced_since_mark, load->loops_since_mark);
-        hlog_fast(average, "%s: %d to %d contexts per loop", __func__,
-            load->min_loop_contexts, load->max_loop_contexts);
+        load->average =
+            (load->average +
+             256 * load->ctxs_serviced_since_mark / (UINT16_MAX + 1)) / 2;
+        hlog_fast(average, "%s: average %" PRIuFAST16 "x%" PRIuFAST16,
+            __func__, load->average / (uint_fast16_t)256,
+            load->average % (uint_fast16_t)256);
+        hlog_fast(average,
+            "%s: %" PRIu32 " contexts in %" PRIuFAST16 " loops",
+            __func__, load->ctxs_serviced_since_mark,
+            load->loops_since_mark);
+        hlog_fast(average,
+            "%s: %d to %d contexts per loop",
+            __func__, load->min_loop_contexts, load->max_loop_contexts);
         load->loops_since_mark = 0;
         load->ctxs_serviced_since_mark = 0;
         load->max_loop_contexts = 0;
@@ -2509,30 +2798,32 @@ worker_run_loop(worker_t *self)
     bool waitable;
 
     if ((waitable = global_state.waitfd && worker_waitable(self)) &&
-        (nevents = epoll_pwait(self->epoll_fd, events, (int) arraycount(events),
-             -1, &self->epoll_sigset)) == -1 &&
+        (nevents =
+            epoll_pwait(self->epoll_fd, events, (int)arraycount(events), -1,
+                        &self->epoll_sigset)) == -1 &&
         errno != EINTR)
         err(EXIT_FAILURE, "%s: epoll_pwait", __func__);
 
     for (half = 0; half < 2; half++) {
         void *context[WORKER_SESSIONS_MAX];
         pthread_mutex_t *mtx = &self->mtx[half];
-        session_t *session_half = &self->session[half * nsessions / 2];
+        session_t *session_half =
+            &self->session[half * nsessions / 2];
         int ncontexts, rc;
 
         if (pthread_mutex_trylock(mtx) == EBUSY)
             continue;
 
         if (global_state.waitfd) {
-            ncontexts = extract_contexts_for_half(
-                session_half, events, nevents, context, waitable);
+            ncontexts = extract_contexts_for_half(session_half, events, nevents,
+                context, waitable);
         } else {
-            ncontexts =
-                fi_poll(self->pollset[half], context, WORKER_SESSIONS_MAX);
+            ncontexts = fi_poll(self->pollset[half], context,
+                WORKER_SESSIONS_MAX);
         }
 
         if (ncontexts < 0) {
-            (void) pthread_mutex_unlock(mtx);
+            (void)pthread_mutex_unlock(mtx);
             bailout_for_ofi_ret(ncontexts, "fi_poll");
         }
 
@@ -2562,7 +2853,9 @@ worker_run_loop(worker_t *self)
         session_t *io_ready_up_to = &session_half[ncontexts];
         session_t *ready_up_to = io_ready_up_to;
 
-        for (i = ready_up_to - session_half; i < nsessions / 2; i++) {
+        for (i = ready_up_to - session_half;
+             i < nsessions / 2;
+             i++) {
             session_t *s = &session_half[i];
             cxn_t *c = s->cxn;
 
@@ -2598,7 +2891,9 @@ worker_run_loop(worker_t *self)
          * the first inactive slot or, if there are no inactive
          * slots, point it one past the end of the session[] half.
          */
-        for (i = active_up_to - session_half; i < nsessions / 2; i++) {
+        for (i = active_up_to - session_half;
+             i < nsessions / 2;
+             i++) {
             session_t *s = &session_half[i];
 
             // skip empty (inactive) slots
@@ -2635,7 +2930,8 @@ worker_run_loop(worker_t *self)
 #endif
 
         /* Service ready session slots. */
-        for (i = ready_from - session_half; i < ready_up_to - session_half;
+        for (i = ready_from - session_half;
+             i < ready_up_to - session_half;
              i++) {
             session_t *s;
             cxn_t *c, **cp;
@@ -2643,7 +2939,8 @@ worker_run_loop(worker_t *self)
                 bool cxn_empty;
                 bool terminal_full;
                 eof_state_t eof;
-            } after;
+            }
+            after;
 
             s = &session_half[i];
 
@@ -2657,9 +2954,10 @@ worker_run_loop(worker_t *self)
             c = *cp;
             assert(c != NULL);
 
-            assert(stole || i < ncontexts || !c->sent_first ||
-                   !fifo_empty(s->ready_for_terminal) ||
+            assert(stole || i < ncontexts ||
+                   !c->sent_first || !fifo_empty(s->ready_for_terminal) ||
                    global_state.cancelled);
+
 
             loop_control_t ctl = session_loop(self, s);
 
@@ -2678,16 +2976,16 @@ worker_run_loop(worker_t *self)
 
             // continue at next cxn_t if `c` did not exit
             switch (ctl) {
-                case loop_continue:
-                    continue;
-                case loop_end:
-                    break;
-                case loop_canceled:
-                    self->canceled = true;
-                    break;
-                case loop_error:
-                    self->failed = true;
-                    break;
+            case loop_continue:
+                continue;
+            case loop_end:
+                break;
+            case loop_canceled:
+                self->canceled = true;
+                break;
+            case loop_error:
+                self->failed = true;
+                break;
             }
 
             c->parent = NULL;
@@ -2699,16 +2997,16 @@ worker_run_loop(worker_t *self)
             if (!global_state.waitfd)
                 ;
             else if (epoll_ctl(self->epoll_fd, EPOLL_CTL_DEL, c->cq_wait_fd,
-                         NULL) == -1) {
-                err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_DEL,)", __func__,
-                    __LINE__);
+                NULL) == -1) {
+                err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_DEL,)",
+                    __func__, __LINE__);
             }
 
-            atomic_fetch_add_explicit(
-                &self->nsessions[half], -1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&self->nsessions[half], -1,
+                memory_order_relaxed);
         }
 
-        (void) pthread_mutex_unlock(mtx);
+        (void)pthread_mutex_unlock(mtx);
     }
 }
 
@@ -2721,8 +3019,8 @@ worker_is_idle(worker_t *self)
     if (self->nsessions[0] != 0 || self->nsessions[1] != 0)
         return false;
 
-    if (self_idx + (size_t) 1 !=
-        atomic_load_explicit(&nworkers_running, memory_order_relaxed))
+    if (self_idx + (size_t)1 !=
+            atomic_load_explicit(&nworkers_running, memory_order_relaxed))
         return false;
 
     if (pthread_mutex_trylock(&workers_mtx) == EBUSY)
@@ -2733,9 +3031,9 @@ worker_is_idle(worker_t *self)
             break;
     }
 
-    bool idle =
-        (nlocked == 2 && self->nsessions[0] == 0 && self->nsessions[1] == 0 &&
-            self_idx + (size_t) 1 == nworkers_running);
+    bool idle = (nlocked == 2 &&
+                 self->nsessions[0] == 0 && self->nsessions[1] == 0 &&
+                 self_idx + (size_t)1 == nworkers_running);
 
     if (idle) {
         nworkers_running--;
@@ -2743,9 +3041,9 @@ worker_is_idle(worker_t *self)
     }
 
     for (half = 0; half < nlocked; half++)
-        (void) pthread_mutex_unlock(&self->mtx[half]);
+        (void)pthread_mutex_unlock(&self->mtx[half]);
 
-    (void) pthread_mutex_unlock(&workers_mtx);
+    (void)pthread_mutex_unlock(&workers_mtx);
 
     return idle;
 }
@@ -2755,26 +3053,26 @@ worker_idle_loop(worker_t *self)
 {
     const ptrdiff_t self_idx = self - &workers[0];
 
-    (void) pthread_mutex_lock(&workers_mtx);
-    while (nworkers_running <= (size_t) self_idx && !self->shutting_down &&
+    (void)pthread_mutex_lock(&workers_mtx);
+    while (nworkers_running <= (size_t)self_idx && !self->shutting_down &&
            !self->canceled)
         pthread_cond_wait(&self->sleep, &workers_mtx);
-    (void) pthread_mutex_unlock(&workers_mtx);
+    (void)pthread_mutex_unlock(&workers_mtx);
 }
 
 static void
 worker_stats_log(worker_t *self)
 {
     hlog_fast(worker_stats, "worker %p %" PRIu64 " epoll loops waitable",
-        (void *) self, self->stats.epoll_loops.waitable);
+        (void *)self, self->stats.epoll_loops.waitable);
     hlog_fast(worker_stats, "worker %p %" PRIu64 " epoll loops total",
-        (void *) self, self->stats.epoll_loops.total);
+        (void *)self, self->stats.epoll_loops.total);
     hlog_fast(worker_stats, "worker %p %" PRIu64 " half loops no I/O ready",
-        (void *) self, self->stats.half_loops.no_io_ready);
+        (void *)self, self->stats.half_loops.no_io_ready);
     hlog_fast(worker_stats, "worker %p %" PRIu64 " half loops no session ready",
-        (void *) self, self->stats.half_loops.no_session_ready);
+        (void *)self, self->stats.half_loops.no_session_ready);
     hlog_fast(worker_stats, "worker %p %" PRIu64 " half loops total",
-        (void *) self, self->stats.half_loops.total);
+        (void *)self, self->stats.half_loops.total);
 }
 
 static void *
@@ -2810,20 +3108,6 @@ paybuflist_destroy(buflist_t *bl)
 }
 
 static buflist_t *
-buflist_create(size_t n)
-{
-    buflist_t *bl = malloc(offsetof(buflist_t, buf) + sizeof(bl->buf[0]) * n);
-
-    if (bl == NULL)
-        return NULL;
-
-    bl->nallocated = n;
-    bl->nfull = 0;
-
-    return bl;
-}
-
-static buflist_t *
 worker_paybuflist_create(worker_t *w, uint64_t access)
 {
     buflist_t *bl = buflist_create(16);
@@ -2848,7 +3132,7 @@ worker_init(worker_t *w)
 
     w->shutting_down = false;
     w->failed = false;
-    keysource_init(&w->keys);
+    seqsource_init(&w->keys);
 
     if ((rc = pthread_cond_init(&w->sleep, NULL)) != 0) {
         errx(EXIT_FAILURE, "%s.%d: pthread_cond_init: %s", __func__, __LINE__,
@@ -2862,11 +3146,11 @@ worker_init(worker_t *w)
 
     for (i = 0; i < arraycount(w->mtx); i++) {
         if ((rc = pthread_mutex_init(&w->mtx[i], NULL)) != 0) {
-            errx(EXIT_FAILURE, "%s.%d: pthread_mutex_init: %s", __func__,
-                __LINE__, strerror(rc));
+            errx(EXIT_FAILURE, "%s.%d: pthread_mutex_init: %s",
+                __func__, __LINE__, strerror(rc));
         }
-        if ((rc = fi_poll_open(global_state.domain, &attr, &w->pollset[i])) !=
-            0)
+        if ((rc = fi_poll_open(global_state.domain, &attr,
+                               &w->pollset[i])) != 0)
             bailout_for_ofi_ret(rc, "fi_poll_open");
     }
     for (i = 0; i < arraycount(w->session); i++)
@@ -2875,13 +3159,24 @@ worker_init(worker_t *w)
     w->paybufs.rx = worker_paybuflist_create(w, payload_access.rx);
     w->paybufs.tx = worker_paybuflist_create(w, payload_access.tx);
 
-    w->load = (load_t){.max_loop_contexts = 0,
-        .min_loop_contexts = INT_MAX,
-        .average = 0,
-        .loops_since_mark = 0,
-        .ctxs_serviced_since_mark = 0};
-    w->stats = (worker_stats_t){.epoll_loops = {.waitable = 0, .total = 0},
-        .half_loops = {.no_io_ready = 0, .no_session_ready = 0, .total = 0}};
+    w->load = (load_t){
+          .max_loop_contexts = 0
+        , .min_loop_contexts = INT_MAX
+        , .average = 0
+        , .loops_since_mark = 0
+        , .ctxs_serviced_since_mark = 0
+    };
+    w->stats = (worker_stats_t){
+          .epoll_loops = {
+              .waitable = 0
+            , .total = 0
+          }
+        , .half_loops = {
+              .no_io_ready = 0
+            , .no_session_ready = 0
+            , .total = 0
+          }
+    };
 }
 
 static bool
@@ -2914,15 +3209,15 @@ worker_launch(worker_t *w)
     CPU_SET(global_state.nextcpu, &cpuset);
 
     if ((rc = pthread_attr_init(&attr)) != 0) {
-        errx(EXIT_FAILURE, "%s.%d: pthread_attr_init: %s", __func__, __LINE__,
-            strerror(rc));
+            errx(EXIT_FAILURE, "%s.%d: pthread_attr_init: %s",
+                __func__, __LINE__, strerror(rc));
     }
 
     if (global_state.personality == get &&
-        (rc = pthread_attr_setaffinity_np(&attr, sizeof(cpuset), &cpuset)) !=
-            0) {
-        errx(EXIT_FAILURE, "%s.%d: pthread_attr_setaffinity_cp: %s", __func__,
-            __LINE__, strerror(rc));
+        (rc = pthread_attr_setaffinity_np(&attr,
+                                          sizeof(cpuset), &cpuset)) != 0) {
+            errx(EXIT_FAILURE, "%s.%d: pthread_attr_setaffinity_cp: %s",
+                __func__, __LINE__, strerror(rc));
     }
 
     if ((rc = pthread_sigmask(SIG_BLOCK, &blockset, &oldset)) != 0) {
@@ -2938,12 +3233,12 @@ worker_launch(worker_t *w)
     }
 
     if (create_rc != 0) {
-        errx(EXIT_FAILURE, "%s.%d: pthread_create: %s", __func__, __LINE__,
-            strerror(create_rc));
+        errx(EXIT_FAILURE, "%s.%d: pthread_create: %s",
+            __func__, __LINE__, strerror(create_rc));
     }
 
-    if (global_state.nextcpu == (int) global_state.processors.last)
-        global_state.nextcpu = (int) global_state.processors.first;
+    if (global_state.nextcpu == (int)global_state.processors.last)
+        global_state.nextcpu = (int)global_state.processors.first;
     else
         global_state.nextcpu++;
 
@@ -2981,29 +3276,29 @@ worker_create(void)
 {
     worker_t *w;
 
-    (void) pthread_mutex_lock(&workers_mtx);
+    (void)pthread_mutex_lock(&workers_mtx);
     w = (nworkers_allocated < arraycount(workers))
-            ? &workers[nworkers_allocated++]
-            : NULL;
+        ? &workers[nworkers_allocated++]
+        : NULL;
     if (w != NULL)
         worker_init(w);
-    (void) pthread_mutex_unlock(&workers_mtx);
+    (void)pthread_mutex_unlock(&workers_mtx);
 
     if (w == NULL)
         return NULL;
 
     if (!worker_launch(w)) {
-        (void) pthread_mutex_lock(&workers_mtx);
+        (void)pthread_mutex_lock(&workers_mtx);
 
-        if ((w - &workers[0]) + (size_t) 1 != nworkers_allocated) {
-            (void) pthread_mutex_unlock(&workers_mtx);
+        if ((w - &workers[0]) + (size_t)1 != nworkers_allocated) {
+            (void)pthread_mutex_unlock(&workers_mtx);
             errx(EXIT_FAILURE, "%s: worker launch failed irrecoverably",
                 __func__);
         }
 
         nworkers_allocated--;
 
-        (void) pthread_mutex_unlock(&workers_mtx);
+        (void)pthread_mutex_unlock(&workers_mtx);
         return NULL;
     }
 
@@ -3046,23 +3341,25 @@ worker_assign_session(worker_t *w, session_t s)
             if (!global_state.waitfd)
                 ;
             else if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, s.cxn->cq_wait_fd,
-                         &(struct epoll_event){.events = EPOLLIN,
-                             .data = {.ptr = slot->cxn}}) == -1) {
-                err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_ADD,)", __func__,
-                    __LINE__);
+                &(struct epoll_event){
+                  .events = EPOLLIN
+                , .data = {.ptr = slot->cxn}
+                }) == -1) {
+                err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_ADD,)",
+                    __func__, __LINE__);
             }
 
-            atomic_fetch_add_explicit(
-                &w->nsessions[half], 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&w->nsessions[half], 1,
+                memory_order_relaxed);
 
-            (void) pthread_mutex_unlock(mtx);
+            (void)pthread_mutex_unlock(mtx);
             return true;
         }
-        (void) pthread_mutex_unlock(mtx);
+        (void)pthread_mutex_unlock(mtx);
     }
     if (global_state.waitfd && (rc = pthread_kill(w->thd, SIGUSR1)) != 0) {
         errx(EXIT_FAILURE, "%s: could not signal thread for worker %p: %s",
-            __func__, (void *) w, strerror(rc));
+            __func__, (void *)w, strerror(rc));
     }
     return false;
 }
@@ -3118,10 +3415,10 @@ workers_assign_session(session_t s)
     worker_t *w;
 
     do {
-        (void) pthread_mutex_lock(&workers_mtx);
+        (void)pthread_mutex_lock(&workers_mtx);
 
         if (workers_assignment_suspended) {
-            (void) pthread_mutex_unlock(&workers_mtx);
+            (void)pthread_mutex_unlock(&workers_mtx);
             return NULL;
         }
 
@@ -3129,7 +3426,7 @@ workers_assign_session(session_t s)
             ;
         else if ((w = workers_assign_session_to_idle(s)) != NULL)
             workers_wake(w);
-        (void) pthread_mutex_unlock(&workers_mtx);
+        (void)pthread_mutex_unlock(&workers_mtx);
     } while (w == NULL && (w = worker_create()) != NULL);
 
     return w;
@@ -3141,7 +3438,7 @@ workers_join_all(void)
     int code = EXIT_SUCCESS;
     size_t i;
 
-    (void) pthread_mutex_lock(&workers_mtx);
+    (void)pthread_mutex_lock(&workers_mtx);
 
     workers_assignment_suspended = true;
 
@@ -3155,15 +3452,15 @@ workers_join_all(void)
         pthread_cond_signal(&w->sleep);
     }
 
-    (void) pthread_mutex_unlock(&workers_mtx);
+    (void)pthread_mutex_unlock(&workers_mtx);
 
     for (i = 0; i < nworkers_allocated; i++) {
         worker_t *w = &workers[i];
         int rc;
 
         if ((rc = pthread_join(w->thd, NULL)) != 0) {
-            errx(EXIT_FAILURE, "%s.%d: pthread_join: %s", __func__, __LINE__,
-                strerror(rc));
+                errx(EXIT_FAILURE, "%s.%d: pthread_join: %s",
+                    __func__, __LINE__, strerror(rc));
         }
         if (w->failed || w->canceled != global_state.expect_cancellation)
             code = EXIT_FAILURE;
@@ -3179,8 +3476,8 @@ workers_join_all(void)
 
 static void
 cxn_init(cxn_t *c, struct fid_av *av,
-    loop_control_t (*loop)(worker_t *, session_t *), void (*cancel)(cxn_t *),
-    bool (*cancellation_complete)(cxn_t *))
+    loop_control_t (*loop)(worker_t *, session_t *),
+    void (*cancel)(cxn_t *), bool (*cancellation_complete)(cxn_t *))
 {
     memset(c, 0, sizeof(*c));
     c->magic = 0xdeadbeef;
@@ -3192,7 +3489,7 @@ cxn_init(cxn_t *c, struct fid_av *av,
     c->started = false;
     c->cancelled = false;
     c->eof.local = c->eof.remote = false;
-    keysource_init(&c->keys);
+    seqsource_init(&c->keys);
 }
 
 static void
@@ -3202,29 +3499,44 @@ xmtr_memory_init(xmtr_t *x)
     int rc;
 
     rc = fi_mr_reg(global_state.domain, &x->initial.msg, sizeof(x->initial.msg),
-        FI_SEND, 0, keysource_next(&global_state.keys), 0, &x->initial.mr,
+        FI_SEND, 0, seqsource_get(&global_state.keys), 0, &x->initial.mr,
         NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_mr_reg(global_state.domain, &x->ack.msg, sizeof(x->ack.msg),
-        FI_RECV, 0, keysource_next(&global_state.keys), 0, &x->ack.mr, NULL);
+        FI_RECV, 0, seqsource_get(&global_state.keys), 0, &x->ack.mr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
-    rc = fi_mr_reg(global_state.domain, txbuf, txbuflen, FI_WRITE, 0,
-        keysource_next(&global_state.keys), 0, x->payload.mr, NULL);
+    rc = fi_mr_reg(global_state.domain, txbuf, txbuflen,
+        FI_WRITE, 0, seqsource_get(&global_state.keys), 0, x->payload.mr,
+        NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 }
 
+static bufhdr_t *
+progbuf_create_and_register(void)
+{
+    progbuf_t *pb = progbuf_alloc();
+    int rc;
+
+    rc = buf_mr_reg(global_state.domain, FI_SEND,
+        seqsource_get(&global_state.keys), &pb->hdr);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_mr_reg");
+
+    return &pb->hdr;
+}
+
 static void
 xmtr_init(xmtr_t *x, struct fid_av *av)
 {
-    const size_t nbufs = 16;
     const size_t maxposted = 64;
     size_t i;
 
@@ -3238,36 +3550,16 @@ xmtr_init(xmtr_t *x, struct fid_av *av)
     cxn_init(&x->cxn, av, xmtr_loop, xmtr_cancel, xmtr_cancellation_complete);
     xmtr_memory_init(x);
     if ((x->wrposted = fifo_create(maxposted)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create posted RDMA writes FIFO",
-            __func__);
-    }
-    if ((x->vec.posted = fifo_create(64)) == NULL) {
-        errx(
-            EXIT_FAILURE, "%s: could not create posted vectors FIFO", __func__);
-    }
-    if ((x->vec.rcvd = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create received vectors FIFO",
-            __func__);
-    }
-
-    if ((x->progress.ready = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create ready progress-buffers FIFO",
-            __func__);
-    }
-
-    if ((x->progress.posted = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create posted progress-buffers FIFO",
-            __func__);
-    }
-
-    if ((x->progress.pool = buflist_create(nbufs)) == NULL) {
         errx(EXIT_FAILURE,
-            "%s: could not create progress-message tx buffer pool", __func__);
+            "%s: could not create posted RDMA writes FIFO", __func__);
     }
+    rxctl_init(&x->vec, 64);
+
+    txctl_init(&x->progress, 64, 16, progbuf_create_and_register);
 
     if ((x->fragment.pool = buflist_create(maxposted)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create fragment header pool",
-            __func__);
+        errx(EXIT_FAILURE,
+            "%s: could not create fragment header pool", __func__);
     }
 
     for (i = 0; i < maxposted; i++) {
@@ -3276,25 +3568,11 @@ xmtr_init(xmtr_t *x, struct fid_av *av)
         if (!buflist_put(x->fragment.pool, &f->hdr))
             errx(EXIT_FAILURE, "%s: fragment pool full", __func__);
     }
-
-    for (i = 0; i < nbufs; i++) {
-        progbuf_t *pb = progbuf_alloc();
-        int rc;
-
-        rc = buf_mr_reg(global_state.domain, FI_SEND,
-            keysource_next(&global_state.keys), &pb->hdr);
-
-        if (rc != 0)
-            bailout_for_ofi_ret(rc, "fi_mr_reg");
-
-        if (!buflist_put(x->progress.pool, &pb->hdr))
-            errx(EXIT_FAILURE, "%s: progress buffer pool full", __func__);
-    }
 }
 
 static void
-terminal_init(
-    terminal_t *t, loop_control_t (*trade)(terminal_t *, fifo_t *, fifo_t *))
+terminal_init(terminal_t *t,
+    loop_control_t (*trade)(terminal_t *, fifo_t *, fifo_t *))
 {
     t->trade = trade;
 }
@@ -3305,7 +3583,7 @@ sink_init(sink_t *s)
     memset(s, 0, sizeof(*s));
     terminal_init(&s->terminal, sink_trade);
     s->txbuflen = strlen(txbuf);
-    s->entirelen = s->txbuflen * (size_t) 100000;
+    s->entirelen = s->txbuflen * (size_t)100000;
     s->idx = 0;
 }
 
@@ -3315,7 +3593,7 @@ source_init(source_t *s)
     memset(s, 0, sizeof(*s));
     terminal_init(&s->terminal, source_trade);
     s->txbuflen = strlen(txbuf);
-    s->entirelen = s->txbuflen * (size_t) 100000;
+    s->entirelen = s->txbuflen * (size_t)100000;
     s->idx = 0;
 }
 
@@ -3328,8 +3606,8 @@ rcvr_memory_init(rcvr_t *r)
         sizeof(r->initial.msg), r->initial.iov, global_state.rx_maxsegs);
 
     if (r->initial.niovs < 1) {
-        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd", __func__,
-            r->initial.niovs);
+        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
+            __func__, r->initial.niovs);
     }
 
     rc = mr_regv_all(global_state.domain, r->initial.iov, r->initial.niovs,
@@ -3339,12 +3617,12 @@ rcvr_memory_init(rcvr_t *r)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "mr_regv_all");
 
-    r->ack.niovs = fibonacci_iov_setup(
-        &r->ack.msg, sizeof(r->ack.msg), r->ack.iov, global_state.rx_maxsegs);
+    r->ack.niovs = fibonacci_iov_setup(&r->ack.msg,
+        sizeof(r->ack.msg), r->ack.iov, global_state.rx_maxsegs);
 
     if (r->ack.niovs < 1) {
-        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd", __func__,
-            r->ack.niovs);
+        errx(EXIT_FAILURE, "%s: unexpected I/O vector length %zd",
+            __func__, r->ack.niovs);
     }
 
     rc = mr_regv_all(global_state.domain, r->ack.iov, r->ack.niovs,
@@ -3355,57 +3633,37 @@ rcvr_memory_init(rcvr_t *r)
         bailout_for_ofi_ret(rc, "mr_regv_all");
 }
 
+static bufhdr_t *
+vecbuf_create_and_register(void)
+{
+    vecbuf_t *vb = vecbuf_alloc();
+    int rc;
+
+    rc = buf_mr_reg(global_state.domain, FI_SEND,
+        seqsource_get(&global_state.keys), &vb->hdr);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_mr_reg");
+
+    return &vb->hdr;
+}
+
 static void
 rcvr_init(rcvr_t *r, struct fid_av *av)
 {
-    const size_t nbufs = 16;
-    size_t i;
-
     memset(r, 0, sizeof(*r));
 
     cxn_init(&r->cxn, av, rcvr_loop, rcvr_cancel, rcvr_cancellation_complete);
     rcvr_memory_init(r);
 
     if ((r->tgtposted = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create RDMA targets FIFO", __func__);
+        errx(EXIT_FAILURE,
+            "%s: could not create RDMA targets FIFO", __func__);
     }
 
-    if ((r->progress.posted = fifo_create(64)) == NULL) {
-        errx(
-            EXIT_FAILURE, "%s: could not create posted vectors FIFO", __func__);
-    }
-    if ((r->progress.rcvd = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create received vectors FIFO",
-            __func__);
-    }
+    rxctl_init(&r->progress, 64);
 
-    if ((r->vec.ready = fifo_create(64)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create ready vectors FIFO", __func__);
-    }
-
-    if ((r->vec.posted = fifo_create(64)) == NULL) {
-        errx(
-            EXIT_FAILURE, "%s: could not create posted vectors FIFO", __func__);
-    }
-
-    if ((r->vec.pool = buflist_create(nbufs)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create vector-message tx buffer pool",
-            __func__);
-    }
-
-    for (i = 0; i < nbufs; i++) {
-        vecbuf_t *vb = vecbuf_alloc();
-        int rc;
-
-        rc = buf_mr_reg(global_state.domain, FI_SEND,
-            keysource_next(&global_state.keys), &vb->hdr);
-
-        if (rc != 0)
-            bailout_for_ofi_ret(rc, "fi_mr_reg");
-
-        if (!buflist_put(r->vec.pool, &vb->hdr))
-            errx(EXIT_FAILURE, "%s: vector buffer pool full", __func__);
-    }
+    txctl_init(&r->vec, 64, 16, vecbuf_create_and_register);
 }
 
 /* Post a receive for the initial message for session `gs`
@@ -3418,14 +3676,14 @@ post_initial_rx(struct fid_ep *ep, get_session_t *gs)
 
     rcvr_t *r = &gs->rcvr;
 
-    rc = fi_recvmsg(ep,
-        &(struct fi_msg){.msg_iov = r->initial.iov,
-            .desc = r->initial.desc,
-            .iov_count = r->initial.niovs,
-            .addr = r->cxn.peer_addr,
-            .context = &gs->ctx,
-            .data = 0},
-        FI_COMPLETION);
+    rc = fi_recvmsg(ep, &(struct fi_msg){
+          .msg_iov = r->initial.iov
+        , .desc = r->initial.desc
+        , .iov_count = r->initial.niovs
+        , .addr = r->cxn.peer_addr
+        , .context = &gs->ctx
+        , .data = 0
+        }, FI_COMPLETION);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
@@ -3434,13 +3692,15 @@ post_initial_rx(struct fid_ep *ep, get_session_t *gs)
 static get_session_t *
 get_session_accept(get_state_t *gst)
 {
-    struct fi_cq_attr cq_attr = {.size = 128,
-        .flags = 0,
-        .format = FI_CQ_FORMAT_MSG,
-        .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC,
-        .signaling_vector = 0,
-        .wait_cond = FI_CQ_COND_NONE,
-        .wait_set = NULL};
+    struct fi_cq_attr cq_attr = {
+      .size = 128
+    , .flags = 0
+    , .format = FI_CQ_FORMAT_MSG
+    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC
+    , .signaling_vector = 0
+    , .wait_cond = FI_CQ_COND_NONE
+    , .wait_set = NULL
+    };
     struct fi_cq_msg_entry completion;
     get_session_t *gs;
     rcvr_t *r;
@@ -3462,14 +3722,14 @@ get_session_accept(get_state_t *gst)
         bailout_for_ofi_ret(ncompleted, "fi_cq_sread");
 
     if (ncompleted != 1) {
-        errx(EXIT_FAILURE, "%s: expected 1 completion, read %zd", __func__,
-            ncompleted);
+        errx(EXIT_FAILURE,
+            "%s: expected 1 completion, read %zd", __func__, ncompleted);
     }
 
     if ((completion.flags & desired_rx_flags) != desired_rx_flags) {
         errx(EXIT_FAILURE,
-            "%s: expected flags %" PRIu64 ", received flags %" PRIu64, __func__,
-            desired_rx_flags, completion.flags & desired_rx_flags);
+            "%s: expected flags %" PRIu64 ", received flags %" PRIu64,
+            __func__, desired_rx_flags, completion.flags & desired_rx_flags);
     }
 
     gs = completion.op_context;
@@ -3488,12 +3748,12 @@ get_session_accept(get_state_t *gst)
             global_state.total_sessions);
     }
 
-    rc = fi_av_insert(
-        r->cxn.av, r->initial.msg.addr, 1, &r->cxn.peer_addr, 0, NULL);
+    rc = fi_av_insert(r->cxn.av, r->initial.msg.addr, 1, &r->cxn.peer_addr,
+        0, NULL);
 
     if (rc < 0) {
-        bailout_for_ofi_ret(
-            rc, "fi_av_insert initial.msg.addr %p", r->initial.msg.addr);
+        bailout_for_ofi_ret(rc, "fi_av_insert initial.msg.addr %p",
+            r->initial.msg.addr);
     }
 
     struct fi_info *ep_info, *hints = fi_dupinfo(global_state.info);
@@ -3508,14 +3768,14 @@ get_session_accept(get_state_t *gst)
     if ((rc = fi_endpoint(global_state.domain, ep_info, &r->cxn.ep, NULL)) < 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
-    hints->dest_addr = NULL; // fi_freeinfo wants to free(3) dest_addr
+    hints->dest_addr = NULL;    // fi_freeinfo wants to free(3) dest_addr
     hints->dest_addrlen = 0;
     fi_freeinfo(hints);
 
     fi_freeinfo(ep_info);
 
-    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &r->cxn.cq, &r->cxn)) !=
-        0)
+    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &r->cxn.cq,
+                         &r->cxn)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
     if (global_state.waitfd) {
@@ -3530,7 +3790,7 @@ get_session_accept(get_state_t *gst)
     }
 
     if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.cq->fid,
-             FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
+        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
     if ((rc = fi_ep_bind(r->cxn.ep, &r->cxn.av->fid, 0)) != 0)
@@ -3544,7 +3804,9 @@ get_session_accept(get_state_t *gst)
     if ((rc = fi_getname(&r->cxn.ep->fid, r->ack.msg.addr, &addrlen)) != 0)
         bailout_for_ofi_ret(rc, "fi_getname");
 
-    r->ack.msg.addrlen = (uint32_t) addrlen;
+    r->ack.msg.addrlen = (uint32_t)addrlen;
+
+    hlog_fast(session, "%s: accepted session %p", __func__, (void *)gs);
 
     return gs;
 }
@@ -3552,13 +3814,15 @@ get_session_accept(get_state_t *gst)
 static put_state_t *
 put_state_open(void)
 {
-    struct fi_av_attr av_attr = {.type = FI_AV_UNSPEC,
-        .rx_ctx_bits = 0,
-        .count = 0,
-        .ep_per_node = 0,
-        .name = NULL,
-        .map_addr = NULL,
-        .flags = 0};
+    struct fi_av_attr av_attr = {
+      .type = FI_AV_UNSPEC
+    , .rx_ctx_bits = 0
+    , .count = 0
+    , .ep_per_node = 0
+    , .name = NULL
+    , .map_addr = NULL
+    , .flags = 0
+    };
     put_state_t *pst;
     int rc;
 
@@ -3575,12 +3839,12 @@ put_state_open(void)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_av_open");
 
-    rc = fi_av_insert(
-        pst->av, global_state.info->dest_addr, 1, &pst->peer_addr, 0, NULL);
+    rc = fi_av_insert(pst->av, global_state.info->dest_addr, 1,
+        &pst->peer_addr, 0, NULL);
 
     if (rc < 0) {
-        bailout_for_ofi_ret(
-            rc, "fi_av_insert dest_addr %p", global_state.info->dest_addr);
+        bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p",
+            global_state.info->dest_addr);
     }
 
     return pst;
@@ -3589,20 +3853,24 @@ put_state_open(void)
 static get_state_t *
 get_state_open(void)
 {
-    struct fi_av_attr av_attr = {.type = FI_AV_UNSPEC,
-        .rx_ctx_bits = 0,
-        .count = 0,
-        .ep_per_node = 0,
-        .name = NULL,
-        .map_addr = NULL,
-        .flags = 0};
-    struct fi_cq_attr cq_attr = {.size = 128,
-        .flags = 0,
-        .format = FI_CQ_FORMAT_MSG,
-        .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC,
-        .signaling_vector = 0,
-        .wait_cond = FI_CQ_COND_NONE,
-        .wait_set = NULL};
+    struct fi_av_attr av_attr = {
+      .type = FI_AV_UNSPEC
+    , .rx_ctx_bits = 0
+    , .count = 0
+    , .ep_per_node = 0
+    , .name = NULL
+    , .map_addr = NULL
+    , .flags = 0
+    };
+    struct fi_cq_attr cq_attr = {
+      .size = 128
+    , .flags = 0
+    , .format = FI_CQ_FORMAT_MSG
+    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC
+    , .signaling_vector = 0
+    , .wait_cond = FI_CQ_COND_NONE
+    , .wait_set = NULL
+    };
     get_state_t *gst;
     int rc;
 
@@ -3620,15 +3888,15 @@ get_state_open(void)
         bailout_for_ofi_ret(rc, "fi_av_open");
 
     if ((rc = fi_endpoint(global_state.domain, global_state.info,
-             &gst->listen_ep, NULL)) != 0)
+                          &gst->listen_ep, NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
-    if ((rc = fi_cq_open(
-             global_state.domain, &cq_attr, &gst->listen_cq, NULL)) != 0)
+    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &gst->listen_cq,
+                         NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
     if ((rc = fi_ep_bind(gst->listen_ep, &gst->listen_cq->fid,
-             FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
+        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind (completion queue)");
 
     if ((rc = fi_ep_bind(gst->listen_ep, &gst->av->fid, 0)) != 0)
@@ -3689,22 +3957,24 @@ get(void)
 static void
 put_session_setup(put_state_t *pst, put_session_t *ps)
 {
-    struct fi_cq_attr cq_attr = {.size = 128,
-        .flags = 0,
-        .format = FI_CQ_FORMAT_MSG,
-        .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC,
-        .signaling_vector = 0,
-        .wait_cond = FI_CQ_COND_NONE,
-        .wait_set = NULL};
+    struct fi_cq_attr cq_attr = {
+      .size = 128
+    , .flags = 0
+    , .format = FI_CQ_FORMAT_MSG
+    , .wait_obj = global_state.waitfd ? FI_WAIT_FD : FI_WAIT_UNSPEC
+    , .signaling_vector = 0
+    , .wait_cond = FI_CQ_COND_NONE
+    , .wait_set = NULL
+    };
     xmtr_t *x = &ps->xmtr;
     int rc;
 
-    if ((rc = fi_endpoint(
-             global_state.domain, global_state.info, &x->cxn.ep, NULL)) != 0)
+    if ((rc = fi_endpoint(global_state.domain, global_state.info, &x->cxn.ep,
+                          NULL)) != 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
 
-    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &x->cxn.cq, &x->cxn)) !=
-        0)
+    if ((rc = fi_cq_open(global_state.domain, &cq_attr, &x->cxn.cq,
+                         &x->cxn)) != 0)
         bailout_for_ofi_ret(rc, "fi_cq_open");
 
     if (global_state.waitfd) {
@@ -3719,7 +3989,7 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
     }
 
     if ((rc = fi_ep_bind(x->cxn.ep, &x->cxn.cq->fid,
-             FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
+        FI_SELECTIVE_COMPLETION | FI_RECV | FI_TRANSMIT)) != 0)
         bailout_for_ofi_ret(rc, "fi_ep_bind");
 
     if ((rc = fi_ep_bind(x->cxn.ep, &pst->av->fid, 0)) != 0)
@@ -3743,7 +4013,7 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
         bailout_for_ofi_ret(rc, "fi_getname");
 
     assert(addrlen <= sizeof(x->initial.msg.addr));
-    x->initial.msg.addrlen = (uint32_t) addrlen;
+    x->initial.msg.addrlen = (uint32_t)addrlen;
 
     /* Post receive for connection acknowledgement. */
     x->ack.desc = fi_mr_desc(x->ack.mr);
@@ -3756,15 +4026,15 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
     xfc->nchildren = 0;
     xfc->cancelled = 0;
 
-    rc = fi_recvmsg(x->cxn.ep,
-        &(struct fi_msg){.msg_iov = &(struct iovec){.iov_base = &x->ack.msg,
-                             .iov_len = sizeof(x->ack.msg)},
-            .desc = &x->ack.desc,
-            .iov_count = 1,
-            .addr = x->cxn.peer_addr,
-            .context = xfc,
-            .data = 0},
-        FI_COMPLETION);
+    rc = fi_recvmsg(x->cxn.ep, &(struct fi_msg){
+          .msg_iov = &(struct iovec){.iov_base = &x->ack.msg,
+                                     .iov_len = sizeof(x->ack.msg)}
+        , .desc = &x->ack.desc
+        , .iov_count = 1
+        , .addr = x->cxn.peer_addr
+        , .context = xfc
+        , .data = 0
+        }, FI_COMPLETION);
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_recvmsg");
@@ -3811,8 +4081,10 @@ count_info(const struct fi_info *first)
     int count;
     const struct fi_info *info;
 
-    for (info = first, count = 1; (info = info->next) != NULL; count++)
-        ;
+    for (info = first, count = 1; (info = info->next) != NULL; count++) {
+        hlog_fast(params, "%s: info %d provider \"%s\"",
+            __func__, count, info->fabric_attr->prov_name);
+    }
 
     return count;
 }
@@ -3834,8 +4106,8 @@ usage(personality_t personality, const char *progname)
     const char *common = "[-n <n>] [-p '<i> - <j>' ] [-r] [-w]";
 
     if (personality == put) {
-        fprintf(stderr, "usage: %s [-c] [-g] [-k <k>] %s <address>\n", progname,
-            common);
+        fprintf(stderr, "usage: %s [-c] [-g] [-k <k>] %s <address>\n",
+            progname, common);
     } else {
         fprintf(stderr, "usage: %s [-b <address>] [-c] %s\n", progname, common);
     }
@@ -3896,16 +4168,16 @@ await_cancellation(void transfer_unused *arg)
 
         if ((rc = pthread_kill(global_state.main_thd, SIGUSR2)) != 0) {
             errx(EXIT_FAILURE,
-                "%s: could not signal thread for main thread: %s", __func__,
-                strerror(rc));
+                "%s: could not signal thread for main thread: %s",
+                __func__, strerror(rc));
         }
 
-        (void) pthread_mutex_lock(&workers_mtx);
+        (void)pthread_mutex_lock(&workers_mtx);
 
         for (i = 0; i < nworkers_running; i++) {
             worker_t *w = &workers[i];
 
-            (void) pthread_cond_signal(&w->sleep);
+            (void)pthread_cond_signal(&w->sleep);
 
             /*
              * Wake each worker with SIGUSR1 if blocking in epoll_pwait(2)
@@ -3914,14 +4186,14 @@ await_cancellation(void transfer_unused *arg)
             if (global_state.waitfd &&
                 (rc = pthread_kill(w->thd, SIGUSR1)) != 0) {
                 errx(EXIT_FAILURE,
-                    "%s: could not signal thread for worker %p: %s", __func__,
-                    (void *) w, strerror(rc));
+                    "%s: could not signal thread for worker %p: %s",
+                    __func__, (void *)w, strerror(rc));
             }
         }
 
-        (void) pthread_cond_signal(&nworkers_cond);
+        (void)pthread_cond_signal(&nworkers_cond);
 
-        (void) pthread_mutex_unlock(&workers_mtx);
+        (void)pthread_mutex_unlock(&workers_mtx);
     }
     return NULL;
 }
@@ -3935,12 +4207,14 @@ parse_nsessions(const char *s, char flagname)
     errno = 0;
     n = strtoumax(s, &end, 0);
     if (n < 1 || SIZE_MAX < n) {
-        errx(EXIT_FAILURE, "`-%c` parameter `%s` is out of range", flagname, s);
+        errx(EXIT_FAILURE, "`-%c` parameter `%s` is out of range", flagname,
+            s);
     }
     if (end == s) {
-        errx(EXIT_FAILURE, "could not parse `-%c` parameter `%s`", flagname, s);
+        errx(EXIT_FAILURE, "could not parse `-%c` parameter `%s`", flagname,
+            s);
     }
-    return (size_t) n;
+    return (size_t)n;
 }
 
 int
@@ -3967,7 +4241,7 @@ main(int argc, char **argv)
         global_state.personality = put;
     } else {
         errx(EXIT_FAILURE, "program personality '%s' is not implemented",
-            progname);
+           progname);
     }
 
     const char *optstring =
@@ -3975,51 +4249,49 @@ main(int argc, char **argv)
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
-            case 'b':
-                addr = optarg;
-                break;
-            case 'c':
-                global_state.expect_cancellation = true;
-                break;
-            case 'g':
-                global_state.contiguous = true;
-                break;
-            case 'k':
-                set.k = true;
-                global_state.local_sessions = parse_nsessions(optarg, 'k');
-                break;
-            case 'n':
-                set.n = true;
-                global_state.total_sessions = parse_nsessions(optarg, 'n');
-                break;
-            case 'p':
-                ninput = 0;
-                (void) sscanf(optarg, "%u - %u%n",
-                    &global_state.processors.first,
-                    &global_state.processors.last, &ninput);
-                if (optarg[ninput] != '\0')
-                    errx(
-                        EXIT_FAILURE, "unexpected `-p` parameter `%s`", optarg);
-                if (INT_MAX < global_state.processors.first ||
-                    INT_MAX < global_state.processors.last)
-                    errx(
-                        EXIT_FAILURE, "unexpected `-p` parameter `%s`", optarg);
-                break;
-            case 'r':
-                global_state.reregister = true;
-                break;
-            case 'w':
-                global_state.waitfd = true;
-                break;
-            default:
-                usage(global_state.personality, progname);
+        case 'b':
+            addr = optarg;
+            break;
+        case 'c':
+            global_state.expect_cancellation = true;
+            break;
+        case 'g':
+            global_state.contiguous = true;
+            break;
+        case 'k':
+            set.k = true;
+            global_state.local_sessions = parse_nsessions(optarg, 'k');
+            break;
+        case 'n':
+            set.n = true;
+            global_state.total_sessions = parse_nsessions(optarg, 'n');
+            break;
+        case 'p':
+            ninput = 0;
+            (void)sscanf(optarg, "%u - %u%n",
+                &global_state.processors.first, &global_state.processors.last,
+                &ninput);
+            if (optarg[ninput] != '\0')
+                errx(EXIT_FAILURE, "unexpected `-p` parameter `%s`", optarg);
+            if (INT_MAX < global_state.processors.first ||
+                INT_MAX < global_state.processors.last)
+                errx(EXIT_FAILURE, "unexpected `-p` parameter `%s`", optarg);
+            break;
+        case 'r':
+            global_state.reregister = true;
+            break;
+        case 'w':
+            global_state.waitfd = true;
+            break;
+        default:
+            usage(global_state.personality, progname);
         }
     }
 
     argc -= optind;
     argv += optind;
 
-    global_state.nextcpu = (int) global_state.processors.first;
+    global_state.nextcpu = (int)global_state.processors.first;
 
     if (global_state.personality == put) {
         if (argc != 1)
@@ -4041,10 +4313,10 @@ main(int argc, char **argv)
 
     workers_initialize();
 
-    keysource_init(&global_state.keys);
+    seqsource_init(&global_state.keys);
 
-    hlog_fast(
-        params, "%ld POSIX I/O vector items maximum", sysconf(_SC_IOV_MAX));
+    hlog_fast(params,
+        "%ld POSIX I/O vector items maximum", sysconf(_SC_IOV_MAX));
 
     if ((hints = fi_allocinfo()) == NULL)
         errx(EXIT_FAILURE, "%s: fi_allocinfo", __func__);
@@ -4054,21 +4326,22 @@ main(int argc, char **argv)
     hints->mode = FI_CONTEXT;
     hints->domain_attr->mr_mode = FI_MR_PROV_KEY;
 
-    rc = fi_getinfo(FI_VERSION(1, 13), addr, fget_fput_service_name,
+    rc = fi_getinfo(FI_VERSION(1, 13), addr,
+        fget_fput_service_name,
         (global_state.personality == get) ? FI_SOURCE : 0, hints,
         &global_state.info);
 
     fi_freeinfo(hints);
 
     switch (-rc) {
-        case FI_ENODATA:
-            hlog_fast(err, "capabilities not available?");
-            break;
-        case FI_ENOSYS:
-            hlog_fast(err, "available libfabric version < 1.13?");
-            break;
-        default:
-            break;
+    case FI_ENODATA:
+        hlog_fast(err, "capabilities not available?");
+        break;
+    case FI_ENOSYS:
+        hlog_fast(err, "available libfabric version < 1.13?");
+        break;
+    default:
+        break;
     }
 
     if (rc != 0)
@@ -4088,8 +4361,8 @@ main(int argc, char **argv)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_fabric");
 
-    rc = fi_domain(
-        global_state.fabric, global_state.info, &global_state.domain, NULL);
+    rc = fi_domain(global_state.fabric, global_state.info, &global_state.domain,
+        NULL);
 
     hlog_fast(params, "provider %s, memory-registration I/O vector limit %zu",
         global_state.info->fabric_attr->prov_name,
@@ -4105,8 +4378,7 @@ main(int argc, char **argv)
     if ((global_state.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0) {
         hlog_fast(params,
             "provider %s RDMA uses virtual addresses instead of offsets, "
-            "quitting.",
-            global_state.info->fabric_attr->prov_name);
+            "quitting.", global_state.info->fabric_attr->prov_name);
         exit(EXIT_FAILURE);
     }
 
@@ -4123,8 +4395,9 @@ main(int argc, char **argv)
     global_state.mr_maxsegs = 1;
     global_state.rx_maxsegs = 1;
     global_state.tx_maxsegs = 1;
-    global_state.rma_maxsegs =
-        global_state.contiguous ? 1 : global_state.info->tx_attr->rma_iov_limit;
+    global_state.rma_maxsegs = global_state.contiguous
+        ? 1
+        : global_state.info->tx_attr->rma_iov_limit;
 
     hlog_fast(params, "maximum endpoint message size (RMA limit) 0x%zx",
         global_state.info->ep_attr->max_msg_size);
@@ -4160,20 +4433,20 @@ main(int argc, char **argv)
             strerror(rc));
     }
 
-    struct sigaction cancel_action = {
-        .sa_sigaction = handle_cancel, .sa_flags = SA_SIGINFO};
+    struct sigaction cancel_action = {.sa_sigaction = handle_cancel,
+                                      .sa_flags = SA_SIGINFO};
 
     if (sigemptyset(&cancel_action.sa_mask) == -1)
         err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
     for (i = 0; i < arraycount(siglist); i++) {
         if (sigaction(siglist[i].signum, &cancel_action,
-                &siglist[i].saved_action) == -1)
+                      &siglist[i].saved_action) == -1)
             err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
     }
 
-    struct sigaction wakeup_action = {
-        .sa_sigaction = handle_wakeup, .sa_flags = SA_SIGINFO};
+    struct sigaction wakeup_action = {.sa_sigaction = handle_wakeup,
+                                      .sa_flags = SA_SIGINFO};
 
     if (sigemptyset(&wakeup_action.sa_mask) == -1)
         err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
@@ -4184,9 +4457,10 @@ main(int argc, char **argv)
     if (sigaction(SIGUSR2, &wakeup_action, &saved_wakeup2_action) == -1)
         err(EXIT_FAILURE, "%s.%d: sigaddset", __func__, __LINE__);
 
-    if ((rc = pthread_create(
-             &global_state.cancel_thd, NULL, await_cancellation, NULL)) != 0) {
-        warnx("%s.%d: pthread_create: %s", __func__, __LINE__, strerror(rc));
+    if ((rc = pthread_create(&global_state.cancel_thd, NULL,
+        await_cancellation, NULL)) != 0) {
+        warnx("%s.%d: pthread_create: %s", __func__, __LINE__,
+            strerror(rc));
         ecode = EXIT_FAILURE;
         goto out;
     }
