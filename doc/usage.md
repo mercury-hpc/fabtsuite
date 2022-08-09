@@ -8,7 +8,7 @@
 
 ## common options
 
-* `-c`: expect **c**ancellation by a signal.  Use exit code 0 (sucess)
+* `-c`: expect **c**ancellation by a signal.  Use exit code 0 (success)
   if the program is cancelled by a signal (SIGHUP, -INT, -QUIT, -TERM).
   Use exit code 1 (failure), otherwise.
 
