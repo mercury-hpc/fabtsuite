@@ -16,6 +16,6 @@ the test client.
 
 `scripts/run-suite` is the main test script.
 
-`doc/building.md` tells how to build the project.
+`doc/building.md` and `doc\building_cmake.md` tell how to build the project.
 
 `doc/tests.md` describes the tests in this suite.
