@@ -1,4 +1,4 @@
-name: cmake libfabric
+name: test latest libfabric
 on:
   workflow_dispatch:
   push:
@@ -56,7 +56,7 @@ jobs:
         ls /tmp/
         cd /tmp/usr/local
         env
-        ./transfer/fget -b localhost &
-        ./transfer/fput localhost
+        ./bin/fabtget -b localhost &
+        ./bin/fabtput localhost
       env:
         LD_LIBRARY_PATH: /tmp/lib

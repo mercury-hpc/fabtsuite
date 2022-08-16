@@ -57,7 +57,7 @@ jobs:
         cd /tmp/usr/local
         env
         # ./scripts/run-suite localhost
-        ./transfer/fget -b localhost &
-        ./transfer/fput localhost
+        ./bin/fabtget -b localhost &
+        ./bin/fabtput localhost
       env:
         LD_LIBRARY_PATH: /tmp/lib
