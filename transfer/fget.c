@@ -569,8 +569,6 @@ completion_flags_to_string(const uint64_t flags, char * const buf,
 static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
 static const uint64_t desired_tagged_rx_flags = FI_RECV | FI_TAGGED;
 static const uint64_t desired_tagged_tx_flags = FI_SEND | FI_TAGGED;
-static const uint64_t desired_wr_flags =
-    FI_RMA | FI_WRITE | FI_COMPLETION | FI_DELIVERY_COMPLETE;
 
 static uint64_t _Atomic next_key_pool = 512;
 
@@ -1640,7 +1638,7 @@ rcvr_cq_process(rcvr_t *r)
     if (ncompleted == -FI_EAVAIL) {
         struct fi_cq_err_entry e;
         char errbuf[256];
-        char flagsbuf[256];
+        char flagsbuf[2][256];
         ssize_t nfailed = fi_cq_readerr(r->cxn.cq, &e, 0);
 
         cmpl = (completion_t){
@@ -1652,11 +1650,12 @@ rcvr_cq_process(rcvr_t *r)
         if (e.err != FI_ECANCELED || !cmpl.xfc->cancelled) {
             hlog_fast(err, "%s: read %zd errors, %s", __func__, nfailed,
                 fi_strerror(e.err));
-            hlog_fast(err, "%s: context %p", __func__, (void *)e.op_context);
-            hlog_fast(err, "%s: completion flags %" PRIx64, __func__, e.flags);
-            hlog_fast(err, "%s: symbolic flags %s", __func__,
-                completion_flags_to_string(e.flags, flagsbuf,
-                sizeof(flagsbuf)));
+            hlog_fast(err, "%s: context %p type %s", __func__, (void *)cmpl.xfc,
+                xfc_type_to_string(cmpl.xfc->type));
+            hlog_fast(err, "%s: completion flags %" PRIx64 " symbolic %s",
+                __func__, e.flags,
+                completion_flags_to_string(e.flags, flagsbuf[0],
+                    sizeof(flagsbuf[0])));
             hlog_fast(err, "%s: provider error %s", __func__,
                 fi_cq_strerror(r->cxn.cq, e.prov_errno, e.err_data, errbuf,
                     sizeof(errbuf)));
@@ -2216,7 +2215,7 @@ xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
     if (ncompleted == -FI_EAVAIL) {
         struct fi_cq_err_entry e;
         char errbuf[256];
-        char flagsbuf[256];
+        char flagsbuf[2][256];
         ssize_t nfailed = fi_cq_readerr(x->cxn.cq, &e, 0);
 
         cmpl = (completion_t){
@@ -2228,12 +2227,12 @@ xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
         if (e.err != FI_ECANCELED || !cmpl.xfc->cancelled) {
             hlog_fast(err, "%s: read %zd errors, %s", __func__, nfailed,
                 fi_strerror(e.err));
-            hlog_fast(err, "%s: context %p", __func__, (void *)e.op_context);
-            hlog_fast(err, "%s: completion flags %" PRIx64 " expected %" PRIx64,
-                __func__, e.flags, desired_wr_flags);
-            hlog_fast(err, "%s: symbolic flags %s", __func__,
-                completion_flags_to_string(e.flags, flagsbuf,
-                sizeof(flagsbuf)));
+            hlog_fast(err, "%s: context %p type %s", __func__, (void *)cmpl.xfc,
+                xfc_type_to_string(cmpl.xfc->type));
+            hlog_fast(err, "%s: completion flags %" PRIx64 " symbolic %s",
+                __func__, e.flags,
+                completion_flags_to_string(e.flags, flagsbuf[0],
+                    sizeof(flagsbuf[0])));
             hlog_fast(err, "%s: provider error %s", __func__,
                 fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
                 sizeof(errbuf)));
