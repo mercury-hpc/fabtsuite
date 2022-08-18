@@ -109,6 +109,7 @@ typedef struct bufhdr {
     struct fid_mr *mr;
     void *desc;
     uint64_t tag;
+    struct fid_ep *ep;
     max_align_t pad;
 } bufhdr_t;
 
@@ -381,6 +382,7 @@ struct worker {
     volatile atomic_bool shutting_down;
     volatile atomic_bool canceled;
     bool failed;
+    bool pollable;
     struct {
         buflist_t *tx;
         buflist_t *rx;
@@ -431,6 +433,7 @@ typedef struct {
     bool expect_cancellation;
     bool reregister;
     bool waitfd;
+    bool mr_endpoint;
     size_t local_sessions;
     size_t total_sessions;
     personality_t personality;
@@ -441,13 +444,16 @@ typedef struct {
     volatile bool cancelled;
     pthread_t cancel_thd;
     pthread_t main_thd;
+    char peer_addr_buf[256];
+    char *peer_addr;
 } state_t;
 
 HLOG_OUTLET_MEDIUM_DEFN(err, all, 0, HLOG_OUTLET_S_ON);
 HLOG_OUTLET_SHORT_DEFN(average, all);
 HLOG_OUTLET_SHORT_DEFN(close, all);
 HLOG_OUTLET_SHORT_DEFN(signal, all);
-HLOG_OUTLET_SHORT_DEFN(params, all);
+HLOG_OUTLET_SHORT_DEFN(noisy_params, all);
+HLOG_OUTLET_SHORT_DEFN(params, noisy_params);
 HLOG_OUTLET_SHORT_DEFN(tx_start, all);
 HLOG_OUTLET_SHORT_DEFN(session_loop, all);
 HLOG_OUTLET_SHORT_DEFN(write, all);
@@ -468,8 +474,7 @@ HLOG_OUTLET_SHORT_DEFN(worker_stats, all);
 HLOG_OUTLET_SHORT_DEFN(multitx, all);
 HLOG_OUTLET_SHORT_DEFN(session, all);
 HLOG_OUTLET_SHORT_DEFN(ooo, all);
-
-static const char fget_fput_service_name[] = "4242";
+HLOG_OUTLET_SHORT_DEFN(addr, all);
 
 static const unsigned split_progress_interval = 2047;
 static const unsigned split_vector_interval = 15;
@@ -479,7 +484,8 @@ static state_t global_state = {.domain = NULL, .fabric = NULL, .info = NULL,
                                .personality = NULL, .local_sessions = 1,
                                .total_sessions = 1,
                                .processors = {.first = 0, .last = INT_MAX},
-                               .cancelled = 0};
+                               .cancelled = 0,
+                               .peer_addr = NULL};
 
 static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
@@ -508,6 +514,27 @@ static const struct {
 } payload_access = {.rx = FI_RECV | FI_REMOTE_WRITE, .tx = FI_SEND};
 
 static int get(void);
+
+static const char *
+xfc_type_to_string(xfc_type_t t)
+{
+    switch (t) {
+    case xft_ack:
+        return "ack";
+    case xft_fragment:
+        return "fragment";
+    case xft_initial:
+        return "initial";
+    case xft_progress:
+        return "progress";
+    case xft_rdma_write:
+        return "rdma_write";
+    case xft_vector:
+        return "vector";
+    default:
+        return "<unknown>";
+    }
+}
 
 static char *
 completion_flags_to_string(const uint64_t flags, char * const buf,
@@ -960,8 +987,29 @@ vecbuf_alloc(void)
 }
 
 static int
-buf_mr_reg(struct fid_domain *dom, uint64_t access, uint64_t key,
-    bufhdr_t *h)
+buf_mr_bind(bufhdr_t *h, struct fid_ep *ep)
+{
+    int rc;
+
+    if (ep == NULL)
+        h->ep = NULL;
+    else if (global_state.mr_endpoint &&
+             (rc = fi_mr_bind(h->mr, &ep->fid, 0)) != 0)
+        return rc;
+    else if (global_state.mr_endpoint &&
+             (rc = fi_mr_enable(h->mr)) != 0)
+        return rc;
+    else
+        h->ep = ep;
+
+    h->desc = fi_mr_desc(h->mr);
+
+    return rc;
+}
+
+static int
+buf_mr_reg(struct fid_domain *dom, struct fid_ep *ep,
+    uint64_t access, uint64_t key, bufhdr_t *h)
 {
     int rc;
     bytebuf_t *b = (bytebuf_t *)h;
@@ -972,7 +1020,8 @@ buf_mr_reg(struct fid_domain *dom, uint64_t access, uint64_t key,
     if (rc != 0)
         return rc;
 
-    h->desc = fi_mr_desc(h->mr);
+    if ((rc = buf_mr_bind(h, ep)) != 0)
+        return rc;
 
     return 0;
 }
@@ -1029,9 +1078,9 @@ paybuflist_replenish(seqsource_t *keys, uint64_t access, buflist_t *bl)
         buf->hdr.xfc.type = xft_rdma_write;
 
         if (!global_state.reregister &&
-            (rc = buf_mr_reg(global_state.domain, access,
+            (rc = buf_mr_reg(global_state.domain, NULL, access,
                              seqsource_get(keys), &buf->hdr)) != 0) {
-            warn_about_ofi_ret(rc, "fi_mr_reg");
+            warn_about_ofi_ret(rc, "buf_mr_reg");
             free(buf);
             break;
         }
@@ -1046,13 +1095,19 @@ paybuflist_replenish(seqsource_t *keys, uint64_t access, buflist_t *bl)
 }
 
 static bytebuf_t *
-worker_payload_txbuf_get(worker_t *w)
+worker_payload_txbuf_get(worker_t *w, struct fid_ep *ep)
 {
     bytebuf_t *b;
+    int rc;
 
     while ((b = (bytebuf_t *)buflist_get(w->paybufs.tx)) == NULL &&
            paybuflist_replenish(&w->keys, payload_access.tx, w->paybufs.tx))
         ;   // do nothing
+
+    if ((rc = buf_mr_bind(&b->hdr, ep)) != 0) {
+        buflist_put(w->paybufs.tx, &b->hdr);
+        return NULL;
+    }
 
     if (b != NULL)
         hlog_fast(paybuf, "%s: buf length %zu", __func__, b->hdr.nallocated);
@@ -1061,13 +1116,19 @@ worker_payload_txbuf_get(worker_t *w)
 }
 
 static bytebuf_t *
-worker_payload_rxbuf_get(worker_t *w)
+worker_payload_rxbuf_get(worker_t *w, struct fid_ep *ep)
 {
     bytebuf_t *b;
+    int rc;
 
     while ((b = (bytebuf_t *)buflist_get(w->paybufs.rx)) == NULL &&
            paybuflist_replenish(&w->keys, payload_access.rx, w->paybufs.rx))
         ;   // do nothing
+
+    if ((rc = buf_mr_bind(&b->hdr, ep)) != 0) {
+        buflist_put(w->paybufs.tx, &b->hdr);
+        return NULL;
+    }
 
     if (b != NULL)
         hlog_fast(paybuf, "%s: buf length %zu", __func__, b->hdr.nallocated);
@@ -1112,8 +1173,9 @@ fibonacci_iov_setup(void *_buf, size_t len, struct iovec *iov, size_t niovs)
  * more than `maxsegs` segments in a single `fi_mr_regv` call.
  */
 static int
-mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
-    size_t niovs, size_t maxsegs, uint64_t access, uint64_t offset,
+mr_regv_all(struct fid_domain *domain, struct fid_ep *ep,
+    const struct iovec *iov, size_t niovs,
+    size_t maxsegs, uint64_t access, uint64_t offset,
     seqsource_t *keys, uint64_t flags, struct fid_mr **mrp,
     void **descp, uint64_t *raddrp, void *context)
 {
@@ -1136,6 +1198,20 @@ mr_regv_all(struct fid_domain *domain, const struct iovec *iov,
 
         if (rc != 0)
             goto err;
+
+        if (global_state.mr_endpoint &&
+            (rc = fi_mr_bind(mr, &ep->fid, 0)) != 0) {
+            hlog_fast(err, "%s: fi_mr_bind: %s", __func__,
+                fi_strerror(-rc));
+            goto err;
+        }
+
+        if (global_state.mr_endpoint &&
+            (rc = fi_mr_enable(mr)) != 0) {
+            hlog_fast(err, "%s: fi_mr_enable: %s", __func__,
+                fi_strerror(-rc));
+            goto err;
+        }
 
         for (j = 0; j < nsegs; j++) {
             hlog_fast(memreg, "filling descriptor %zu", i * maxsegs + j);
@@ -1234,8 +1310,8 @@ rxctl_post(cxn_t *c, rxctl_t *ctl, bufhdr_t *h)
         , .desc = &h->desc
         , .iov_count = 1
         , .addr = c->peer_addr
-        , .tag = tag
-        , .ignore = ctl->ignore
+        , .tag = tag & ~ctl->ignore
+        , .ignore = 0
         , .context = &h->xfc.ctx
         , .data = 0
         }, FI_COMPLETION);
@@ -1325,7 +1401,7 @@ txctl_put(txctl_t *ctl, bufhdr_t *h)
 
 static void
 txctl_init(txctl_t *ctl, size_t len, size_t nbufs,
-    bufhdr_t *(*create_and_register)(void))
+    bufhdr_t *(*create_and_register)(struct fid_ep *), struct fid_ep *ep)
 {
     size_t i;
 
@@ -1350,7 +1426,7 @@ txctl_init(txctl_t *ctl, size_t len, size_t nbufs,
     }
 
     for (i = 0; i < nbufs; i++) {
-        bufhdr_t *h = create_and_register();
+        bufhdr_t *h = create_and_register(ep);
 
         if (!buflist_put(ctl->pool, h))
             errx(EXIT_FAILURE, "%s: vector buffer pool full", __func__);
@@ -1439,7 +1515,7 @@ txctl_transmit(cxn_t *c, txctl_t *tc)
             , .desc = h->desc
             , .iov_count = 1
             , .addr = c->peer_addr
-            , .tag = h->tag
+            , .tag = h->tag & ~tc->ignore
             , .ignore = 0
             , .context = &h->xfc.ctx
             , .data = 0
@@ -1474,7 +1550,7 @@ rcvr_start(worker_t *w, rcvr_t *r, fifo_t *ready_for_cxn)
     }
 
     for (nleftover = sizeof(txbuf), nloaded = 0; nleftover > 0; ) {
-        bytebuf_t *b = worker_payload_rxbuf_get(w);
+        bytebuf_t *b = worker_payload_rxbuf_get(w, r->cxn.ep);
 
         if (b == NULL) {
             hlog_fast(err, "%s: could not get a buffer", __func__);
@@ -1754,7 +1830,8 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
             h->nused = 0;
 
             if (global_state.reregister &&
-                (rc = buf_mr_reg(global_state.domain, payload_access.rx,
+                (rc = buf_mr_reg(global_state.domain, r->cxn.ep,
+                                 payload_access.rx,
                                  seqsource_get(&r->cxn.keys), h)) < 0)
                 bailout_for_ofi_ret(rc, "payload memory registration failed");
 
@@ -1948,11 +2025,18 @@ xmtr_ack_rx_process(xmtr_t *x, completion_t *cmpl)
 
     if (rc < 0)
         bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p", x->ack.msg.addr);
+    else if (rc != 1) {
+        errx(EXIT_FAILURE, "%s: inserted %d addresses, expected 1",
+            __func__, rc);
+    }
+
+    hlog_fast(addr, "xmtr %p registered address %jx",
+        (void *)x, (uintmax_t)x->cxn.peer_addr);
 
     while (rxctl_ready(&x->vec)) {
         vecbuf_t *vb = vecbuf_alloc();
 
-        rc = buf_mr_reg(global_state.domain, FI_RECV,
+        rc = buf_mr_reg(global_state.domain, x->cxn.ep, FI_RECV,
             seqsource_get(&x->cxn.keys), &vb->hdr);
 
         if (rc < 0)
@@ -1972,7 +2056,7 @@ xmtr_start(worker_t *w, xmtr_t *x, fifo_t *ready_for_terminal)
     x->cxn.started = true;
 
     while (!fifo_full(ready_for_terminal)) {
-        bytebuf_t *b = worker_payload_txbuf_get(w);
+        bytebuf_t *b = worker_payload_txbuf_get(w, x->cxn.ep);
 
         if (b == NULL)
             errx(EXIT_FAILURE, "%s: could not get a buffer", __func__);
@@ -2418,7 +2502,7 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
             head->xfc.nchildren = 0;
 
         if (global_state.reregister && x->fragment.offset == 0 &&
-            (rc = buf_mr_reg(global_state.domain, payload_access.tx,
+            (rc = buf_mr_reg(global_state.domain, x->cxn.ep, payload_access.tx,
                              seqsource_get(&x->cxn.keys), head)) < 0)
             bailout_for_ofi_ret(rc, "payload memory registration failed");
 
@@ -2618,25 +2702,53 @@ xmtr_loop(worker_t *w, session_t *s)
     return loop_continue;
 }
 
+static void
+session_shutdown(session_t *s)
+{
+    bufhdr_t *h;
+    cxn_t *cxn = s->cxn;
+    int rc;
+
+    while ((h = fifo_alt_get(s->ready_for_cxn)) != NULL ||
+           (h = fifo_alt_get(s->ready_for_terminal)) != NULL) {
+        buf_mr_dereg(h);
+        buf_free(h);
+    }
+    if ((rc = fi_close(&cxn->cq->fid)) < 0) {
+        hlog_fast(err, "%s: could not fi_close CQ: %s",
+            __func__, fi_strerror(-rc));
+    }
+    if ((rc = fi_close(&cxn->av->fid)) < 0) {
+        hlog_fast(err, "%s: could not fi_close AV: %s",
+            __func__, fi_strerror(-rc));
+    }
+    if ((rc = fi_close(&cxn->ep->fid)) < 0) {
+#if 0
+        bailout_for_ofi_ret(rc, "fi_close (cxn endpoint)");
+#else
+        hlog_fast(err, "%s: could not fi_close endpoint: %s",
+            __func__, fi_strerror(-rc));
+#endif
+    }
+}
+
 static loop_control_t
 cxn_loop(worker_t *w, session_t *s)
 {
-    int rc;
     cxn_t *cxn = s->cxn;
     const loop_control_t ctl = cxn->loop(w, s);
 
     switch (ctl) {
     case loop_end:
     case loop_error:
-        if ((rc = fi_close(&cxn->ep->fid)) < 0)
-            bailout_for_ofi_ret(rc, "fi_close");
-        hlog_fast(close, "%s: closed.", __func__);
+        cxn->cancel(cxn);
+        cxn->cancelled = true;
+        hlog_fast(close, "%s: shutting down.", __func__);
         break;
     case loop_continue:
         if (cxn->cancelled) {
             if (cxn->cancellation_complete(cxn)) {
-                if ((rc = fi_close(&cxn->ep->fid)) < 0)
-                    bailout_for_ofi_ret(rc, "fi_close");
+                session_shutdown(s);
                 hlog_fast(close, "%s: closed.", __func__);
                 return loop_canceled;
             }
@@ -2816,14 +2928,16 @@ worker_run_loop(worker_t *self)
         if (global_state.waitfd) {
             ncontexts = extract_contexts_for_half(session_half, events, nevents,
                 context, waitable);
-        } else {
+        } else if (self->pollable) {
             ncontexts = fi_poll(self->pollset[half], context,
                 WORKER_SESSIONS_MAX);
-        }
-
-        if (ncontexts < 0) {
-            (void)pthread_mutex_unlock(mtx);
-            bailout_for_ofi_ret(ncontexts, "fi_poll");
+            if (ncontexts < 0) {
+                (void)pthread_mutex_unlock(mtx);
+                bailout_for_ofi_ret(ncontexts, "fi_poll");
+            }
+        } else {
+            ncontexts = extract_contexts_for_half(session_half, NULL, 0,
+                context, false);
         }
 
         /* TBD move this down, use the total number ready regardless of
@@ -2990,7 +3104,8 @@ worker_run_loop(worker_t *self)
             c->parent = NULL;
             *cp = NULL;
 
-            if ((rc = fi_poll_del(self->pollset[half], &c->cq->fid, 0)) != 0)
+            if (self->pollable &&
+                (rc = fi_poll_del(self->pollset[half], &c->cq->fid, 0)) != 0)
                 bailout_for_ofi_ret(rc, "fi_poll_del");
 
             if (!global_state.waitfd)
@@ -3143,14 +3258,19 @@ worker_init(worker_t *w)
     else if ((w->epoll_fd = epoll_create(1)) == -1)
         err(EXIT_FAILURE, "%s.%d: epoll_create", __func__, __LINE__);
 
+    w->pollable = true;
     for (i = 0; i < arraycount(w->mtx); i++) {
         if ((rc = pthread_mutex_init(&w->mtx[i], NULL)) != 0) {
             errx(EXIT_FAILURE, "%s.%d: pthread_mutex_init: %s",
                 __func__, __LINE__, strerror(rc));
         }
         if ((rc = fi_poll_open(global_state.domain, &attr,
-                               &w->pollset[i])) != 0)
+                               &w->pollset[i])) == -FI_ENOSYS) {
+            w->pollable = false;
+            break;
+        } else if (rc != 0) {
             bailout_for_ofi_ret(rc, "fi_poll_open");
+        }
     }
     for (i = 0; i < arraycount(w->session); i++)
         w->session[i] = (session_t){.cxn = NULL, .terminal = NULL};
@@ -3332,7 +3452,9 @@ worker_assign_session(worker_t *w, session_t s)
             *slot = s;
             slot->cxn->parent = slot;
 
-            rc = fi_poll_add(w->pollset[half], &s.cxn->cq->fid, 0);
+            rc = w->pollable
+                ? fi_poll_add(w->pollset[half], &s.cxn->cq->fid, 0)
+                : 0;
 
             if (rc != 0)
                 bailout_for_ofi_ret(rc, "fi_poll_add");
@@ -3519,25 +3641,25 @@ xmtr_memory_init(xmtr_t *x)
 }
 
 static bufhdr_t *
-progbuf_create_and_register(void)
+progbuf_create_and_register(struct fid_ep *ep)
 {
     progbuf_t *pb = progbuf_alloc();
     int rc;
 
-    rc = buf_mr_reg(global_state.domain, FI_SEND,
+    rc = buf_mr_reg(global_state.domain, ep, FI_SEND,
         seqsource_get(&global_state.keys), &pb->hdr);
 
     if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_mr_reg");
+        bailout_for_ofi_ret(rc, "buf_mr_reg");
 
     return &pb->hdr;
 }
 
+/* First stage of initialization, no endpoint (x->cxn.ep) necessary. */
 static void
 xmtr_init(xmtr_t *x, struct fid_av *av)
 {
     const size_t maxposted = 64;
-    size_t i;
 
     memset(x, 0, sizeof(*x));
 
@@ -3553,8 +3675,16 @@ xmtr_init(xmtr_t *x, struct fid_av *av)
             "%s: could not create posted RDMA writes FIFO", __func__);
     }
     rxctl_init(&x->vec, 64);
+}
 
-    txctl_init(&x->progress, 64, 16, progbuf_create_and_register);
+/* Second stage initialization needs an endpoint (x->cxn.ep). */
+static void
+xmtr_buffers_init(xmtr_t *x)
+{
+    const size_t maxposted = 64;
+    size_t i;
+
+    txctl_init(&x->progress, 64, 16, progbuf_create_and_register, x->cxn.ep);
 
     if ((x->fragment.pool = buflist_create(maxposted)) == NULL) {
         errx(EXIT_FAILURE,
@@ -3597,7 +3727,7 @@ source_init(source_t *s)
 }
 
 static void
-rcvr_memory_init(rcvr_t *r)
+rcvr_initial_msg_init(rcvr_t *r, struct fid_ep *listen_ep)
 {
     int rc;
 
@@ -3609,12 +3739,19 @@ rcvr_memory_init(rcvr_t *r)
             __func__, r->initial.niovs);
     }
 
-    rc = mr_regv_all(global_state.domain, r->initial.iov, r->initial.niovs,
+    rc = mr_regv_all(global_state.domain, listen_ep,
+        r->initial.iov, r->initial.niovs,
         minsize(2, global_state.mr_maxsegs), FI_RECV, 0, &global_state.keys, 0,
         r->initial.mr, r->initial.desc, r->initial.raddr, NULL);
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "mr_regv_all");
+}
+
+static void
+rcvr_ack_msg_init(rcvr_t *r, struct fid_ep *ep)
+{
+    int rc;
 
     r->ack.niovs = fibonacci_iov_setup(&r->ack.msg,
         sizeof(r->ack.msg), r->ack.iov, global_state.rx_maxsegs);
@@ -3624,7 +3761,7 @@ rcvr_memory_init(rcvr_t *r)
             __func__, r->ack.niovs);
     }
 
-    rc = mr_regv_all(global_state.domain, r->ack.iov, r->ack.niovs,
+    rc = mr_regv_all(global_state.domain, ep, r->ack.iov, r->ack.niovs,
         minsize(2, global_state.mr_maxsegs), FI_RECV, 0, &global_state.keys, 0,
         r->ack.mr, r->ack.desc, r->ack.raddr, NULL);
 
@@ -3633,27 +3770,27 @@ rcvr_memory_init(rcvr_t *r)
 }
 
 static bufhdr_t *
-vecbuf_create_and_register(void)
+vecbuf_create_and_register(struct fid_ep *ep)
 {
     vecbuf_t *vb = vecbuf_alloc();
     int rc;
 
-    rc = buf_mr_reg(global_state.domain, FI_SEND,
+    rc = buf_mr_reg(global_state.domain, ep, FI_SEND,
         seqsource_get(&global_state.keys), &vb->hdr);
 
     if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_mr_reg");
+        bailout_for_ofi_ret(rc, "buf_mr_reg");
 
     return &vb->hdr;
 }
 
 static void
-rcvr_init(rcvr_t *r, struct fid_av *av)
+rcvr_init(rcvr_t *r, struct fid_ep *listen_ep, struct fid_av *av)
 {
     memset(r, 0, sizeof(*r));
 
     cxn_init(&r->cxn, av, rcvr_loop, rcvr_cancel, rcvr_cancellation_complete);
-    rcvr_memory_init(r);
+    rcvr_initial_msg_init(r, listen_ep);
 
     if ((r->tgtposted = fifo_create(64)) == NULL) {
         errx(EXIT_FAILURE,
@@ -3661,8 +3798,12 @@ rcvr_init(rcvr_t *r, struct fid_av *av)
     }
 
     rxctl_init(&r->progress, 64);
+}
 
-    txctl_init(&r->vec, 64, 16, vecbuf_create_and_register);
+static void
+rcvr_buffers_init(rcvr_t *r)
+{
+    txctl_init(&r->vec, 64, 16, vecbuf_create_and_register, r->cxn.ep);
 }
 
 /* Post a receive for the initial message for session `gs`
@@ -3755,6 +3896,9 @@ get_session_accept(get_state_t *gst)
     if (rc < 0) {
         bailout_for_ofi_ret(rc, "fi_av_insert initial.msg.addr %p",
             r->initial.msg.addr);
+    } else if (rc != 1) {
+        errx(EXIT_FAILURE, "%s: inserted %d addresses, expected 1",
+            __func__, rc);
     }
 
     struct fi_info *ep_info, *hints = fi_dupinfo(global_state.info);
@@ -3812,6 +3956,81 @@ get_session_accept(get_state_t *gst)
     return gs;
 }
 
+uint8_t *
+hex_string_to_bytes(const char *inbuf, size_t *nbytesp)
+{
+    uint8_t *outbuf;
+    const char *p;
+    size_t i, inbuflen = strlen(inbuf), nbytes;
+    int nconverted;
+
+    if (inbuflen == 0) {
+        if (nbytesp != NULL)
+            *nbytesp = 0;
+        /* Avoid returning NULL here, NULL is reserved to indicate an error. */ 
+        return malloc(1);
+    }
+
+    if ((inbuflen + 1) % 3 != 0)
+        return NULL;
+
+    nbytes = (inbuflen + 1) / 3;
+    if ((outbuf = malloc(nbytes)) == NULL)
+        return NULL;
+
+    if (sscanf(inbuf, "%02" SCNx8 "%n", &outbuf[0], &nconverted) != 1 ||
+        nconverted != 2)
+        goto fail;
+
+    for (p = &inbuf[nconverted], i = 1; i < nbytes; i++, p += nconverted) {
+        if (sscanf(p, ":%02" SCNx8 "%n", &outbuf[i], &nconverted) != 1 ||
+            nconverted != 3)
+            goto fail;
+    }
+
+    if (nbytesp != NULL)
+        *nbytesp = nbytes;
+
+    return outbuf;
+fail:
+    free(outbuf);
+    return NULL;
+}
+
+static char *
+bytes_to_hex_string(const uint8_t *inbuf, size_t inbuflen)
+{
+    char *outbuf, *p;
+    const char *delim;
+    size_t i, nempty, outbuflen;
+    int nprinted;
+
+    if (inbuflen == 0)
+        return strdup("");
+
+    /* sizeof("ff") includes the terminating NUL, thus `outbuflen`
+     * accounts for the colon delimiters between hex octets and
+     * the NUL at the end of string.
+     */
+    outbuflen = inbuflen * sizeof("ff");
+
+    if ((outbuf = malloc(outbuflen)) == NULL)
+        return NULL;
+
+    for (p = outbuf, nempty = outbuflen, delim = "", i = 0;
+         i < inbuflen;
+         i++, delim = ":", p += nprinted, nempty -= (size_t)nprinted) {
+
+        nprinted = snprintf(p, nempty, "%s%02" PRIx8, delim, inbuf[i]);
+
+        if (nprinted < 0 || (size_t)nprinted >= nempty) {
+            free(outbuf);
+            return NULL;
+        }
+    }
+    return outbuf;
+}
+
 static put_state_t *
 put_state_open(void)
 {
@@ -3840,12 +4059,40 @@ put_state_open(void)
     if (rc != 0)
         bailout_for_ofi_ret(rc, "fi_av_open");
 
-    rc = fi_av_insert(pst->av, global_state.info->dest_addr, 1,
+    assert(global_state.peer_addr != NULL);
+
+    struct fi_info *addr_info, *hints = fi_dupinfo(global_state.info);
+
+    size_t nbytes;
+    uint8_t *addrbytes = hex_string_to_bytes(global_state.peer_addr, &nbytes);
+    if (addrbytes == NULL) {
+        errx(EXIT_FAILURE, "%s: could not decode hex address '%s'",
+            __func__, global_state.peer_addr);
+    }
+    hints->dest_addr = addrbytes;
+    hints->dest_addrlen = nbytes;
+    hints->addr_format = FI_FORMAT_UNSPEC;
+
+    rc = fi_getinfo(FI_VERSION(1, 13), NULL, NULL, 0, hints, &addr_info);
+
+    if (rc < 0) {
+        bailout_for_ofi_ret(rc, "fi_getinfo for peer_addr %s",
+            global_state.peer_addr);
+    }
+
+    hints->dest_addr = NULL;
+    hints->dest_addrlen = 0;
+    fi_freeinfo(hints);
+
+    rc = fi_av_insert(pst->av, addr_info->dest_addr, 1,
         &pst->peer_addr, 0, NULL);
 
     if (rc < 0) {
         bailout_for_ofi_ret(rc, "fi_av_insert dest_addr %p",
             global_state.info->dest_addr);
+    } else if (rc != 1) {
+        errx(EXIT_FAILURE, "%s: inserted %d addresses, expected 1 (%s)",
+            __func__, rc, global_state.peer_addr);
     }
 
     return pst;
@@ -3906,6 +4153,24 @@ get_state_open(void)
     if ((rc = fi_enable(gst->listen_ep)) != 0)
         bailout_for_ofi_ret(rc, "fi_enable");
 
+    struct {
+        uint8_t buf[512];
+        size_t len;
+    } raw;
+    raw.len = sizeof(raw.buf);
+
+    if ((rc = fi_getname(&gst->listen_ep->fid, raw.buf, &raw.len)) != 0)
+        bailout_for_ofi_ret(rc, "fi_getname");
+
+    if (raw.len > sizeof(raw.buf))
+        errx(EXIT_FAILURE, "%s: raw-address buffer too small", __func__);
+
+    char *hexstr = bytes_to_hex_string(raw.buf, raw.len);
+
+    printf("bound %s\n", hexstr);
+
+    free(hexstr);
+
     return gst;
 }
 
@@ -3927,7 +4192,7 @@ get(void)
         r = &gs->rcvr;
         s = &gs->sink;
 
-        rcvr_init(r, gst->av);
+        rcvr_init(r, gst->listen_ep, gst->av);
         sink_init(s);
 
         post_initial_rx(gst->listen_ep, gs);
@@ -3939,6 +4204,8 @@ get(void)
         r = &gs->rcvr;
         s = &gs->sink;
 
+        rcvr_ack_msg_init(r, r->cxn.ep);
+        rcvr_buffers_init(r);
         if (!session_init(&gs->sess, &r->cxn, &s->terminal))
             errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
     }
@@ -4000,6 +4267,8 @@ put_session_setup(put_state_t *pst, put_session_t *ps)
         bailout_for_ofi_ret(rc, "fi_enable");
 
     x->cxn.peer_addr = pst->peer_addr;
+    hlog_fast(addr, "%s: xmtr %p initial peer address %jx", __func__,
+        (void *)x, (uintmax_t)x->cxn.peer_addr);
 
     /* Setup initial message. */
     memset(&x->initial.msg, 0, sizeof(x->initial.msg));
@@ -4061,6 +4330,7 @@ put(void)
         if (!session_init(&ps->sess, &x->cxn, &s->terminal))
             errx(EXIT_FAILURE, "%s: failed to initialize session", __func__);
 
+        xmtr_buffers_init(x);
         put_session_setup(pst, ps);
     }
 
@@ -4082,7 +4352,7 @@ count_info(const struct fi_info *first)
     int count;
     const struct fi_info *info;
 
-    for (info = first, count = 1; (info = info->next) != NULL; count++) {
+    for (info = first, count = 0; info != NULL; count++, info = info->next) {
         hlog_fast(params, "%s: info %d provider \"%s\"",
             __func__, count, info->fabric_attr->prov_name);
     }
@@ -4110,7 +4380,7 @@ usage(personality_t personality, const char *progname)
         fprintf(stderr, "usage: %s [-c] [-g] [-k <k>] %s <address>\n",
             progname, common);
     } else {
-        fprintf(stderr, "usage: %s [-b <address>] [-c] %s\n", progname, common);
+        fprintf(stderr, "usage: %s [-c] %s\n", progname, common);
     }
 
     exit(EXIT_FAILURE);
@@ -4223,7 +4493,6 @@ main(int argc, char **argv)
 {
     sigset_t oldset, blockset, usr2set;
     struct fi_info *hints;
-    const char *addr = NULL;
     char *progname, *tmp;
     size_t i;
     int ecode, opt, ninput, rc;
@@ -4246,13 +4515,10 @@ main(int argc, char **argv)
     }
 
     const char *optstring =
-        (global_state.personality == get) ? "b:cn:p:rw" : "cgk:n:p:rw";
+        (global_state.personality == get) ? "cn:p:rw" : "cgk:n:p:rw";
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
-        case 'b':
-            addr = optarg;
-            break;
         case 'c':
             global_state.expect_cancellation = true;
             break;
@@ -4297,7 +4563,10 @@ main(int argc, char **argv)
     if (global_state.personality == put) {
         if (argc != 1)
             usage(global_state.personality, progname);
-        addr = argv[0];
+        if (strlen(argv[0]) >= sizeof(global_state.peer_addr_buf))
+            errx(EXIT_FAILURE, "destination address too long");
+        strcpy(global_state.peer_addr_buf, argv[0]);
+        global_state.peer_addr = global_state.peer_addr_buf;
     } else if (argc != 0)
         usage(global_state.personality, progname);
 
@@ -4323,13 +4592,17 @@ main(int argc, char **argv)
         errx(EXIT_FAILURE, "%s: fi_allocinfo", __func__);
 
     hints->ep_attr->type = FI_EP_RDM;
-    hints->caps = FI_MSG | FI_RMA | FI_REMOTE_WRITE | FI_WRITE;
+    hints->caps |= FI_MSG | FI_TAGGED;
+    hints->caps |= FI_RMA;
+    hints->caps |= FI_REMOTE_READ | FI_READ | FI_REMOTE_WRITE | FI_WRITE;
     hints->mode = FI_CONTEXT;
-    hints->domain_attr->mr_mode = FI_MR_PROV_KEY;
+    /* FI_MR_ENDPOINT is *required* by cxi; `FI_MR_UNSPEC` will not do. */
+    hints->domain_attr->mr_mode = FI_MR_ENDPOINT | FI_MR_PROV_KEY;
 
-    rc = fi_getinfo(FI_VERSION(1, 13), addr,
-        fget_fput_service_name,
-        (global_state.personality == get) ? FI_SOURCE : 0, hints,
+    hlog_fast(noisy_params, "hints:\n%s", fi_tostr(hints, FI_TYPE_INFO));
+
+    global_state.info = NULL;
+    rc = fi_getinfo(FI_VERSION(1, 13), NULL, NULL, 0, hints,
         &global_state.info);
 
     fi_freeinfo(hints);
@@ -4350,6 +4623,12 @@ main(int argc, char **argv)
 
     hlog_fast(params, "%d infos found", count_info(global_state.info));
 
+    hlog_fast(noisy_params, "global_state.info: %s",
+        fi_tostr(global_state.info, FI_TYPE_INFO));
+
+    if ((global_state.info->domain_attr->mr_mode & FI_MR_ENDPOINT) != 0)
+        global_state.mr_endpoint = true;
+
     if ((global_state.info->mode & FI_CONTEXT) != 0) {
         hlog_fast(params,
             "contexts must embed fi_context; good thing %s does that.",
@@ -4364,6 +4643,9 @@ main(int argc, char **argv)
 
     rc = fi_domain(global_state.fabric, global_state.info, &global_state.domain,
         NULL);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_domain");
 
     hlog_fast(params, "provider %s, memory-registration I/O vector limit %zu",
         global_state.info->fabric_attr->prov_name,
