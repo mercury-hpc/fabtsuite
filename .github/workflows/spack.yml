@@ -21,5 +21,10 @@ jobs:
 
     - name: Run a multi-line script
       run: |
-        ./spack/bin/spack install fabtsuite
-
+        . ./spack/share/spack/setup-env.sh
+        spack install fabtsuite
+        spack load fabtsuite
+        env
+        fabtget -b localhost &
+        fabtput localhost
+        
