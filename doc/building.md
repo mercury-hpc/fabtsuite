@@ -16,7 +16,7 @@ build their respective subprojects.  Ordinarily, one should build using
 the top-level script.
 
 The project relies on `gcc` to compile and `pkg-config` to find its
-single library dependency, `libfabric`.
+single library dependency, `libfabric` (>=1.13).
 
 Make sure that you have your
 `PKG_CONFIG_PATH` and `LD_LIBRARY_PATH` set correctly for `libfabric`.
@@ -39,8 +39,3 @@ time.  Run `mkcmake` to rebuild.
 
 Run `build.sh` each time the project sources change.  The entire project
 will be (re)built.
-
-# Next steps
-
-Eventually the project will be built with CMake and packaged with Spack,
-but as of 24 May 2022, it remains a `mk-configure` project.
