@@ -21,7 +21,7 @@
 
 ### Options
 
-* `-b *address*`: the **b**inding address.  Wait for connections on the
+* `-b `*`address`*`: the **b**inding address.  Wait for connections on the
   given address. `localhost` is usually appropriate when `fget` and
   `fput` run on the same host.  Otherwise, the name given by `hostname`
   or `hostname -f` is probably best.

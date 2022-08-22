@@ -1,7 +1,7 @@
 # Running the tests
 
 To start a test sequence, start the test script,
-`scripts/run-suite <hostname>`, replacing `<hostname>` either with the
+`scripts/run-suite <hostname>`, replacing `<hostname>` either with the
 name of the test host (e.g., `hostname` output) or with `localhost`.
 The script will run silently for a few minutes and then print a report
 like this one:
