@@ -40,10 +40,10 @@ runs.
   scatter-gather RDMA.
 
 * `-k `*`k`*: start only *k* transmit sessions.  Use this option with
-  `-n `*`n`*`.  *k* may not exceed *n*.
+  `-n `*`n`*.  *k* may not exceed *n*.
 
-* `-n *n*`: tell the peer to expect that between this process and the
+* `-n `*`n`*: tell the peer to expect that between this process and the
   other `fput` processes will establish *n* transmit sessions with the
-  peer.  Unless a `-k `*`k`*`` argument says otherwise, the new `fput`
+  peer.  Unless a `-k `*`k`* argument says otherwise, the new `fput`
   process will start all *n* sessions.
 
