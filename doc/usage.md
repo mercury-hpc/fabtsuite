@@ -4,7 +4,7 @@
 
 `fget [-b `*`address`*`] [-c] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w]`
 
-`fput [-c] [-g] [-k `*`k`*`] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w] `*`remote address`*``
+`fput [-c] [-g] [-k `*`k`*`] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w] `*`remote address`*
 
 ## common options
 
@@ -21,12 +21,12 @@
 
 ### Options
 
-* `-b `*`address`*`: the **b**inding address.  Wait for connections on the
+* `-b `*`address`*: the **b**inding address.  Wait for connections on the
   given address. `localhost` is usually appropriate when `fget` and
   `fput` run on the same host.  Otherwise, the name given by `hostname`
   or `hostname -f` is probably best.
 
-* `-p '`*`i`*` - `*`j`*`'`: pin worker threads to processors
+* `-p '`*`i`*` - `*`j`*`'`: **p**in worker threads to processors
   *i* through *j*.
 
 ## `fput`
