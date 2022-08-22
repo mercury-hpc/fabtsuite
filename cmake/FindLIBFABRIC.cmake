@@ -21,7 +21,7 @@ if(NOT (PC_LIBFABRIC_FOUND STREQUAL "IGNORE"))
     endif()
     set(PKG_CONFIG_USE_LIBFABRIC_CMAKE_PREFIX_PATH ON)
 
-    pkg_check_modules(PC_LIBFABRIC libfabric)
+    pkg_check_modules(PC_LIBFABRIC libfabric>=1.13)
     # LINK_LIBRARIES returns empty and doesn't give full path. Set library path.
     set(LIBFABRIC_LIBDIR ${PC_LIBFABRIC_LIBDIR})
 
@@ -65,4 +65,6 @@ if(LIBFABRIC_FOUND)
       )
     endif()
   endif()
+else()
+  message (FATAL_ERROR "Could not find a suitable version of libfabric (>=1.13)")
 endif()

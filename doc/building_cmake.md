@@ -2,7 +2,7 @@
 
 ## Dependencies
 
-`libfabric` is required.
+`libfabric` >= 1.13 is required.
 
 [Spack](https://spack.io/) users can use `spack install libfabric`.
 
