@@ -2811,11 +2811,11 @@ worker_run_loop(worker_t *self)
 
             session_t *s = c->parent;
             assert(s != NULL);
-
+#if 0
             ptrdiff_t sess_idx = s - session_half;
 
             assert(0 <= sess_idx && sess_idx < nsessions / 2);
-
+#endif
             sessions_swap(s, &session_half[i]);
         }
 
@@ -2871,7 +2871,7 @@ worker_run_loop(worker_t *self)
 
 #if 1
         session_t *ready_from = session_half;
-        bool stole = false;
+        // bool stole = false;
 #else
         session_t *ready_from;
         bool stole;
