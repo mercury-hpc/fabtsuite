@@ -22,5 +22,5 @@ Let's assume that everything is installed under `/tmp/usr/local`
 and you have write permission on /tmp/usr/local.
 
     cd /tmp/usr/local
-    ./scripts/run-suite localhost
+    ./bin/fabtrun localhost
 

@@ -27,4 +27,4 @@ jobs:
         env
         fabtget -b localhost &
         fabtput localhost
-        fabtrun
+        fabtrun localhost
