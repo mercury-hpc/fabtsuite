@@ -1,4 +1,8 @@
 # fabtsuite: a libfabric test suite
+[![check spelling](https://github.com/hyoklee/fabtsuite/actions/workflows/spell.yml/badge.svg)](https://github.com/hyoklee/fabtsuite/actions/workflows/spell.yml)
+[![cmake fabtsuite](https://github.com/hyoklee/fabtsuite/actions/workflows/cmake.yml/badge.svg)](https://github.com/hyoklee/fabtsuite/actions/workflows/cmake.yml)
+[![spack fabtsuite](https://github.com/hyoklee/fabtsuite/actions/workflows/spack.yml/badge.svg)](https://github.com/hyoklee/fabtsuite/actions/workflows/spack.yml)
+[![test latest libfabric](https://github.com/hyoklee/fabtsuite/actions/workflows/fabric.yml/badge.svg)](https://github.com/hyoklee/fabtsuite/actions/workflows/fabric.yml)
 
 This is a test suite for libfabric designed to exercise features
 having particular interest for the Mochi project.
