@@ -25,17 +25,17 @@ main(int argc, char **argv)
 
     while ((ch = getopt(argc, argv, "l:L:")) != -1) {
         switch (ch) {
-            case 'l':
-                if (hlog_set_state(optarg, HLOG_OUTLET_S_ON, false) == -1)
-                    err(EXIT_FAILURE, "could not enable outlet '%s'", optarg);
-                break;
-            case 'L':
-                if (hlog_set_state(optarg, HLOG_OUTLET_S_OFF, false) == -1)
-                    err(EXIT_FAILURE, "could not disable outlet '%s'", optarg);
-                break;
-            default:
-                usage(argv[0]);
-                break;
+        case 'l':
+            if (hlog_set_state(optarg, HLOG_OUTLET_S_ON, false) == -1)
+                err(EXIT_FAILURE, "could not enable outlet '%s'", optarg);
+            break;
+        case 'L':
+            if (hlog_set_state(optarg, HLOG_OUTLET_S_OFF, false) == -1)
+                err(EXIT_FAILURE, "could not disable outlet '%s'", optarg);
+            break;
+        default:
+            usage(argv[0]);
+            break;
         }
     }
 
