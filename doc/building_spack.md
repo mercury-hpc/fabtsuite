@@ -4,9 +4,6 @@
 
 Then, run the following commands to install and test.
 
-```
-spack install fabtsuite ^libfabric fabrics=rxm,tcp,udp,rxd
-spack load fabtsuite
-fabtrun localhost
-```
-
+    spack install fabtsuite ^libfabric fabrics=rxm,tcp,udp,rxd
+    spack load fabtsuite
+    fabtrun localhost
