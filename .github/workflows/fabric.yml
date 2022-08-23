@@ -41,7 +41,7 @@ jobs:
     - name: Run a multi-line script
       run: |
         . ./spack/share/spack/setup-env.sh
-        spack install libfabric@1.15.1 fabrics=rxm,tcp,udp,rxd
+        spack install libfabric@main fabrics=rxm,tcp,udp,rxd
         spack load libfabric
         spack view copy -i /tmp libfabric
         ls /tmp/lib/
@@ -50,7 +50,6 @@ jobs:
         cmake ..
         make
         sudo make install
-        which fabtrun
         fabtrun localhost
       env:
         LD_LIBRARY_PATH: /tmp/lib

@@ -22,9 +22,6 @@ jobs:
     - name: Run a multi-line script
       run: |
         . ./spack/share/spack/setup-env.sh
-        spack install fabtsuite ^libfabric@1.15.1 fabrics=rxm,tcp,udp,rxd
+        spack install fabtsuite ^libfabric fabrics=rxm,tcp,udp,rxd
         spack load fabtsuite
-        env
-        fabtget -b localhost &
-        fabtput localhost
         fabtrun localhost

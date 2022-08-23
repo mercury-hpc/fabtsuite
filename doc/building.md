@@ -1,3 +1,7 @@
+# Spack Users
+
+See [Building with Spack](building_spack.md).
+
 # CMake Users
 
 See [Building with CMake](building_cmake.md).
