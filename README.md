@@ -15,10 +15,10 @@ under `doc/.`
 
 The test program, which lives under `transfer/`, assumes either
 a server or client personality, depending on the name by which
-it is invoked.  Invoked as `fget`, it is the test server, and as `fput`,
+it is invoked.  Invoked as `fabtget`, it is the test server, and as `fabtput`,
 the test client.
 
-`scripts/run-suite` is the main test script.
+`scripts/fabtrun` is the main test script.
 
 `doc/building.md`, `doc/building_cmake.md`, and `doc/building_spack.md`
 tell how to build the project.
