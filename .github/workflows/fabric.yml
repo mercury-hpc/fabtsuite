@@ -41,7 +41,7 @@ jobs:
     - name: Run a multi-line script
       run: |
         . ./spack/share/spack/setup-env.sh
-        spack install libfabric@develop
+        spack install libfabric@main
         spack load libfabric
         spack view copy -i /tmp libfabric
         ls /tmp/lib/

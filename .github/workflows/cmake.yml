@@ -35,7 +35,7 @@ jobs:
     - name: Checkout Spack
       uses: actions/checkout@v2
       with:
-        repository: hyoklee/spack
+        repository: spack/spack
         path: ./spack
 
     - name: Run a multi-line script
