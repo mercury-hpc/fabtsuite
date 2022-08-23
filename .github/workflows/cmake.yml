@@ -41,9 +41,9 @@ jobs:
     - name: Run a multi-line script
       run: |
         . ./spack/share/spack/setup-env.sh
-        spack install libfabric
+        spack install libfabric fabrics=rxm,tcp,udp,rxd
         spack load libfabric
-        spack view copy /tmp libfabric
+        spack view copy -i /tmp libfabric
         ls /tmp/lib/
         ls
         mkdir build
