@@ -45,18 +45,12 @@ jobs:
         spack load libfabric
         spack view copy -i /tmp libfabric
         ls /tmp/lib/
-        ls
         mkdir build
         cd build
-        ls
         cmake ..
-        ls
         make
-        make DESTDIR=/tmp install
-        ls /tmp/
-        cd /tmp/usr/local
-        echo "/tmp/usr/local/bin" >> $GITHUB_PATH
-        env
-        ./bin/fabtrun localhost
+        sudo make install
+        which fabtrun
+        fabtrun localhost
       env:
         LD_LIBRARY_PATH: /tmp/lib
