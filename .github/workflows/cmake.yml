@@ -55,9 +55,8 @@ jobs:
         make DESTDIR=/tmp install
         ls /tmp/
         cd /tmp/usr/local
+        echo "/tmp/usr/local/bin" >> $GITHUB_PATH
         env
-        # ./scripts/run-suite localhost
-        ./bin/fabtget -b localhost &
-        ./bin/fabtput localhost
+        ./bin/fabtrun localhost
       env:
         LD_LIBRARY_PATH: /tmp/lib
