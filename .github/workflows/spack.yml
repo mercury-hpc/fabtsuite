@@ -28,4 +28,3 @@ jobs:
         fabtget -b localhost &
         fabtput localhost
         fabtrun
-	
