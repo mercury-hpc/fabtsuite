@@ -2,6 +2,10 @@ name: fix clang-format
 on: 
   workflow_dispatch:
   push:
+    paths-ignore:
+    - 'hlog/**'
+    - 'transfer/fget.c'
+  
 jobs:
   formatting-check:
     name: Formatting Check

@@ -1,6 +1,14 @@
 name: check clang-format
 on:
-  pull_request:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+    - 'hlog/**'
+    - 'transfer/fget.c'
+  pull_request:  
+    paths-ignore:
+    - 'hlog/**'
+    - 'transfer/fget.c'
 jobs:
   formatting-check:
     name: Formatting Check
