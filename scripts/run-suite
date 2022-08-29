@@ -9,7 +9,7 @@ nfail=0
 prog=$(basename $0)
 timed_out=no
 timeout_default=600
-cancel_timeout_default=3
+cancel_timeout_default=2
 
 bail()
 {
@@ -268,21 +268,28 @@ for flagset in $fget_flagset; do
 		fi
 	} > $tmpdir/fget.${flagset}.result 3>&2 &
 
+	pid=$!
+
 	fputcmd=$(counterpart_cmd_for_flagset $flagset ./transfer/fput)
 
 	while ! [ -e $tmpdir/addr ] && [ ${timed_out:-no} != yes ]; do
 		:	# spin rudely
 	done
+
+	failed=no
 	if [ ${timed_out:-no} = yes ]; then
-		break
-	fi
-	if ! $fputcmd $(cat $tmpdir/addr); then
-		echo fail > $tmpdir/fget.${flagset}.result
+		kill -9 $pid || true
+	elif ! $fputcmd $(cat $tmpdir/addr); then
+		failed=yes
 	fi
 
 	while ! wait; do
 		:
 	done
+
+	if [ ${failed} = yes ]; then
+		echo fail > $tmpdir/fget.${flagset}.result
+	fi
 
 	if [ ${timed_out:-no} = yes ]; then
 		break
@@ -299,19 +306,21 @@ for flagset in $fput_flagset; do
 
 	$fgetcmd &
 
+	pid=$!
+
 	while ! [ -e $tmpdir/addr ] && [ ${timed_out:-no} != yes ]; do
 		:	# spin rudely
 	done
 	if [ ${timed_out:-no} = yes ]; then
-		break
-	fi
-
-	{ if env $fputenv time -p /bin/sh -c "$fputcmd $(cat $tmpdir/addr) 2>&3" 2>&1 && ! random_fail && \
-	   [ ${timed_out:-no} = no ] ; then
-		echo ok
+		kill -9 $pid || true
 	else
-		echo fail
-	fi } > $tmpdir/fput.${flagset}.result 3>&2
+		{ if env $fputenv time -p /bin/sh -c "$fputcmd $(cat $tmpdir/addr) 2>&3" 2>&1 && ! random_fail && \
+		   [ ${timed_out:-no} = no ] ; then
+			echo ok
+		else
+			echo fail
+		fi } > $tmpdir/fput.${flagset}.result 3>&2
+	fi
 
 	while ! wait; do
 		:
