@@ -205,6 +205,7 @@ typedef struct {
 struct cxn {
     uint32_t magic;
     loop_control_t (*loop)(worker_t *, session_t *);
+    void (*shutdown)(cxn_t *);
     void (*cancel)(cxn_t *);
     bool (*cancellation_complete)(cxn_t *);
     struct fid_ep *ep;
@@ -224,6 +225,8 @@ struct cxn {
                          * sends an initial message to its peer
                          */
     bool cancelled;
+    bool ended;
+    loop_control_t end_reason;
     bool started;
     /* Receiver needs to send an empty vector.msg.niovs == 0 to close,
      * sender needs to send progress.msg.nleftover == 0, record having
@@ -301,9 +304,7 @@ typedef struct {
         void *desc[12];
         struct iovec iov2[12];
         void *desc2[12];
-        struct fid_mr *mr[12];
-        uint64_t raddr[12];
-        ssize_t niovs;
+        struct fid_mr *mr;
     } payload;
     struct {
         buflist_t *pool;    // unused fragment headers
@@ -476,6 +477,7 @@ HLOG_OUTLET_SHORT_DEFN(multitx, all);
 HLOG_OUTLET_SHORT_DEFN(session, all);
 HLOG_OUTLET_SHORT_DEFN(ooo, all);
 HLOG_OUTLET_SHORT_DEFN(addr, all);
+HLOG_OUTLET_SHORT_DEFN(poll, all);
 
 static const unsigned split_progress_interval = 2047;
 static const unsigned split_vector_interval = 15;
@@ -1005,7 +1007,19 @@ buf_mr_bind(bufhdr_t *h, struct fid_ep *ep)
 
     h->desc = fi_mr_desc(h->mr);
 
-    return rc;
+    return 0;
+}
+
+static int
+buf_mr_dereg(bufhdr_t *h)
+{
+    struct fid_mr *mr = h->mr;
+
+    if (mr == NULL)
+        return 0;
+
+    h->mr = NULL;
+    return fi_close(&mr->fid);
 }
 
 static int
@@ -1018,19 +1032,17 @@ buf_mr_reg(struct fid_domain *dom, struct fid_ep *ep,
     rc = fi_mr_reg(dom, &b->payload[0], h->nallocated, access, 0, key, 0,
         &h->mr, NULL);
 
-    if (rc != 0)
+    if (rc != 0) {
+        h->mr = NULL;
         return rc;
+    }
 
-    if ((rc = buf_mr_bind(h, ep)) != 0)
+    if ((rc = buf_mr_bind(h, ep)) != 0) {
+        (void)buf_mr_dereg(h);
         return rc;
+    }
 
     return 0;
-}
-
-static int
-buf_mr_dereg(bufhdr_t *h)
-{
-    return fi_close(&h->mr->fid);
 }
 
 static void
@@ -1105,7 +1117,7 @@ worker_payload_txbuf_get(worker_t *w, struct fid_ep *ep)
            paybuflist_replenish(&w->keys, payload_access.tx, w->paybufs.tx))
         ;   // do nothing
 
-    if ((rc = buf_mr_bind(&b->hdr, ep)) != 0) {
+    if (!global_state.reregister && (rc = buf_mr_bind(&b->hdr, ep)) != 0) {
         buflist_put(w->paybufs.tx, &b->hdr);
         return NULL;
     }
@@ -1126,7 +1138,7 @@ worker_payload_rxbuf_get(worker_t *w, struct fid_ep *ep)
            paybuflist_replenish(&w->keys, payload_access.rx, w->paybufs.rx))
         ;   // do nothing
 
-    if ((rc = buf_mr_bind(&b->hdr, ep)) != 0) {
+    if (!global_state.reregister && (rc = buf_mr_bind(&b->hdr, ep)) != 0) {
         buflist_put(w->paybufs.tx, &b->hdr);
         return NULL;
     }
@@ -1230,6 +1242,19 @@ err:
         (void)fi_close(&mrp[j]->fid);
 
     return rc;
+}
+
+static int
+mr_deregv_all(size_t niovs, size_t maxsegs, struct fid_mr **mrp)
+{
+    size_t i, nregs = (niovs + maxsegs - 1) / maxsegs;
+    int rc;
+
+    for (i = 0; i < nregs; i++) {
+        if ((rc = fi_close(&mrp[i]->fid)) < 0)
+            return rc;
+    }
+    return 0;
 }
 
 static inline bool
@@ -1830,6 +1855,7 @@ rcvr_vector_update(fifo_t *ready_for_cxn, rcvr_t *r)
 
             h->nused = 0;
 
+            /* TBD rebind */
             if (global_state.reregister &&
                 (rc = buf_mr_reg(global_state.domain, r->cxn.ep,
                                  payload_access.rx,
@@ -1868,7 +1894,7 @@ rcvr_targets_read(fifo_t *ready_for_terminal, rcvr_t *r)
             h->nused = h->nallocated;
             (void)fifo_get(r->tgtposted);
 
-            if (global_state.reregister && (rc = fi_close(&h->mr->fid)) != 0)
+            if (global_state.reregister && (rc = buf_mr_dereg(h)) != 0)
                 warn_about_ofi_ret(rc, "fi_close");
 
             (void)fifo_alt_put(ready_for_terminal, h);
@@ -1883,7 +1909,7 @@ rcvr_targets_read(fifo_t *ready_for_terminal, rcvr_t *r)
         h->nused != 0) {
         (void)fifo_get(r->tgtposted);
 
-        if (global_state.reregister && (rc = fi_close(&h->mr->fid)) != 0)
+        if (global_state.reregister && (rc = buf_mr_dereg(h)) != 0)
             warn_about_ofi_ret(rc, "fi_close");
 
         (void)fifo_alt_put(ready_for_terminal, h);
@@ -2396,7 +2422,7 @@ xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
 
             (void)fifo_get(x->wrposted);
 
-            if (reregister && (rc = fi_close(&h->mr->fid)) != 0)
+            if (reregister && (rc = buf_mr_dereg(h)) != 0)
                 warn_about_ofi_ret(rc, "fi_close");
 
             x->bytes_progress += h->nused;
@@ -2710,19 +2736,29 @@ session_shutdown(session_t *s)
     cxn_t *cxn = s->cxn;
     int rc;
 
+    if (cxn->shutdown != NULL)
+        cxn->shutdown(cxn);
+
+    assert(cxn->parent == s);
+    cxn->parent = NULL;
+    s->cxn = NULL;
+
     while ((h = fifo_alt_get(s->ready_for_cxn)) != NULL ||
            (h = fifo_alt_get(s->ready_for_terminal)) != NULL) {
         buf_mr_dereg(h);
         buf_free(h);
     }
+
     if ((rc = fi_close(&cxn->cq->fid)) < 0) {
-        hlog_fast(err, "%s: could not fi_close CQ: %s",
-            __func__, fi_strerror(-rc));
+        hlog_fast(err, "%s: could not fi_close CQ %p: %s",
+            __func__, (void *)&cxn->cq, fi_strerror(-rc));
     }
+#if 0
     if ((rc = fi_close(&cxn->av->fid)) < 0) {
         hlog_fast(err, "%s: could not fi_close AV: %s",
             __func__, fi_strerror(-rc));
     }
+#endif
     if ((rc = fi_close(&cxn->ep->fid)) < 0) {
 #if 0
         bailout_for_ofi_ret(rc, "fi_close (cxn endpoint)");
@@ -2743,15 +2779,15 @@ cxn_loop(worker_t *w, session_t *s)
     case loop_end:
     case loop_error:
         cxn->cancel(cxn);
-        cxn->cancelled = true;
+        cxn->ended = true;
+        cxn->end_reason = ctl;
         hlog_fast(close, "%s: shutting down.", __func__);
         break;
     case loop_continue:
-        if (cxn->cancelled) {
+        if (cxn->cancelled || cxn->ended) {
             if (cxn->cancellation_complete(cxn)) {
-                session_shutdown(s);
                 hlog_fast(close, "%s: closed.", __func__);
-                return loop_canceled;
+                return cxn->cancelled ? loop_canceled : cxn->end_reason;
             }
         } else if (global_state.cancelled) {
             cxn->cancel(cxn);
@@ -3048,7 +3084,7 @@ worker_run_loop(worker_t *self)
              i < ready_up_to - session_half;
              i++) {
             session_t *s;
-            cxn_t *c, **cp;
+            cxn_t *c;
             struct {
                 bool cxn_empty;
                 bool terminal_full;
@@ -3063,9 +3099,7 @@ worker_run_loop(worker_t *self)
                 break;
             }
 
-            cp = &s->cxn;
-
-            c = *cp;
+            c = s->cxn;
             assert(c != NULL);
 
             assert(stole || i < ncontexts ||
@@ -3102,12 +3136,13 @@ worker_run_loop(worker_t *self)
                 break;
             }
 
-            c->parent = NULL;
-            *cp = NULL;
-
             if (self->pollable &&
                 (rc = fi_poll_del(self->pollset[half], &c->cq->fid, 0)) != 0)
                 bailout_for_ofi_ret(rc, "fi_poll_del");
+            else {
+                hlog_fast(poll, "%s: removed CQ %p from worker %p poll set",
+                    __func__, (void *)&c->cq, (void *)self);
+            }
 
             if (!global_state.waitfd)
                 ;
@@ -3116,6 +3151,8 @@ worker_run_loop(worker_t *self)
                 err(EXIT_FAILURE, "%s.%d: epoll_ctl(,EPOLL_CTL_DEL,)",
                     __func__, __LINE__);
             }
+
+            session_shutdown(s);
 
             atomic_fetch_add_explicit(&self->nsessions[half], -1,
                 memory_order_relaxed);
@@ -3213,7 +3250,7 @@ paybuflist_destroy(buflist_t *bl)
     for (i = 0; i < bl->nfull; i++) {
         bufhdr_t *h = bl->buf[i];
 
-        if (!global_state.reregister && (rc = fi_close(&h->mr->fid)) != 0)
+        if (!global_state.reregister && (rc = buf_mr_dereg(h)) != 0)
             warn_about_ofi_ret(rc, "fi_close");
 
         free(h);
@@ -3599,12 +3636,14 @@ workers_join_all(void)
 static void
 cxn_init(cxn_t *c, struct fid_av *av,
     loop_control_t (*loop)(worker_t *, session_t *),
-    void (*cancel)(cxn_t *), bool (*cancellation_complete)(cxn_t *))
+    void (*cancel)(cxn_t *), bool (*cancellation_complete)(cxn_t *),
+    void (*shutdown)(cxn_t *))
 {
     memset(c, 0, sizeof(*c));
     c->magic = 0xdeadbeef;
     c->cancel = cancel;
     c->cancellation_complete = cancellation_complete;
+    c->shutdown = shutdown;
     c->loop = loop;
     c->av = av;
     c->sent_first = false;
@@ -3612,6 +3651,18 @@ cxn_init(cxn_t *c, struct fid_av *av,
     c->cancelled = false;
     c->eof.local = c->eof.remote = false;
     seqsource_init(&c->keys);
+}
+
+void
+xmtr_shutdown(cxn_t *c)
+{
+    xmtr_t *x = (xmtr_t *)c;
+    if (fi_close(&x->initial.mr->fid) < 0)
+        hlog_fast(err, "%s: could not close initial MR", __func__);
+    if (fi_close(&x->ack.mr->fid) < 0)
+        hlog_fast(err, "%s: could not close ack MR", __func__);
+    if (fi_close(&x->payload.mr->fid) < 0)
+        hlog_fast(err, "%s: could not close payload MR", __func__);
 }
 
 static void
@@ -3634,7 +3685,7 @@ xmtr_memory_init(xmtr_t *x)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 
     rc = fi_mr_reg(global_state.domain, txbuf, txbuflen,
-        FI_WRITE, 0, seqsource_get(&global_state.keys), 0, x->payload.mr,
+        FI_WRITE, 0, seqsource_get(&global_state.keys), 0, &x->payload.mr,
         NULL);
 
     if (rc != 0)
@@ -3669,7 +3720,8 @@ xmtr_init(xmtr_t *x, struct fid_av *av)
     x->phase = false;
     x->bytes_progress = 0;
 
-    cxn_init(&x->cxn, av, xmtr_loop, xmtr_cancel, xmtr_cancellation_complete);
+    cxn_init(&x->cxn, av, xmtr_loop, xmtr_cancel, xmtr_cancellation_complete,
+        xmtr_shutdown);
     xmtr_memory_init(x);
     if ((x->wrposted = fifo_create(maxposted)) == NULL) {
         errx(EXIT_FAILURE,
@@ -3750,6 +3802,31 @@ rcvr_initial_msg_init(rcvr_t *r, struct fid_ep *listen_ep)
 }
 
 static void
+rcvr_shutdown(cxn_t *c)
+{
+    bufhdr_t *h;
+    rcvr_t *r = (rcvr_t *)c;
+    session_t *s = c->parent;
+    int rc;
+
+    if (mr_deregv_all(r->initial.niovs, minsize(2, global_state.mr_maxsegs),
+                      r->initial.mr) < 0) {
+        hlog_fast(err, "%s: could not close initial MR", __func__);
+    }
+    if (mr_deregv_all(r->ack.niovs, minsize(2, global_state.mr_maxsegs),
+                      r->ack.mr) < 0) {
+        hlog_fast(err, "%s: could not close ack MR", __func__);
+    }
+    while ((h = fifo_get(r->tgtposted)) != NULL) {
+
+        if ((rc = buf_mr_dereg(h)) != 0)
+            warn_about_ofi_ret(rc, "buf_mr_dereg");
+
+        (void)fifo_alt_put(s-> ready_for_terminal, h);
+    }
+}
+
+static void
 rcvr_ack_msg_init(rcvr_t *r, struct fid_ep *ep)
 {
     int rc;
@@ -3790,7 +3867,8 @@ rcvr_init(rcvr_t *r, struct fid_ep *listen_ep, struct fid_av *av)
 {
     memset(r, 0, sizeof(*r));
 
-    cxn_init(&r->cxn, av, rcvr_loop, rcvr_cancel, rcvr_cancellation_complete);
+    cxn_init(&r->cxn, av, rcvr_loop, rcvr_cancel, rcvr_cancellation_complete,
+        rcvr_shutdown);
     rcvr_initial_msg_init(r, listen_ep);
 
     if ((r->tgtposted = fifo_create(64)) == NULL) {
