@@ -446,6 +446,7 @@ typedef struct {
     pthread_t main_thd;
     char peer_addr_buf[256];
     char *peer_addr;
+    char *address_filename;
 } state_t;
 
 HLOG_OUTLET_MEDIUM_DEFN(err, all, 0, HLOG_OUTLET_S_ON);
@@ -4098,6 +4099,52 @@ put_state_open(void)
     return pst;
 }
 
+static void
+emit_address(uint8_t *buf, size_t len)
+{
+    char *hexstr = bytes_to_hex_string(buf, len);
+    int fd;
+
+    FILE *file;
+    const char *address_filename = global_state.address_filename;
+    char template[] = "fget.XXXXXX";
+
+    if (address_filename == NULL) {
+        file = NULL;
+    } else if ((fd = mkstemp(template)) == -1) {
+        err(EXIT_FAILURE, "%s: mkstemp", __func__);
+    } else if ((file = fdopen(fd, "w")) == NULL)   // does not `dup(fd)`
+        err(EXIT_FAILURE, "%s: fdopen", __func__);
+
+    fprintf((file == NULL) ? stdout : file, "%s\n", hexstr);
+
+    free(hexstr);
+
+    if (file == NULL)
+        return;
+
+    fclose(file);  // closes `fd`
+    if (link(template, address_filename) == 0)
+        ;
+    else if (errno != EEXIST) {
+        (void)unlink(template);
+        err(EXIT_FAILURE, "%s: failed to move temporary file `%s` to `%s`",
+            __func__, template, address_filename);
+    } else if (unlink(address_filename) == -1) {
+        (void)unlink(template);
+        err(EXIT_FAILURE, "%s: failed to remove address file `%s`",
+            __func__, address_filename);
+    } else if (link(template, address_filename) == -1) {
+        (void)unlink(template);
+        err(EXIT_FAILURE, "%s: failed to move temporary file `%s` to `%s`",
+            __func__, template, address_filename);
+    }
+    if (unlink(template) == -1) {
+        warn("%s: failed to unlink temporary file `%s`",
+            __func__, template);
+    }
+}
+
 static get_state_t *
 get_state_open(void)
 {
@@ -4165,11 +4212,7 @@ get_state_open(void)
     if (raw.len > sizeof(raw.buf))
         errx(EXIT_FAILURE, "%s: raw-address buffer too small", __func__);
 
-    char *hexstr = bytes_to_hex_string(raw.buf, raw.len);
-
-    printf("bound %s\n", hexstr);
-
-    free(hexstr);
+    emit_address(raw.buf, raw.len);
 
     return gst;
 }
@@ -4374,13 +4417,15 @@ personality_to_name(personality_t p)
 static void
 usage(personality_t personality, const char *progname)
 {
-    const char *common = "[-n <n>] [-p '<i> - <j>' ] [-r] [-w]";
+    const char *common1 = "[-a <address-file>] [-c]";
+    const char *common2 = "[-n <n>] [-a <address-file>] [-p '<i> - <j>' ] "
+                          "[-r] [-w]";
 
     if (personality == put) {
-        fprintf(stderr, "usage: %s [-c] [-g] [-k <k>] %s <address>\n",
-            progname, common);
+        fprintf(stderr, "usage: %s %s [-g] [-k <k>] %s <address>\n",
+            progname, common1, common2);
     } else {
-        fprintf(stderr, "usage: %s [-c] %s\n", progname, common);
+        fprintf(stderr, "usage: %s %s %s\n", progname, common1, common2);
     }
 
     exit(EXIT_FAILURE);
@@ -4515,10 +4560,16 @@ main(int argc, char **argv)
     }
 
     const char *optstring =
-        (global_state.personality == get) ? "cn:p:rw" : "cgk:n:p:rw";
+        (global_state.personality == get) ? "a:cn:p:rw" : "a:cgk:n:p:rw";
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
+        case 'a':
+            if ((global_state.address_filename = strdup(optarg)) == NULL) {
+                err(EXIT_FAILURE, "%s: could not set address filename",
+                    __func__);
+            }
+            break;
         case 'c':
             global_state.expect_cancellation = true;
             break;
