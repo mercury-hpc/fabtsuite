@@ -11,6 +11,8 @@ CFLAGS+=$(LIBFABRIC_CFLAGS)
 CFLAGS+=-gdwarf-4 -std=c11
 CFLAGS+=-Wall -pedantic -Wextra -Werror
 CFLAGS+=-O3
+#CFLAGS+=-fsanitize=undefined
+#LDFLAGS+=-fsanitize=undefined
 CC=gcc
 SRCS=fget.c
 #WARNS=4

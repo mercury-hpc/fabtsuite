@@ -96,10 +96,14 @@ print_flagset_line()
 		default_realtime=${realtime}
 		printf "%-31.31s %8.2f %-24s %s\\n" "default" \
 		    $realtime - $result
+	elif [ $(dc -e "[[t] p q] st $default_realtime 0 =t [f] p q") = "t" ]
+	then
+		printf "%-31.31s %8.2f %-24s %s\\n" \
+		    "$(echo $flagset | sed 's/,/ /g')" $realtime - $result
 	else
 		printf "%-31.31s %8.2f %-24.0f %s\\n" \
-		    "$(echo $flagset | sed 's/,/ /g')" ${realtime} \
-		    $(echo "2 k $realtime $default_realtime / 100 * p" | dc) \
+		    "$(echo $flagset | sed 's/,/ /g')" $realtime \
+		    $(dc -e "2 k $realtime $default_realtime / 100 * p") \
 		    $result
 	fi
 }
