@@ -478,6 +478,7 @@ HLOG_OUTLET_SHORT_DEFN(session, all);
 HLOG_OUTLET_SHORT_DEFN(ooo, all);
 HLOG_OUTLET_SHORT_DEFN(addr, all);
 HLOG_OUTLET_SHORT_DEFN(poll, all);
+HLOG_OUTLET_SHORT_DEFN(leak, all);
 
 static const unsigned split_progress_interval = 2047;
 static const unsigned split_vector_interval = 15;
@@ -2750,22 +2751,12 @@ session_shutdown(session_t *s)
     }
 
     if ((rc = fi_close(&cxn->cq->fid)) < 0) {
-        hlog_fast(err, "%s: could not fi_close CQ %p: %s",
+        hlog_fast(leak, "%s: could not fi_close CQ %p: %s",
             __func__, (void *)&cxn->cq, fi_strerror(-rc));
     }
-#if 0
-    if ((rc = fi_close(&cxn->av->fid)) < 0) {
-        hlog_fast(err, "%s: could not fi_close AV: %s",
-            __func__, fi_strerror(-rc));
-    }
-#endif
     if ((rc = fi_close(&cxn->ep->fid)) < 0) {
-#if 0
-        bailout_for_ofi_ret(rc, "fi_close (cxn endpoint)");
-#else
-        hlog_fast(err, "%s: could not fi_close endpoint: %s",
-            __func__, fi_strerror(-rc));
-#endif
+        hlog_fast(leak, "%s: could not fi_close endpoint %p: %s",
+            __func__, (void *)&cxn->ep, fi_strerror(-rc));
     }
 }
 
