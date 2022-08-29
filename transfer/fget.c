@@ -4417,15 +4417,16 @@ personality_to_name(personality_t p)
 static void
 usage(personality_t personality, const char *progname)
 {
-    const char *common1 = "[-a <address-file>] [-c]";
-    const char *common2 = "[-n <n>] [-a <address-file>] [-p '<i> - <j>' ] "
+    const char *common1 = "[-c]";
+    const char *common2 = "[-n <n>] [-p '<i> - <j>' ] "
                           "[-r] [-w]";
 
     if (personality == put) {
         fprintf(stderr, "usage: %s %s [-g] [-k <k>] %s <address>\n",
             progname, common1, common2);
     } else {
-        fprintf(stderr, "usage: %s %s %s\n", progname, common1, common2);
+        fprintf(stderr, "usage: %s [-a <address-file>] %s %s\n", progname,
+            common1, common2);
     }
 
     exit(EXIT_FAILURE);
@@ -4560,7 +4561,7 @@ main(int argc, char **argv)
     }
 
     const char *optstring =
-        (global_state.personality == get) ? "a:cn:p:rw" : "a:cgk:n:p:rw";
+        (global_state.personality == get) ? "a:cn:p:rw" : "cgk:n:p:rw";
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
