@@ -3712,8 +3712,8 @@ get_session_accept(get_state_t *gst)
         ncompleted = fi_cq_sread(gst->listen_cq, &completion, 1, NULL, -1);
         if (ncompleted == -FI_EINTR)
             hlog_fast(signal, "%s: fi_cq_sread interrupted", __func__);
-    } while (ncompleted == -FI_EAGAIN ||
-             (ncompleted == -FI_EINTR && !global_state.cancelled));
+    } while ((ncompleted == -FI_EAGAIN ||
+             ncompleted == -FI_EINTR) && !global_state.cancelled);
 
     if (global_state.cancelled)
         errx(EXIT_FAILURE, "caught a signal, exiting.");
@@ -4355,59 +4355,6 @@ main(int argc, char **argv)
             progname);
     }
 
-    rc = fi_fabric(global_state.info->fabric_attr, &global_state.fabric,
-        NULL /* app context */);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_fabric");
-
-    rc = fi_domain(global_state.fabric, global_state.info, &global_state.domain,
-        NULL);
-
-    hlog_fast(params, "provider %s, memory-registration I/O vector limit %zu",
-        global_state.info->fabric_attr->prov_name,
-        global_state.info->domain_attr->mr_iov_limit);
-
-    hlog_fast(params,
-        "provider %s %s application-requested memory-registration keys",
-        global_state.info->fabric_attr->prov_name,
-        ((global_state.info->domain_attr->mr_mode & FI_MR_PROV_KEY) != 0)
-            ? "does not support"
-            : "supports");
-
-    if ((global_state.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0) {
-        hlog_fast(params,
-            "provider %s RDMA uses virtual addresses instead of offsets, "
-            "quitting.", global_state.info->fabric_attr->prov_name);
-        exit(EXIT_FAILURE);
-    }
-
-    hlog_fast(params, "Rx/Tx I/O vector limits %zu/%zu",
-        global_state.info->rx_attr->iov_limit,
-        global_state.info->tx_attr->iov_limit);
-
-    hlog_fast(params, "RMA I/O vector limit %zu",
-        global_state.info->tx_attr->rma_iov_limit);
-
-    /* Always use 1 because there are problems with using mr_maxsegs > 1,
-     * i.e., global_state.info->domain_attr->mr_iov_limit.
-     */
-    global_state.mr_maxsegs = 1;
-    global_state.rx_maxsegs = 1;
-    global_state.tx_maxsegs = 1;
-    global_state.rma_maxsegs = global_state.contiguous
-        ? 1
-        : global_state.info->tx_attr->rma_iov_limit;
-
-    hlog_fast(params, "maximum endpoint message size (RMA limit) 0x%zx",
-        global_state.info->ep_attr->max_msg_size);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "fi_domain");
-
-    hlog_fast(params, "starting personality '%s'",
-        personality_to_name(global_state.personality));
-
     if (sigemptyset(&blockset) == -1)
         err(EXIT_FAILURE, "%s.%d: sigemptyset", __func__, __LINE__);
 
@@ -4464,6 +4411,59 @@ main(int argc, char **argv)
         ecode = EXIT_FAILURE;
         goto out;
     }
+
+    rc = fi_fabric(global_state.info->fabric_attr, &global_state.fabric,
+        NULL /* app context */);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_fabric");
+
+    rc = fi_domain(global_state.fabric, global_state.info, &global_state.domain,
+        NULL);
+
+    hlog_fast(params, "provider %s, memory-registration I/O vector limit %zu",
+        global_state.info->fabric_attr->prov_name,
+        global_state.info->domain_attr->mr_iov_limit);
+
+    hlog_fast(params,
+        "provider %s %s application-requested memory-registration keys",
+        global_state.info->fabric_attr->prov_name,
+        ((global_state.info->domain_attr->mr_mode & FI_MR_PROV_KEY) != 0)
+            ? "does not support"
+            : "supports");
+
+    if ((global_state.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0) {
+        hlog_fast(params,
+            "provider %s RDMA uses virtual addresses instead of offsets, "
+            "quitting.", global_state.info->fabric_attr->prov_name);
+        exit(EXIT_FAILURE);
+    }
+
+    hlog_fast(params, "Rx/Tx I/O vector limits %zu/%zu",
+        global_state.info->rx_attr->iov_limit,
+        global_state.info->tx_attr->iov_limit);
+
+    hlog_fast(params, "RMA I/O vector limit %zu",
+        global_state.info->tx_attr->rma_iov_limit);
+
+    /* Always use 1 because there are problems with using mr_maxsegs > 1,
+     * i.e., global_state.info->domain_attr->mr_iov_limit.
+     */
+    global_state.mr_maxsegs = 1;
+    global_state.rx_maxsegs = 1;
+    global_state.tx_maxsegs = 1;
+    global_state.rma_maxsegs = global_state.contiguous
+        ? 1
+        : global_state.info->tx_attr->rma_iov_limit;
+
+    hlog_fast(params, "maximum endpoint message size (RMA limit) 0x%zx",
+        global_state.info->ep_attr->max_msg_size);
+
+    if (rc != 0)
+        bailout_for_ofi_ret(rc, "fi_domain");
+
+    hlog_fast(params, "starting personality '%s'",
+        personality_to_name(global_state.personality));
 
     global_state.main_thd = pthread_self();
 
