@@ -9,7 +9,7 @@ nfail=0
 prog=$(basename $0)
 timed_out=no
 timeout_default=600
-cancel_timeout_default=3
+cancel_timeout_default=2
 
 bail()
 {
@@ -46,7 +46,7 @@ exit_handler()
 
 usage()
 {
-	echo "usage: ${prog} <hostname>" 1>&2
+	echo "usage: ${prog}" 1>&2
 	exit 1
 }
 
@@ -96,10 +96,14 @@ print_flagset_line()
 		default_realtime=${realtime}
 		printf "%-31.31s %8.2f %-24s %s\\n" "default" \
 		    $realtime - $result
+	elif [ $(dc -e "[[t] p q] st $default_realtime 0 =t [f] p q") = "t" ]
+	then
+		printf "%-31.31s %8.2f %-24s %s\\n" \
+		    "$(echo $flagset | sed 's/,/ /g')" $realtime - $result
 	else
 		printf "%-31.31s %8.2f %-24.0f %s\\n" \
-		    "$(echo $flagset | sed 's/,/ /g')" ${realtime} \
-		    $(echo "2 k $realtime $default_realtime / 100 * p" | dc) \
+		    "$(echo $flagset | sed 's/,/ /g')" $realtime \
+		    $(dc -e "2 k $realtime $default_realtime / 100 * p") \
 		    $result
 	fi
 }
@@ -240,56 +244,83 @@ if ! tmpdir=$(mktemp -d ${prog}.XXXXXX) ; then
 	exit 1
 fi
 
-if [ $# -ne 1 ]; then
+if [ $# -ne 0 ]; then
 	usage $0
 fi
 
-test_host=$1
-
 generic_flagset="default cancel cacheless reregister cacheless,reregister wait"
-fget_flagset=$generic_flagset
-fput_flagset="$generic_flagset contiguous contiguous,reregister"
-fput_flagset="$fput_flagset contiguous,reregister,cacheless"
+get_flagset=$generic_flagset
+put_flagset="$generic_flagset contiguous contiguous,reregister"
+put_flagset="$put_flagset contiguous,reregister,cacheless"
 
-for flagset in $fget_flagset; do
-	fgetenv=$(env_for_flagset $flagset)
-	fgetcmd=$(cmd_for_flagset $flagset "fabtget -b $test_host")
+for flagset in $get_flagset; do
+	genv=$(env_for_flagset $flagset)
+	gcmd=$(cmd_for_flagset $flagset "./transfer/fabtget -a $tmpdir/addr")
+
+	rm -f $tmpdir/addr
 
 	{
-		if env $fgetenv time -p /bin/sh -c "$fgetcmd 2>&3" 2>&1 && \
+		if env $genv time -p /bin/sh -c "$gcmd 2>&3" 2>&1 && \
                    ! random_fail && [ ${timed_out:-no} = no ] ; then
 			echo ok
 		else
 			echo fail
 		fi
-	} > $tmpdir/fget.${flagset}.result 3>&2 &
+	} > $tmpdir/get.${flagset}.result 3>&2 &
 
-	fputcmd=$(counterpart_cmd_for_flagset $flagset fabtput)
-	if ! $fputcmd $test_host; then
-		echo fail > $tmpdir/fget.${flagset}.result
+	pid=$!
+
+	pcmd=$(counterpart_cmd_for_flagset $flagset ./transfer/fabtput)
+
+	while ! [ -e $tmpdir/addr ] && [ ${timed_out:-no} != yes ]; do
+		:	# spin rudely
+	done
+
+	failed=no
+	if [ ${timed_out:-no} = yes ]; then
+		kill -9 $pid || true
+	elif ! $pcmd $(cat $tmpdir/addr); then
+		failed=yes
 	fi
 
 	while ! wait; do
 		:
 	done
 
+	if [ ${failed} = yes ]; then
+		echo fail > $tmpdir/get.${flagset}.result
+	fi
+
 	if [ ${timed_out:-no} = yes ]; then
 		break
 	fi
 done
 
-for flagset in $fput_flagset; do
-	fputenv=$(env_for_flagset $flagset)
-	fputcmd=$(cmd_for_flagset $flagset "fabtput")
-	fgetcmd=$(counterpart_cmd_for_flagset $flagset \
-	    fabtget -b $test_host)
-	$fgetcmd &
-	{ if env $fputenv time -p /bin/sh -c "$fputcmd $test_host 2>&3" 2>&1 && ! random_fail && \
-	   [ ${timed_out:-no} = no ] ; then
-		echo ok
+for flagset in $put_flagset; do
+	penv=$(env_for_flagset $flagset)
+	pcmd=$(cmd_for_flagset $flagset "./transfer/fabtput")
+	gcmd=$(counterpart_cmd_for_flagset $flagset \
+	    ./transfer/fabtget -a $tmpdir/addr)
+
+	rm -f $tmpdir/addr
+
+	$gcmd &
+
+	pid=$!
+
+	while ! [ -e $tmpdir/addr ] && [ ${timed_out:-no} != yes ]; do
+		:	# spin rudely
+	done
+	if [ ${timed_out:-no} = yes ]; then
+		kill -9 $pid || true
 	else
-		echo fail
-	fi } > $tmpdir/fput.${flagset}.result 3>&2
+		{ if env $penv time -p /bin/sh -c "$pcmd $(cat $tmpdir/addr) 2>&3" 2>&1 && ! random_fail && \
+		   [ ${timed_out:-no} = no ] ; then
+			echo ok
+		else
+			echo fail
+		fi } > $tmpdir/put.${flagset}.result 3>&2
+	fi
 
 	while ! wait; do
 		:
@@ -300,11 +331,11 @@ for flagset in $fput_flagset; do
 	fi
 done
 
-print_report fget
+print_report get
 
 echo 
 
-print_report fput
+print_report put
 
 print_footer
 
