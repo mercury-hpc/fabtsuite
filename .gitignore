@@ -20,8 +20,8 @@
 _mkc_*
 
 # Executables
-fget
-fput
+fabtget
+fabtput
 
 # vim swap files
 .*.swp
