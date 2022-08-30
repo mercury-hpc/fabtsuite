@@ -2948,9 +2948,7 @@ worker_run_loop(worker_t *self)
             session_t *s = c->parent;
             assert(s != NULL);
 
-            ptrdiff_t sess_idx = s - session_half;
-
-            assert(0 <= sess_idx && sess_idx < nsessions / 2);
+            assert(0 <= s - session_half && s - session_half < nsessions / 2);
 
             sessions_swap(s, &session_half[i]);
         }
@@ -3007,7 +3005,6 @@ worker_run_loop(worker_t *self)
 
 #if 1
         session_t *ready_from = session_half;
-        bool stole = false;
 #else
         session_t *ready_from;
         bool stole;
@@ -3051,8 +3048,8 @@ worker_run_loop(worker_t *self)
             c = s->cxn;
             assert(c != NULL);
 
-            assert(stole || i < ncontexts || !c->sent_first ||
-                   !fifo_empty(s->ready_for_terminal) ||
+            assert(/* stole || */ i < ncontexts ||
+                   !c->sent_first || !fifo_empty(s->ready_for_terminal) ||
                    global_state.cancelled);
 
             loop_control_t ctl = session_loop(self, s);
