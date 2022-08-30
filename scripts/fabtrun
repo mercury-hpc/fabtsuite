@@ -259,6 +259,10 @@ for flagset in $get_flagset; do
 
 	rm -f $tmpdir/addr
 
+	if [ ${timed_out:-no} = yes ]; then
+		break
+	fi
+
 	{
 		if env $genv time -p /bin/sh -c "$gcmd 2>&3" 2>&1 && \
                    ! random_fail && [ ${timed_out:-no} = no ] ; then
@@ -290,10 +294,6 @@ for flagset in $get_flagset; do
 	if [ ${failed} = yes ]; then
 		echo fail > $tmpdir/get.${flagset}.result
 	fi
-
-	if [ ${timed_out:-no} = yes ]; then
-		break
-	fi
 done
 
 for flagset in $put_flagset; do
@@ -303,6 +303,10 @@ for flagset in $put_flagset; do
 	    ./transfer/fabtget -a $tmpdir/addr)
 
 	rm -f $tmpdir/addr
+
+	if [ ${timed_out:-no} = yes ]; then
+		break
+	fi
 
 	$gcmd &
 
@@ -325,10 +329,6 @@ for flagset in $put_flagset; do
 	while ! wait; do
 		:
 	done
-
-	if [ ${timed_out:-no} = yes ]; then
-		break
-	fi
 done
 
 print_report get
