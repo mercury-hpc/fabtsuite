@@ -1,10 +1,10 @@
-# Usage of `fget` and `fput` commands
+# Usage of `fabtget` and `fabtput` commands
 
 ## Synopsis
 
-`fget [-b `*`address`*`] [-c] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w]`
+`fabtget [-b `*`address`*`] [-c] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w]`
 
-`fput [-c] [-g] [-k `*`k`*`] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w] `*`remote address`*``
+`fabtput [-c] [-g] [-k `*`k`*`] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w] `*`remote address`*
 
 ## common options
 
@@ -17,21 +17,21 @@
 * `-w`: **w**ait for I/O using `epoll_pwait(2)` instead of
   `fi_poll(3)`ing in a busy loop.
 
-## `fget`
+## `fabtget`
 
 ### Options
 
-* `-b *address*`: the **b**inding address.  Wait for connections on the
-  given address. `localhost` is usually appropriate when `fget` and
-  `fput` run on the same host.  Otherwise, the name given by `hostname`
+* `-b `*`address`*: the **b**inding address.  Wait for connections on the
+  given address. `localhost` is usually appropriate when `fabtget` and
+  `fabtput` run on the same host.  Otherwise, the name given by `hostname`
   or `hostname -f` is probably best.
 
-* `-p '`*`i`*` - `*`j`*`'`: pin worker threads to processors
+* `-p '`*`i`*` - `*`j`*`'`: **p**in worker threads to processors
   *i* through *j*.
 
-## `fput`
+## `fabtput`
 
-*`remote address`* tells the host where the peer `fget` process
+*`remote address`* tells the host where the peer `fabtget` process
 runs.
 
 ### Options
@@ -40,10 +40,10 @@ runs.
   scatter-gather RDMA.
 
 * `-k `*`k`*: start only *k* transmit sessions.  Use this option with
-  `-n `*`n`*`.  *k* may not exceed *n*.
+  `-n `*`n`*.  *k* may not exceed *n*.
 
-* `-n *n*`: tell the peer to expect that between this process and the
-  other `fput` processes will establish *n* transmit sessions with the
-  peer.  Unless a `-k `*`k`*`` argument says otherwise, the new `fput`
+* `-n `*`n`*: tell the peer to expect that between this process and the
+  other `fabtput` processes will establish *n* transmit sessions with the
+  peer.  Unless a `-k `*`k`* argument says otherwise, the new `fabtput`
   process will start all *n* sessions.
 

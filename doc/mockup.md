@@ -1,14 +1,14 @@
-Mockup `scripts/run-suite` output and some implementation notes.
+Mockup `scripts/fabtrune` output and some implementation notes.
  
 ```
-fget parameter set          duration (s) duration/default (%)     result
+fabtget parameter set          duration (s) duration/default (%)     result
 --------------------------------------------------------------------------
 default                             5.00 -                        ok
 reregister                          5.05 101                      ok
 cacheless                           5.00 100                      fail
 cacheless reregister                6.45 129                      ok
 
-fput parameter set          duration (s) duration/default (%)     result
+fabtput parameter set          duration (s) duration/default (%)     result
 --------------------------------------------------------------------------
 default                             5.00 -                        ok
 reregister                          5.05 101                      ok
@@ -34,10 +34,10 @@ key:
 11 tests, 7 succeeded, 4 failed
 ```
 
-Example Bourne shell script to print the fput results:
+Example Bourne shell script to print the fabtput results:
 
 ```
-printf "%-23s %16s %-24s %s\\n" "fput parameter set" "duration (s)" "duration/default (%)" "result"
+printf "%-23s %16s %-24s %s\\n" "fabtput parameter set" "duration (s)" "duration/default (%)" "result"
 printf -- "--------------------------------------------------------------------------\\n"
 printf "%-31.31s %8.2f %-24s %s\\n" "default" 5 - ok
 printf "%-31.31s %8.2f %-24.0f %s\\n" "reregister" 5.05 101 ok

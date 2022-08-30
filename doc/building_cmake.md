@@ -18,9 +18,9 @@ See [building.md](building.md) for the manual installation of libfabric.
 
 ## Test
 
-Let's assume that everything is installed under `/tmp/usr/local`
-and you have write permission on /tmp/usr/local.
+Let's assume that everything is installed under `/tmp/usr/local/bin`
+and you have *write* permission on your current working directory.
 
-    cd /tmp/usr/local
-    ./scripts/run-suite localhost
+    export PATH=/tmp/usr/local/bin:$PATH
+    fabtrun localhost
 

@@ -1,13 +1,13 @@
 # Running the tests
 
 To start a test sequence, start the test script,
-`scripts/run-suite <hostname>`, replacing `<hostname>` either with the
+`scripts/fabtrun <hostname>`, replacing `<hostname>` either with the
 name of the test host (e.g., `hostname` output) or with `localhost`.
 The script will run silently for a few minutes and then print a report
 like this one:
 
 ```
-fget parameter set          duration (s) duration/default (%)     result
+fabtget parameter set          duration (s) duration/default (%)     result
 --------------------------------------------------------------------------
 default                             5.58 -                        ok
 cancel                              3.01 53                       ok
@@ -15,7 +15,7 @@ cacheless                           5.88 105                      ok
 reregister                          6.40 114                      ok
 cacheless reregister                5.15 92                       ok
 
-fput parameter set          duration (s) duration/default (%)     result
+fabtput parameter set          duration (s) duration/default (%)     result
 --------------------------------------------------------------------------
 default                             5.27 -                        ok
 cancel                              3.00 56                       ok
@@ -48,20 +48,20 @@ pass/fail indication on the entire suite.
  
 # Test procedure
 
-`scripts/run-suite` operates the two programs under `transfer/`, `fget`
-and `fput`, using different combinations of parameters to independently
+`scripts/fabtrun` operates the two programs under `transfer/`, `fabtget`
+and `fabtput`, using different combinations of parameters to independently
 exercise different features and performance aspects of `libfabric`.
 
-`fget` is a server and `fput` is a client.  `fput` uses RDMA writes
-to send payloads to `fget`.  (In principle, `fget` could "pull" payloads
+`fabtget` is a server and `fabtput` is a client.  `fabtput` uses RDMA writes
+to send payloads to `fabtget`.  (In principle, `fabtget` could "pull" payloads
 using RDMA reads, but there are no RDMA reads, today.)
 
-`scripts/run-suite` runs tests in two stages, the `fget` test stage and
-the `fput` test stage.  In the `fget` test stage, the script runs through
-several parameter sets for `fget`.  Once for each `fget` parameter set,
-the script starts `fget` and an `fput` counterpart and waits for both to
-finish (or timeout).  In the `fput` test stage, the script runs through
-`fput` parameter sets, starting `fput` and an `fget` counterpart once
+`scripts/fabtrun` runs tests in two stages, the `fabtget` test stage and
+the `fabtput` test stage.  In the `fabtget` test stage, the script runs through
+several parameter sets for `fabtget`.  Once for each `fabtget` parameter set,
+the script starts `fabtget` and an `fabtput` counterpart and waits for both to
+finish (or timeout).  In the `fabtput` test stage, the script runs through
+`fabtput` parameter sets, starting `fabtput` and an `fabtget` counterpart once
 for each parameter set.  Counterparts are always started with default
 parameters.
 
@@ -79,14 +79,14 @@ A test's parameter set consists of one or more keywords (`cacheless`,
 `cancel`, `contiguous`, `reregister`), each of which changes the
 test's operating mode in some fashion from the default mode, or else
 the single keyword, `default`, for the test's default operating mode.
-Not all keywords apply to both `fget` and `fput`.  The keywords are
+Not all keywords apply to both `fabtget` and `fabtput`.  The keywords are
 fully described here:
 
 `default`: each RDMA buffer is registered once at the beginning of
     the test and reused without deregistration/reregistration.  Test
     programs are allowed to run until completion---i.e., it they are
     not canceled.  The memory-registration cache, if the provider
-    uses one, operates under default conditions. `fput` RDMA-writes
+    uses one, operates under default conditions. `fabtput` RDMA-writes
     multiple non-contiguous buffer segments at once using solitary
     `fi_writemsg(3)` calls.
 
@@ -104,15 +104,15 @@ fully described here:
     indications do not arrive, then the test will timeout; the script
     will show that the test failed.
 
-`contiguous`: configure `fput` to RDMA-write a single contiguous buffer
+`contiguous`: configure `fabtput` to RDMA-write a single contiguous buffer
     at a time.  I.e., use no gather RDMA.
 
     Generally we expect for `contiguous` mode to be slower than using
     gather RDMA.
 
-`reregister`: after each RDMA buffer is transmitted (`fput`) or after it is
-    emptied (`fget`), deregister it.  Re-register each buffer before reusing
-    it as an RDMA source (`fput`) or target (`fget`).
+`reregister`: after each RDMA buffer is transmitted (`fabtput`) or after it is
+    emptied (`fabtget`), deregister it.  Re-register each buffer before reusing
+    it as an RDMA source (`fabtput`) or target (`fabtget`).
     
     Generally we expect for deregistering and re-registering buffers to
     be slower than registering all buffers just once.

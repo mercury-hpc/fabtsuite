@@ -1,0 +1,56 @@
+name: cmake fabtsuite
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+    - 'doc/**'
+    - 'LICENSE'
+    - '**.md'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        name: ["Ubuntu Latest GCC"]
+        include:
+          - name: "Ubuntu Latest GCC"
+            artifact: "Linux.tar.xz"
+            os: ubuntu-latest
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    if: "!contains(github.event.head_commit.message, 'skip-ci')"
+          
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    - name: Install Dependencies (Linux)
+      run: |
+        sudo apt-get update -y
+      if: matrix.os == 'ubuntu-latest'
+    
+    # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+    - name: Get Sources
+      uses: actions/checkout@v2
+
+    - name: Checkout Spack
+      uses: actions/checkout@v2
+      with:
+        repository: spack/spack
+        path: ./spack
+
+    - name: Run a multi-line script
+      run: |
+        . ./spack/share/spack/setup-env.sh
+        spack install libfabric fabrics=rxm,tcp,udp,rxd
+        spack load libfabric
+        spack view copy -i /tmp libfabric
+        ls /tmp/lib/
+        mkdir build
+        cd build
+        cmake ..
+        make
+        sudo make install
+        which fabtrun
+        fabtrun localhost
+      env:
+        LD_LIBRARY_PATH: /tmp/lib
