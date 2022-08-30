@@ -276,13 +276,20 @@ for flagset in $get_flagset; do
 
 	pcmd=$(counterpart_cmd_for_flagset $flagset ./transfer/fabtput)
 
+	failed=no
+
+	# spin rudely
 	while ! [ -e $tmpdir/addr ] && [ ${timed_out:-no} != yes ]; do
-		:	# spin rudely
+		if [ "x$(cat $tmpdir/get.${flagset}.result)" = "xfail" ]; then
+			failed=yes
+			break
+		fi
 	done
 
-	failed=no
 	if [ ${timed_out:-no} = yes ]; then
 		kill -9 $pid || true
+	elif [ $failed = yes ]; then
+		: # already failed, do nothing
 	elif ! $pcmd $(cat $tmpdir/addr); then
 		failed=yes
 	fi
