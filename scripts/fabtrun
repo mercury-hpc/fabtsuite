@@ -1,4 +1,39 @@
 #!/bin/sh
+#
+# Notes about making this script, `fabtrun`, multi-node are labeled `MN`.
+#
+# MN: The general idea is that this script should have two operating
+# modes, call them "server" mode and "client" mode.  Where the existing
+# script starts an fabtget process and an fabtput process in each step,
+# the script in server mode would start one process in each step (e.g.,
+# fabtget).  A counterpart script in client mode would start the other
+# process in each step (e.g., fabtput).  Then server and client will
+# wait for the programs they started to finish or fail before moving on
+# to the next step.
+#
+# MN: Right now fabtrun creates a temporary directory when it starts.
+# It uses that temporary directory to save some state variables.
+# The client and server should share that directory.  The script that
+# kicks off the multi-node test probably should create the directory and tell
+# each client & server instance what the directory is called using an
+# environment variable or command-line parameter.
+#
+# MN: Currently, fabtrun performs runs every test step in two test
+# phases (one phase for get, one phase for put).  Then it produces
+# a report.  In one flexible approach to multi-node testing, each
+# client-mode/server-mode instance will run only a single step; then the
+# script that runs the batch job will synchronize through filesystem
+# fiddling or network messages; then the batch script will start each
+# instance on the next step.  In this way all steps, 1..n, are run.
+# Finally, the batch script can run step n+1, the reporting
+# step, on a solitary node, and capture the output.
+#
+# MN: To test multiple clients per server, fabtrun needs to be modified
+# to pass `-k` and `-n` to `fabtput` and `-n` to `fabtget`.
+# It may make the most sense to do that after making the other changes.
+#
+# See other `MN` markings, below, for more advice.
+#
 
 set -e
 set -u
@@ -236,6 +271,9 @@ trap usr1_handler USR1
 trap exit_handler EXIT HUP INT PIPE QUIT
 trap child_handler CHLD
 
+# MN: this is where the temporary directory that stores the script
+# state is created.
+
 if ! tmpdir=$(mktemp -d ${prog}.XXXXXX) ; then
 	echo "could not create temporary directory, bailing." 1>&2
 	exit 1
@@ -250,6 +288,14 @@ get_flagset=$generic_flagset
 put_flagset="$generic_flagset contiguous contiguous,reregister"
 put_flagset="$put_flagset contiguous,reregister,cacheless"
 
+#
+# MN: This is where fabtrun loops over every test step in the `get`
+# phase.  One quick & easy way to make the script run a solitary step,
+# `n`, is to just loop over all steps in both phases, counting up on a
+# variable `i` in each loop.  If `i == n` or if `n` was not provided,
+# then run the step; if `i != n`, then `continue`.  This preserves the
+# logic and code of the single-node script.  Just an idea.
+#
 for flagset in $get_flagset; do
 	genv=$(env_for_flagset $flagset)
 	gcmd=$(cmd_for_flagset $flagset "./transfer/fabtget -a $tmpdir/addr")
@@ -260,6 +306,9 @@ for flagset in $get_flagset; do
 		break
 	fi
 
+	#
+	# MN: start the `get` process.  Only do this in server mode.
+	#
 	{
 		{ env $genv time -p /bin/sh -c "$gcmd 2>&3" 2>&1 ; } \
 		    > $tmpdir/get-phase-get.${flagset}.timing 3>&2 &
@@ -281,6 +330,10 @@ for flagset in $get_flagset; do
 
 	pcmd=$(counterpart_cmd_for_flagset $flagset ./transfer/fabtput)
 
+	#
+	# MN: wait for the `get` process to get started.  Only do this
+	# in client mode.
+	#
 	while ! [ -e $tmpdir/addr ] && ! [ ${timed_out:-no} = yes ] && \
 	      ! grep -q fail $tmpdir/get-phase-get.${flagset}.result; do
 		: # spin rudely
@@ -297,6 +350,9 @@ for flagset in $get_flagset; do
 		continue
 	fi
 
+	#
+	# MN: in client mode, start the `put` process.
+	#
 	{
 		$pcmd $(cat $tmpdir/addr) &
 
@@ -319,6 +375,10 @@ for flagset in $get_flagset; do
 	done
 done
 
+#
+# MN: This is where fabtrun loops over every test step in the `put`
+# phase.
+#
 for flagset in $put_flagset; do
 	penv=$(env_for_flagset $flagset)
 	pcmd=$(cmd_for_flagset $flagset "./transfer/fabtput")
@@ -331,6 +391,9 @@ for flagset in $put_flagset; do
 		break
 	fi
 
+	#
+	# MN: in server mode, start the `get` process
+	#
 	{
 		$gcmd &
 
@@ -349,6 +412,9 @@ for flagset in $put_flagset; do
 
 	wgpid=$!
 
+	#
+	# MN: in client mode, wait for the `get` process to start.
+	#
 	while ! [ -e $tmpdir/addr ] && [ ${timed_out:-no} != yes ] && \
 	      ! grep -q fail $tmpdir/put-phase-get.${flagset}.result; do
 		:	# spin rudely
@@ -364,6 +430,9 @@ for flagset in $put_flagset; do
 		continue
 	fi
 
+	#
+	# MN: in client mode, start the `put` process
+	#
 	{
 		{ env $penv time -p /bin/sh -c \
 		  "$pcmd $(cat $tmpdir/addr) 2>&3" 2>&1 ; } \
@@ -376,18 +445,35 @@ for flagset in $put_flagset; do
 		then
 			echo ok
 		else
+			#
+			# MN: tricky!  If the `put` process fails, you need
+			# to stop the `get` process prematurely or else the
+			# test may hang until it times out.  Then you
+			# won't get a complete test report.  The client
+			# needs to indicate to the batch script and/or 
+			# the server that the `get` process should be killed
+			# off.
+			#
 			xargs kill -9 < $tmpdir/put-phase-get.${flagset}.pid \
 			    2> /dev/null || true
 			echo fail
 		fi
 	} > $tmpdir/put-phase-put.${flagset}.result &
 
+	#
+	# MN: this synchronization with `put` and `get` processes probably 
+	# needs to be performed by the batch script, since the exact details
+	# may vary based on the platform and batch-submission system.
+	#
 	echo "phase put, testing parameter set $flagset" 1>&2
 	while ! wait; do
 		echo "re-awaiting background processes for $flagset" 1>&2
 	done
 done
 
+#
+# MN: Print the report: step `n+1`.
+#
 print_report get
 
 echo 
@@ -396,6 +482,11 @@ print_report put
 
 print_footer
 
+#
+# MN: addendum to the report; the timed-out condition probably should
+# be written to the temporary directory or sent somehow over the network
+# so that it's globally available.
+#
 if [ ${timed_out:-no} != no ]; then
 	echo
 	echo "*** A timeout occurred before all tests were run. ***" 
