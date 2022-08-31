@@ -7,11 +7,11 @@
 #SBATCH -A CSC332_crusher
 #SBATCH -J fabtrun
 #SBATCH -o %x-%j.out
-#SBATCH -t 00:00:30
+#SBATCH -t 00:00:40
 #SBATCH -N 6
 srun -N1 -n1 ./fabtget1.sh &
 srun -N1 -n1 ./fabtget2.sh &
 srun -N2 -n2 ./fabtput1.sh &
 srun -N2 -n2 ./fabtput2.sh &
-sleep 20
+sleep 35
 
