@@ -7,7 +7,7 @@ Install it under the shared project directory called
 `/ccs/proj/csc332` that all nodes can read and write.
 
    make DESTDIR=/ccs/proj/csc332 install 
-   cd /ccs/proj/csc332/bin
+   cd /ccs/proj/csc332/usr/local/bin
    sbatch fabtrun.slurm
 
 The above test requires 6 nodes - 2 nodes for `fabtget` and 4 nodes for `fabtput`.
