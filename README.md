@@ -24,3 +24,4 @@ the test client.
 tell how to build the project.
 
 `doc/tests.md` describes the tests in this suite.
+`doc/tests_mn.md` describes how to run test using multiple nodes.
