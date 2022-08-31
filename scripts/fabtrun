@@ -68,26 +68,17 @@ random_fail()
 print_flagset_line()
 {
 	flagset=$1
+	result=$2
 	read kw_realtime realtime
-	if [ ${kw_realtime:-fail} = "fail" ]; then
-		ntests=$(($ntests + 1))
-		nfail=$(($nfail + 1))
-		printf "%-31.31s %8s %-24s %s\\n" \
-		    "$(echo $flagset | sed 's/,/ /g')" - - fail
-		return 1
-	fi
 	read discard || true
 	read discard || true
-	read result || true
-	if [ ${kw_realtime:-none} != "real" ]; then
-		ntests=$(($ntests + 1))
-		nfail=$(($nfail + 1))
-		printf "%-31.31s %8s %-24s %s\\n" \
-		    "$(echo $flagset | sed 's/,/ /g')" - - fail
-		return 1
-	fi
 	ntests=$(($ntests + 1))
-	if [ ${result:-none} = ok ]; then
+	if [ x${kw_realtime:-none} != xreal ]; then
+		nfail=$(($nfail + 1))
+		printf "%-31.31s %8s %-24s %s\\n" \
+		    "$(echo $flagset | sed 's/,/ /g')" - - fail
+		return 1
+	elif [ ${result:-none} = ok ]; then
 		npass=$(($npass + 1))
 	else
 		nfail=$(($nfail + 1))
@@ -219,11 +210,17 @@ HEADING_EOF
 
 	# rely on flagset `default` to be first, *wince*.
 	for flagset in $(eval echo \$${which}_flagset); do
-		if [ -e $tmpdir/${which}.${flagset}.result ]; then
+		result=$tmpdir/${which}-phase-${which}.${flagset}.result
+		timing=$tmpdir/${which}-phase-${which}.${flagset}.timing
+		if [ -e $timing ]
+		then
 			print_flagset_line $flagset \
-			    < $tmpdir/${which}.${flagset}.result || continue
+			    $(cat $result 2> /dev/null || echo fail) \
+			    < $timing || continue
 		else
-			print_flagset_line $flagset < /dev/null || continue
+			print_flagset_line $flagset \
+			    $(cat $result 2> /dev/null || echo fail) \
+			    < /dev/null || continue
 		fi
 	done
 }
@@ -264,43 +261,62 @@ for flagset in $get_flagset; do
 	fi
 
 	{
-		if env $genv time -p /bin/sh -c "$gcmd 2>&3" 2>&1 && \
-                   ! random_fail && [ ${timed_out:-no} = no ] ; then
+		{ env $genv time -p /bin/sh -c "$gcmd 2>&3" 2>&1 ; } \
+		    > $tmpdir/get-phase-get.${flagset}.timing 3>&2 &
+
+		pid=$!
+		echo $pid > $tmpdir/get-phase-get.${flagset}.pid
+
+		if wait $pid && ! random_fail && [ ${timed_out:-no} = no ]
+		then
 			echo ok
 		else
+			xargs kill -9 < $tmpdir/get-phase-put.${flagset}.pid \
+			    2> /dev/null || true
 			echo fail
 		fi
-	} > $tmpdir/get.${flagset}.result 3>&2 &
+	} > $tmpdir/get-phase-get.${flagset}.result &
 
-	pid=$!
+	wgpid=$!
 
 	pcmd=$(counterpart_cmd_for_flagset $flagset ./transfer/fabtput)
 
-	failed=no
-
-	# spin rudely
-	while ! [ -e $tmpdir/addr ] && [ ${timed_out:-no} != yes ]; do
-		if [ "x$(cat $tmpdir/get.${flagset}.result)" = "xfail" ]; then
-			failed=yes
-			break
-		fi
+	while ! [ -e $tmpdir/addr ] && ! [ ${timed_out:-no} = yes ] && \
+	      ! grep -q fail $tmpdir/get-phase-get.${flagset}.result; do
+		: # spin rudely
 	done
 
 	if [ ${timed_out:-no} = yes ]; then
-		kill -9 $pid || true
-	elif [ $failed = yes ]; then
-		: # already failed, do nothing
-	elif ! $pcmd $(cat $tmpdir/addr); then
-		failed=yes
+		xargs kill -9 < $tmpdir/get-phase-get.${flagset}.pid \
+		    2> /dev/null || true
+		wait $wgpid
+		continue
 	fi
 
+	if grep -q fail $tmpdir/get-phase-get.${flagset}.result; then
+		continue
+	fi
+
+	{
+		$pcmd $(cat $tmpdir/addr) &
+
+		pid=$!
+		echo $pid > $tmpdir/get-phase-put.${flagset}.pid
+
+		if wait $pid
+		then
+			echo ok
+		else
+			xargs kill -9 < $tmpdir/get-phase-get.${flagset}.pid \
+			    2> /dev/null || true
+			echo fail
+		fi
+	} > $tmpdir/get-phase-put.${flagset}.result &
+
+	echo "phase get, testing parameter set $flagset" 1>&2
 	while ! wait; do
-		:
+		echo "re-awaiting background processes for $flagset" 1>&2
 	done
-
-	if [ ${failed} = yes ]; then
-		echo fail > $tmpdir/get.${flagset}.result
-	fi
 done
 
 for flagset in $put_flagset; do
@@ -315,26 +331,60 @@ for flagset in $put_flagset; do
 		break
 	fi
 
-	$gcmd &
+	{
+		$gcmd &
 
-	pid=$!
+		pid=$!
+		echo $pid > $tmpdir/put-phase-get.${flagset}.pid
 
-	while ! [ -e $tmpdir/addr ] && [ ${timed_out:-no} != yes ]; do
-		:	# spin rudely
-	done
-	if [ ${timed_out:-no} = yes ]; then
-		kill -9 $pid || true
-	else
-		{ if env $penv time -p /bin/sh -c "$pcmd $(cat $tmpdir/addr) 2>&3" 2>&1 && ! random_fail && \
-		   [ ${timed_out:-no} = no ] ; then
+		if wait $pid
+		then
 			echo ok
 		else
+			xargs kill -9 < $tmpdir/put-phase-put.${flagset}.pid \
+			    2> /dev/null || true
 			echo fail
-		fi } > $tmpdir/put.${flagset}.result 3>&2
+		fi
+	} > $tmpdir/put-phase-get.${flagset}.result &
+
+	wgpid=$!
+
+	while ! [ -e $tmpdir/addr ] && [ ${timed_out:-no} != yes ] && \
+	      ! grep -q fail $tmpdir/put-phase-get.${flagset}.result; do
+		:	# spin rudely
+	done
+
+	if [ ${timed_out:-no} = yes ]; then
+		xargs kill -9 < $tmpdir/put-phase-get.${flagset}.pid || true
+		wait $wgpid
+		continue
 	fi
 
+	if grep -q fail $tmpdir/put-phase-get.${flagset}.result; then
+		continue
+	fi
+
+	{
+		{ env $penv time -p /bin/sh -c \
+		  "$pcmd $(cat $tmpdir/addr) 2>&3" 2>&1 ; } \
+		> $tmpdir/put-phase-put.${flagset}.timing 3>&2 &
+
+		pid=$!
+		echo $pid > $tmpdir/put-phase-put.${flagset}.pid
+
+		if wait $pid && ! random_fail && [ ${timed_out:-no} = no ]
+		then
+			echo ok
+		else
+			xargs kill -9 < $tmpdir/put-phase-get.${flagset}.pid \
+			    2> /dev/null || true
+			echo fail
+		fi
+	} > $tmpdir/put-phase-put.${flagset}.result &
+
+	echo "phase put, testing parameter set $flagset" 1>&2
 	while ! wait; do
-		:
+		echo "re-awaiting background processes for $flagset" 1>&2
 	done
 done
 
