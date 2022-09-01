@@ -1,4 +1,4 @@
-PROG=fget
+PROG=fabtget
 
 LIBFABRIC_INCFLAGS!=pkg-config --cflags-only-I libfabric
 LIBFABRIC_CFLAGS!=pkg-config --cflags-only-other libfabric
@@ -11,11 +11,13 @@ CFLAGS+=$(LIBFABRIC_CFLAGS)
 CFLAGS+=-gdwarf-4 -std=c11
 CFLAGS+=-Wall -pedantic -Wextra -Werror
 CFLAGS+=-O3
+#CFLAGS+=-fsanitize=undefined
+#LDFLAGS+=-fsanitize=undefined
 CC=gcc
-SRCS=fget.c
+SRCS=fabtget.c
 #WARNS=4
 
-all: fget
-	@$(LN) -sf fget fput
+all: fabtget
+	@$(LN) -sf fabtget fabtput
 
 .include <mkc.prog.mk>

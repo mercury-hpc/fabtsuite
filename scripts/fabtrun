@@ -1,4 +1,39 @@
 #!/bin/sh
+#
+# Notes about making this script, `fabtrun`, multi-node are labeled `MN`.
+#
+# MN: The general idea is that this script should have two operating
+# modes, call them "server" mode and "client" mode.  Where the existing
+# script starts an fabtget process and an fabtput process in each step,
+# the script in server mode would start one process in each step (e.g.,
+# fabtget).  A counterpart script in client mode would start the other
+# process in each step (e.g., fabtput).  Then server and client will
+# wait for the programs they started to finish or fail before moving on
+# to the next step.
+#
+# MN: Right now fabtrun creates a temporary directory when it starts.
+# It uses that temporary directory to save some state variables.
+# The client and server should share that directory.  The script that
+# kicks off the multi-node test probably should create the directory and tell
+# each client & server instance what the directory is called using an
+# environment variable or command-line parameter.
+#
+# MN: Currently, fabtrun performs runs every test step in two test
+# phases (one phase for get, one phase for put).  Then it produces
+# a report.  In one flexible approach to multi-node testing, each
+# client-mode/server-mode instance will run only a single step; then the
+# script that runs the batch job will synchronize through filesystem
+# fiddling or network messages; then the batch script will start each
+# instance on the next step.  In this way all steps, 1..n, are run.
+# Finally, the batch script can run step n+1, the reporting
+# step, on a solitary node, and capture the output.
+#
+# MN: To test multiple clients per server, fabtrun needs to be modified
+# to pass `-k` and `-n` to `fabtput` and `-n` to `fabtget`.
+# It may make the most sense to do that after making the other changes.
+#
+# See other `MN` markings, below, for more advice.
+#
 
 set -e
 set -u
@@ -9,7 +44,7 @@ nfail=0
 prog=$(basename $0)
 timed_out=no
 timeout_default=600
-cancel_timeout_default=3
+cancel_timeout_default=2
 
 bail()
 {
@@ -46,7 +81,7 @@ exit_handler()
 
 usage()
 {
-	echo "usage: ${prog} <hostname>" 1>&2
+	echo "usage: ${prog}" 1>&2
 	exit 1
 }
 
@@ -68,26 +103,17 @@ random_fail()
 print_flagset_line()
 {
 	flagset=$1
+	result=$2
 	read kw_realtime realtime
-	if [ ${kw_realtime:-fail} = "fail" ]; then
-		ntests=$(($ntests + 1))
-		nfail=$(($nfail + 1))
-		printf "%-31.31s %8s %-24s %s\\n" \
-		    "$(echo $flagset | sed 's/,/ /g')" - - fail
-		return 1
-	fi
 	read discard || true
 	read discard || true
-	read result || true
-	if [ ${kw_realtime:-none} != "real" ]; then
-		ntests=$(($ntests + 1))
-		nfail=$(($nfail + 1))
-		printf "%-31.31s %8s %-24s %s\\n" \
-		    "$(echo $flagset | sed 's/,/ /g')" - - fail
-		return 1
-	fi
 	ntests=$(($ntests + 1))
-	if [ ${result:-none} = ok ]; then
+	if [ x${kw_realtime:-none} != xreal ]; then
+		nfail=$(($nfail + 1))
+		printf "%-31.31s %8s %-24s %s\\n" \
+		    "$(echo $flagset | sed 's/,/ /g')" - - fail
+		return 1
+	elif [ ${result:-none} = ok ]; then
 		npass=$(($npass + 1))
 	else
 		nfail=$(($nfail + 1))
@@ -96,10 +122,14 @@ print_flagset_line()
 		default_realtime=${realtime}
 		printf "%-31.31s %8.2f %-24s %s\\n" "default" \
 		    $realtime - $result
+	elif [ $(dc -e "[[t] p q] st $default_realtime 0 =t [f] p q") = "t" ]
+	then
+		printf "%-31.31s %8.2f %-24s %s\\n" \
+		    "$(echo $flagset | sed 's/,/ /g')" $realtime - $result
 	else
 		printf "%-31.31s %8.2f %-24.0f %s\\n" \
-		    "$(echo $flagset | sed 's/,/ /g')" ${realtime} \
-		    $(echo "2 k $realtime $default_realtime / 100 * p" | dc) \
+		    "$(echo $flagset | sed 's/,/ /g')" $realtime \
+		    $(dc -e "2 k $realtime $default_realtime / 100 * p") \
 		    $result
 	fi
 }
@@ -215,11 +245,17 @@ HEADING_EOF
 
 	# rely on flagset `default` to be first, *wince*.
 	for flagset in $(eval echo \$${which}_flagset); do
-		if [ -e $tmpdir/${which}.${flagset}.result ]; then
+		result=$tmpdir/${which}-phase-${which}.${flagset}.result
+		timing=$tmpdir/${which}-phase-${which}.${flagset}.timing
+		if [ -e $timing ]
+		then
 			print_flagset_line $flagset \
-			    < $tmpdir/${which}.${flagset}.result || continue
+			    $(cat $result 2> /dev/null || echo fail) \
+			    < $timing || continue
 		else
-			print_flagset_line $flagset < /dev/null || continue
+			print_flagset_line $flagset \
+			    $(cat $result 2> /dev/null || echo fail) \
+			    < /dev/null || continue
 		fi
 	done
 }
@@ -235,79 +271,222 @@ trap usr1_handler USR1
 trap exit_handler EXIT HUP INT PIPE QUIT
 trap child_handler CHLD
 
+# MN: this is where the temporary directory that stores the script
+# state is created.
+
 if ! tmpdir=$(mktemp -d ${prog}.XXXXXX) ; then
 	echo "could not create temporary directory, bailing." 1>&2
 	exit 1
 fi
 
-if [ $# -ne 1 ]; then
+if [ $# -ne 0 ]; then
 	usage $0
 fi
 
-test_host=$1
-
 generic_flagset="default cancel cacheless reregister cacheless,reregister wait"
-fget_flagset=$generic_flagset
-fput_flagset="$generic_flagset contiguous contiguous,reregister"
-fput_flagset="$fput_flagset contiguous,reregister,cacheless"
+get_flagset=$generic_flagset
+put_flagset="$generic_flagset contiguous contiguous,reregister"
+put_flagset="$put_flagset contiguous,reregister,cacheless"
 
-for flagset in $fget_flagset; do
-	fgetenv=$(env_for_flagset $flagset)
-	fgetcmd=$(cmd_for_flagset $flagset "fabtget -b $test_host")
+#
+# MN: This is where fabtrun loops over every test step in the `get`
+# phase.  One quick & easy way to make the script run a solitary step,
+# `n`, is to just loop over all steps in both phases, counting up on a
+# variable `i` in each loop.  If `i == n` or if `n` was not provided,
+# then run the step; if `i != n`, then `continue`.  This preserves the
+# logic and code of the single-node script.  Just an idea.
+#
+for flagset in $get_flagset; do
+	genv=$(env_for_flagset $flagset)
+	gcmd=$(cmd_for_flagset $flagset "./transfer/fabtget -a $tmpdir/addr")
 
+	rm -f $tmpdir/addr
+
+	if [ ${timed_out:-no} = yes ]; then
+		break
+	fi
+
+	#
+	# MN: start the `get` process.  Only do this in server mode.
+	#
 	{
-		if env $fgetenv time -p /bin/sh -c "$fgetcmd 2>&3" 2>&1 && \
-                   ! random_fail && [ ${timed_out:-no} = no ] ; then
+		{ env $genv time -p /bin/sh -c "$gcmd 2>&3" 2>&1 ; } \
+		    > $tmpdir/get-phase-get.${flagset}.timing 3>&2 &
+
+		pid=$!
+		echo $pid > $tmpdir/get-phase-get.${flagset}.pid
+
+		if wait $pid && ! random_fail && [ ${timed_out:-no} = no ]
+		then
 			echo ok
 		else
+			xargs kill -9 < $tmpdir/get-phase-put.${flagset}.pid \
+			    2> /dev/null || true
 			echo fail
 		fi
-	} > $tmpdir/fget.${flagset}.result 3>&2 &
+	} > $tmpdir/get-phase-get.${flagset}.result &
 
-	fputcmd=$(counterpart_cmd_for_flagset $flagset fabtput)
-	if ! $fputcmd $test_host; then
-		echo fail > $tmpdir/fget.${flagset}.result
+	wgpid=$!
+
+	pcmd=$(counterpart_cmd_for_flagset $flagset ./transfer/fabtput)
+
+	#
+	# MN: wait for the `get` process to get started.  Only do this
+	# in client mode.
+	#
+	while ! [ -e $tmpdir/addr ] && ! [ ${timed_out:-no} = yes ] && \
+	      ! grep -q fail $tmpdir/get-phase-get.${flagset}.result; do
+		: # spin rudely
+	done
+
+	if [ ${timed_out:-no} = yes ]; then
+		xargs kill -9 < $tmpdir/get-phase-get.${flagset}.pid \
+		    2> /dev/null || true
+		wait $wgpid
+		continue
 	fi
 
+	if grep -q fail $tmpdir/get-phase-get.${flagset}.result; then
+		continue
+	fi
+
+	#
+	# MN: in client mode, start the `put` process.
+	#
+	{
+		$pcmd $(cat $tmpdir/addr) &
+
+		pid=$!
+		echo $pid > $tmpdir/get-phase-put.${flagset}.pid
+
+		if wait $pid
+		then
+			echo ok
+		else
+			xargs kill -9 < $tmpdir/get-phase-get.${flagset}.pid \
+			    2> /dev/null || true
+			echo fail
+		fi
+	} > $tmpdir/get-phase-put.${flagset}.result &
+
+	echo "phase get, testing parameter set $flagset" 1>&2
 	while ! wait; do
-		:
+		echo "re-awaiting background processes for $flagset" 1>&2
 	done
+done
+
+#
+# MN: This is where fabtrun loops over every test step in the `put`
+# phase.
+#
+for flagset in $put_flagset; do
+	penv=$(env_for_flagset $flagset)
+	pcmd=$(cmd_for_flagset $flagset "./transfer/fabtput")
+	gcmd=$(counterpart_cmd_for_flagset $flagset \
+	    ./transfer/fabtget -a $tmpdir/addr)
+
+	rm -f $tmpdir/addr
 
 	if [ ${timed_out:-no} = yes ]; then
 		break
 	fi
-done
 
-for flagset in $fput_flagset; do
-	fputenv=$(env_for_flagset $flagset)
-	fputcmd=$(cmd_for_flagset $flagset "fabtput")
-	fgetcmd=$(counterpart_cmd_for_flagset $flagset \
-	    fabtget -b $test_host)
-	$fgetcmd &
-	{ if env $fputenv time -p /bin/sh -c "$fputcmd $test_host 2>&3" 2>&1 && ! random_fail && \
-	   [ ${timed_out:-no} = no ] ; then
-		echo ok
-	else
-		echo fail
-	fi } > $tmpdir/fput.${flagset}.result 3>&2
+	#
+	# MN: in server mode, start the `get` process
+	#
+	{
+		$gcmd &
 
-	while ! wait; do
-		:
+		pid=$!
+		echo $pid > $tmpdir/put-phase-get.${flagset}.pid
+
+		if wait $pid
+		then
+			echo ok
+		else
+			xargs kill -9 < $tmpdir/put-phase-put.${flagset}.pid \
+			    2> /dev/null || true
+			echo fail
+		fi
+	} > $tmpdir/put-phase-get.${flagset}.result &
+
+	wgpid=$!
+
+	#
+	# MN: in client mode, wait for the `get` process to start.
+	#
+	while ! [ -e $tmpdir/addr ] && [ ${timed_out:-no} != yes ] && \
+	      ! grep -q fail $tmpdir/put-phase-get.${flagset}.result; do
+		:	# spin rudely
 	done
 
 	if [ ${timed_out:-no} = yes ]; then
-		break
+		xargs kill -9 < $tmpdir/put-phase-get.${flagset}.pid || true
+		wait $wgpid
+		continue
 	fi
+
+	if grep -q fail $tmpdir/put-phase-get.${flagset}.result; then
+		continue
+	fi
+
+	#
+	# MN: in client mode, start the `put` process
+	#
+	{
+		{ env $penv time -p /bin/sh -c \
+		  "$pcmd $(cat $tmpdir/addr) 2>&3" 2>&1 ; } \
+		> $tmpdir/put-phase-put.${flagset}.timing 3>&2 &
+
+		pid=$!
+		echo $pid > $tmpdir/put-phase-put.${flagset}.pid
+
+		if wait $pid && ! random_fail && [ ${timed_out:-no} = no ]
+		then
+			echo ok
+		else
+			#
+			# MN: tricky!  If the `put` process fails, you need
+			# to stop the `get` process prematurely or else the
+			# test may hang until it times out.  Then you
+			# won't get a complete test report.  The client
+			# needs to indicate to the batch script and/or 
+			# the server that the `get` process should be killed
+			# off.
+			#
+			xargs kill -9 < $tmpdir/put-phase-get.${flagset}.pid \
+			    2> /dev/null || true
+			echo fail
+		fi
+	} > $tmpdir/put-phase-put.${flagset}.result &
+
+	#
+	# MN: this synchronization with `put` and `get` processes probably 
+	# needs to be performed by the batch script, since the exact details
+	# may vary based on the platform and batch-submission system.
+	#
+	echo "phase put, testing parameter set $flagset" 1>&2
+	while ! wait; do
+		echo "re-awaiting background processes for $flagset" 1>&2
+	done
 done
 
-print_report fget
+#
+# MN: Print the report: step `n+1`.
+#
+print_report get
 
 echo 
 
-print_report fput
+print_report put
 
 print_footer
 
+#
+# MN: addendum to the report; the timed-out condition probably should
+# be written to the temporary directory or sent somehow over the network
+# so that it's globally available.
+#
 if [ ${timed_out:-no} != no ]; then
 	echo
 	echo "*** A timeout occurred before all tests were run. ***" 
