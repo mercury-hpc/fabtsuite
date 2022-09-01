@@ -298,7 +298,7 @@ put_flagset="$put_flagset contiguous,reregister,cacheless"
 #
 for flagset in $get_flagset; do
 	genv=$(env_for_flagset $flagset)
-	gcmd=$(cmd_for_flagset $flagset "./transfer/fabtget -a $tmpdir/addr")
+	gcmd=$(cmd_for_flagset $flagset "fabtget -a $tmpdir/addr")
 
 	rm -f $tmpdir/addr
 
@@ -328,7 +328,7 @@ for flagset in $get_flagset; do
 
 	wgpid=$!
 
-	pcmd=$(counterpart_cmd_for_flagset $flagset ./transfer/fabtput)
+	pcmd=$(counterpart_cmd_for_flagset $flagset fabtput)
 
 	#
 	# MN: wait for the `get` process to get started.  Only do this
@@ -381,9 +381,9 @@ done
 #
 for flagset in $put_flagset; do
 	penv=$(env_for_flagset $flagset)
-	pcmd=$(cmd_for_flagset $flagset "./transfer/fabtput")
+	pcmd=$(cmd_for_flagset $flagset "fabtput")
 	gcmd=$(counterpart_cmd_for_flagset $flagset \
-	    ./transfer/fabtget -a $tmpdir/addr)
+	    fabtget -a $tmpdir/addr)
 
 	rm -f $tmpdir/addr
 
