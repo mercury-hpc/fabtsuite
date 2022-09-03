@@ -1,6 +1,6 @@
 # Running Multi-node Test
 
-  A sample [SLURM script](../scripts/fabtrun.slurm) for multi-node test is provided.
+  A sample [SLURM script](../scripts/fabtrun.slurm) and [QSUB script](../scripts/fabtrun.qsub) for multi-node test is provided.
 
 To run the sample script, build `fabtsuite` with [CMake](building_cmake.md).
 Install it under the shared project directory called
