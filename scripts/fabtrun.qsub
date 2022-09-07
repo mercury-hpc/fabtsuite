@@ -25,7 +25,7 @@ for i in `cat $PREFIX/nodes.txt`; do
     if [[ "$j" -gt 0 ]]; then
 	mpiexec -host $i -n 1 -ppn 1 $PREFIX/bin/fabtput.sh
 	# Alternatively, you can use ssh.
-	# ssh $i 'fabtput.sh'
+	# ssh $i '$PREFIX/bin/fabtput.sh'
     else
 	mpiexec -host $i -n 1 -ppn 1 nohup $PREFIX/bin/fabtget.sh > fabtget.out 2> fabtget.err < /dev/null &
 	# Alternatively, you can use ssh.
