@@ -10,8 +10,8 @@ IndentGotoLabels: false
 IndentPPDirectives: AfterHash
 ColumnLimit: 80
 AccessModifierOffset: -4
-AlignAfterOpenBracket: DontAlign
 AlignConsecutiveMacros: true
 AlwaysBreakAfterReturnType: All
 SpaceAfterCStyleCast: true
+IndentPPDirectives: None
 ...

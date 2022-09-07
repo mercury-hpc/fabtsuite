@@ -24,4 +24,4 @@ jobs:
         . ./spack/share/spack/setup-env.sh
         spack install fabtsuite ^libfabric fabrics=rxm,tcp,udp,rxd
         spack load fabtsuite
-        fabtrun localhost
+        fabtrun
