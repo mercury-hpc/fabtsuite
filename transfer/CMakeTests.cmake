@@ -3,7 +3,16 @@ add_test (
     COMMAND test.sh
 )
 
-add_test (
-    NAME slurm
-    COMMAND sbatch --wait test.slurm
-)
+if (${SLURM})
+  add_test (
+      NAME slurm
+      COMMAND sbatch --wait test.slurm
+  )
+endif ()  
+
+if (${PBS})
+  add_test (
+      NAME pbs
+      COMMAND qsub -W block=true fabtrun.qsub
+  )
+endif ()  
