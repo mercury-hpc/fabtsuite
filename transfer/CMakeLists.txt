@@ -23,3 +23,8 @@ install(CODE "execute_process(
     ln -sv fabtget fabtput
     \")")
 
+file(COPY test.sh DESTINATION .)
+file(COPY test.slurm DESTINATION .)
+file(COPY tget.sh DESTINATION .)
+file(COPY tput.sh DESTINATION .)
+include(CMakeTests.cmake)
