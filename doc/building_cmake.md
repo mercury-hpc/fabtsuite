@@ -12,9 +12,12 @@ See [building.md](building.md) for the manual installation of libfabric.
 
      mkdir build
      cd build
-     cmake ..
+     cmake .. 
      make
      make DESTDIR=/tmp/ install
+
+ Use `-DCMAKE_INSTALL_PREFIX=/my/local` to change installation
+prefix from `/usr/local/` to something else (e.g., `/my/local`).
 
 ## Test
 

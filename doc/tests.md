@@ -7,40 +7,58 @@ The script will run silently for a few minutes and then print a report
 like this one:
 
 ```
-fabtget parameter set          duration (s) duration/default (%)     result
+phase get, testing parameter set default
+phase get, testing parameter set cancel
+phase get, testing parameter set cacheless
+phase get, testing parameter set reregister
+phase get, testing parameter set cacheless,reregister
+phase get, testing parameter set wait
+phase put, testing parameter set default
+phase put, testing parameter set cancel
+phase put, testing parameter set cacheless
+phase put, testing parameter set reregister
+phase put, testing parameter set cacheless,reregister
+phase put, testing parameter set wait
+phase put, testing parameter set contiguous
+phase put, testing parameter set contiguous,reregister
+phase put, testing parameter set contiguous,reregister,cacheless
+get parameter set          duration (s) duration/default (%)     result
 --------------------------------------------------------------------------
-default                             5.58 -                        ok
-cancel                              3.01 53                       ok
-cacheless                           5.88 105                      ok
-reregister                          6.40 114                      ok
-cacheless reregister                5.15 92                       ok
+default                             6.19 -                        ok
+cancel                              2.02 32                       ok
+cacheless                           6.29 101                      ok
+reregister                          5.25 84                       ok
+cacheless reregister                6.04 97                       ok
+wait                               10.94 176                      ok
 
-fabtput parameter set          duration (s) duration/default (%)     result
+put parameter set          duration (s) duration/default (%)     result
 --------------------------------------------------------------------------
-default                             5.27 -                        ok
-cancel                              3.00 56                       ok
-cacheless                           5.65 107                      ok
-reregister                          5.37 101                      ok
-cacheless reregister                5.24 99                       ok
-contiguous                          9.18 174                      ok
-contiguous reregister               8.76 166                      ok
-contiguous reregister cacheless     8.96 170                      ok
+default                             4.89 -                        ok
+cancel                              2.02 41                       ok
+cacheless                           5.15 105                      ok
+reregister                          5.21 106                      ok
+cacheless reregister                5.13 104                      ok
+wait                                7.74 158                      ok
+contiguous                          7.65 156                      ok
+contiguous reregister               8.46 173                      ok
+contiguous reregister cacheless     8.29 169                      ok
 
 key:
 
   parameters:
-      default: register each RDMA buffer once, use scatter-gather RDMA
+      default: register each RDMA buffer once, use scatter-gather RDMA 
       cancel: -c, send SIGINT to cancel after 3 seconds
       cacheless: env FI_MR_CACHE_MAX_SIZE=0, disable memory-registration cache
       contiguous: -g, RDMA conti(g)uous bytes, no scatter-gather
       reregister: -r, deregister/(r)eregister each RDMA buffer before reuse
+      wait: -w, wait for I/O using epoll_pwait(2) instead of fi_poll(3)
 
   duration: elapsed real time in seconds
 
   duration/default: elapsed real time as a percentage of the duration
     measured with the default parameter set
 
-13 tests, 13 succeeded, 0 failed
+15 tests, 15 succeeded, 0 failed
 ```
 
 Look at the summary result in the last line for a
