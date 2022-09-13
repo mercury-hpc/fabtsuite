@@ -1,0 +1,35 @@
+#!/bin/sh
+##
+## Usage: qsub cancel.qsub
+## Author: Hyokyung Lee (hyoklee@hdfgroup.org)
+## Last Update: 2022-09-12
+##
+#PBS -l select=2:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=10:00
+#PBS -q debug
+#PBS -A radix-io
+
+PREFIX=/lus/grand/projects/radix-io
+
+# Get all node names first.
+mpiexec -n 1 -ppn 1 cat $PBS_NODEFILE >& $PREFIX/nodes.txt
+
+# Run 1 server and (select - 1) client(s).
+# The debug queue has only 2 nodes.
+# Therefore, this script will run only 1 client.
+# The first node in nodes.txt will be the server.
+# The rest will be clients.
+j=0
+for i in `cat $PREFIX/nodes.txt`; do
+    if [[ "$j" -gt 0 ]]; then
+	mpiexec -host $i -n 1 -ppn 1 $PREFIX/bin/fabtput.sh -c
+	# Alternatively, you can use ssh.
+	# ssh $i '$PREFIX/bin/fabtput.sh -c'
+    else
+	mpiexec -host $i -n 1 -ppn 1 nohup $PREFIX/bin/fabtget.sh -c > fabtget.out 2> fabtget.err < /dev/null &
+	# Alternatively, you can use ssh.
+	# ssh $i 'nohup $PREFIX/bin/fabtget.sh -c > fabtget.out 2> fabtget.err < /dev/null &'
+    fi
+    ((j++))
+done    
