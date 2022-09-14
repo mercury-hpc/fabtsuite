@@ -21,10 +21,9 @@
 
 ### Options
 
-* `-b `*`address`*: the **b**inding address.  Wait for connections on the
-  given address. `localhost` is usually appropriate when `fabtget` and
-  `fabtput` run on the same host.  Otherwise, the name given by `hostname`
-  or `hostname -f` is probably best.
+* `-a `*`address_file`*: a file name for **a**ddress.  Wait for connections on
+  the address written in the file.
+  `fabtput` uses the address in the file to establish connection.
 
 * `-p '`*`i`*` - `*`j`*`'`: **p**in worker threads to processors
   *i* through *j*.

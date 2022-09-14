@@ -25,5 +25,5 @@ Let's assume that everything is installed under `/tmp/usr/local/bin`
 and you have *write* permission on your current working directory.
 
     export PATH=/tmp/usr/local/bin:$PATH
-    fabtrun localhost
+    fabtrun
 
