@@ -1,5 +1,18 @@
 # Developer's Guide
 
+## Naming Convention
+
+* All scripts start with `fabt` and have no file extension like `.sh`.
+* There are 6 abbreviations (a.) for features:
+| Feature        | a. |
+|================|====|
+| FI_WAIT_FD     | w  |
+| fi_cancel()    | c  |
+| cross-job-comm | x  |
+| multi-thread   | t  |
+| vectored-IO    | v  |
+| MPI Interop.   | m  |
+
 ## Debugging with hlog
 
   

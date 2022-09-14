@@ -23,11 +23,8 @@ install(CODE "execute_process(
     ln -sv fabtget fabtput
     \")")
 
-file(COPY test.sh DESTINATION .)
-file(COPY test.slurm DESTINATION .)
-file(COPY tget.sh DESTINATION .)
-file(COPY tput.sh DESTINATION .)
-file(COPY ../scripts/fabtrun.qsub DESTINATION .)
-file(COPY ../scripts/wait.qsub DESTINATION .)
-file(COPY ../scripts/cancel.qsub DESTINATION .)
+file(GLOB TEST_SCRIPTS
+  "../test/*"
+)
+file(COPY ${TEST_SCRIPTS} DESTINATION .)
 include(CMakeTests.cmake)

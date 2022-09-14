@@ -1,15 +1,11 @@
   add_test (
-      NAME multi-node
-      COMMAND sbatch --wait test.slurm
-  )
-  add_test (
       NAME FI_WAIT_FD
-      COMMAND sbatch --wait test.slurm
+      COMMAND sbatch --wait wait.slurm
   )
 
   add_test (
       NAME fi_cancel
-      COMMAND sbatch --wait test.slurm
+      COMMAND sbatch --wait cancel.slurm
   )
 
   add_test (
