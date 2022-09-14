@@ -4438,16 +4438,80 @@ static void
 usage(personality_t personality, const char *progname)
 {
     const char *common1 = "[-c]";
-    const char *common2 = "[-n <n>] [-p '<i> - <j>' ] "
-                          "[-r] [-w]";
+    const char *common2 = "[-n <n>] [-p '<i> - <j>' ] [-r] [-w]";
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "USAGE:\n");
+    fprintf(stderr, "\n");
 
     if (personality == put) {
-        fprintf(stderr, "usage: %s %s [-g] [-k <k>] %s <address>\n", progname,
+        fprintf(stderr, "    %s %s [-g] [-k <k>] %s <address>\n", progname,
                 common1, common2);
     } else {
-        fprintf(stderr, "usage: %s [-a <address-file>] %s %s\n", progname,
-                common1, common2);
+        fprintf(stderr, "    %s [-a <address-file>] %s %s\n", progname, common1,
+                common2);
     }
+    fprintf(stderr, "\n");
+
+    if (personality == get) {
+        fprintf(stderr, "    -a <address-file>\n");
+        fprintf(stderr, "        dump address to file <address-file>\n");
+        fprintf(stderr, "        (otherwise goes to stdout)\n");
+        fprintf(stderr, "\n");
+    }
+
+    fprintf(stderr, "    -c\n");
+    fprintf(stderr, "        send SIGINT to cancel after 3 seconds\n");
+    fprintf(stderr, "\n");
+
+    if (personality == put) {
+        fprintf(stderr, "    -g\n");
+        fprintf(stderr, "        RDMA conti(g)uous bytes, no scatter-gather\n");
+        fprintf(stderr, "\n");
+
+        fprintf(stderr, "    -k <k>\n");
+        fprintf(stderr, "        number of local sessions\n");
+        fprintf(stderr, "\n");
+    }
+
+    fprintf(stderr, "    -n\n");
+    fprintf(stderr, "        total number of sessions\n");
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "    -p '<i> - <j>'\n");
+    fprintf(stderr,
+            "        set the first <i> and last <j> processors to use\n");
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "    -r\n");
+    fprintf(stderr,
+            "        deregister/(r)eregister each RDMA buffer before reuse\n");
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "    -w\n");
+    fprintf(
+        stderr,
+        "        wait for I/O using epoll_pwait(2) instead of fi_poll(3)\n");
+    fprintf(stderr, "\n");
+
+    if (personality == put) {
+        fprintf(stderr, "    <address>\n");
+        fprintf(stderr, "        destination address\n");
+        fprintf(stderr, "\n");
+    }
+
+    fprintf(stderr, "NOTES:\n");
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "    no parameters: register each RDMA buffer once, use "
+                    "scatter-gather RDMA\n");
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "    To run in 'cacheless' mode, set the "
+                    "FI_MR_CACHE_MAX_SIZE environment\n");
+    fprintf(stderr,
+            "    variable to 0 to disable the memory registration cache.\n");
+    fprintf(stderr, "\n");
 
     exit(EXIT_FAILURE);
 }
