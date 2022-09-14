@@ -8,8 +8,7 @@ Please try update LD_LIBRARY_PATH and PATH like as follows.
 export LD_LIBRARY_PATH=$PREFIX/lib:$LD_LIBRARY_PATH
 export PATH=$PREFIX/bin:$PATH
 ```
-The `PREFIX` is where Spack installed the fabtsuite.
-
+The `PREFIX` is where Spack installed the libfabric and fabtsuite package.
 
 * What is the default timeout value for CTest?
 
@@ -24,3 +23,4 @@ If a test fails due to timeout, you'll get an output like below:
 6/8 Test #6: multi-thread .....................***Timeout 1500.10 sec
     Start 7: vectored-IO
 ```
+
