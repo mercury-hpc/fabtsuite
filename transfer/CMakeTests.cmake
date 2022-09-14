@@ -4,7 +4,7 @@ add_test (
     COMMAND test.sh
 )
 
-# Test Cori.
+# Test Crusher.
 if (${SLURM})
 include(CMakeTests_s.cmake)
 endif ()  
