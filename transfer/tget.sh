@@ -1,7 +1,5 @@
 #!/bin/bash
-echo "Running fabtget."
-FILE=fabtget_host1.txt
-cat /proc/sys/kernel/hostname > $FILE
-cat $FILE
-time -p ./fabtget -a $FILE
+FILE=fabtget_address.txt
+echo "Running ./fabtget $1 -a $FILE."
+time -p ./fabtget $1 -a $FILE
 

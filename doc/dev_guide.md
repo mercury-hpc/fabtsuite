@@ -1,6 +1,16 @@
 # Developer's Guide
 
-## Adding a new CTest
+## Debugging with hlog
+
+  
+## Single-Node Test
+
+## Multi-Node Test
+
+  The programs require shell scripting because they do not generate time.
+  `nohup` is necessary .
+  
+## Adding a New CTest
 
 ### Local
 1. Write a script that runs `fabtget` and `fabtput`.
