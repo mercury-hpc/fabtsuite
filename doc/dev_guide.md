@@ -1,11 +1,11 @@
 # Developer's Guide
 
-## Naming Convention
+## Naming Conventions
 
-* All scripts start with `fabt` and have no file extension like `.sh`.
-* There are 6 abbreviations (a.) for features:
+There are 6 abbreviations (a.) for testing features:
+
 | Feature        | a. |
-|================|====|
+|----------------|----|
 | FI_WAIT_FD     | w  |
 | fi_cancel()    | c  |
 | cross-job-comm | x  |
@@ -13,10 +13,15 @@
 | vectored-IO    | v  |
 | MPI Interop.   | m  |
 
+All multi-node scripts start with `fabt` and have file extension like `.sh`.
+
 ## Debugging with hlog
 
   
 ## Single-Node Test
+
+[test/test.sh](../test/test.sh) is used to check if programs run correctly
+on local host.
 
 ## Multi-Node Test
 
