@@ -2,7 +2,7 @@
 
 * GitHub Action fails with `Error: Process completed with exit code 145.` Why?
 
-  We don't know the reason yet. Howerver, you can try to run the failed job
+  We don't know the reason yet. However, you can try to run the failed job
   again and it will pass eventually.
   
 * I installed fabtsuite using Spack but I get the `available libfabric version
