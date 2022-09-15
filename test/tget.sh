@@ -1,5 +1,9 @@
 #!/bin/bash
 FILE=fabtget_address.txt
-echo "Running ./fabtget $1 -a $FILE."
-time -p ./fabtget $1 -a $FILE
+WORKDIR=$PBS_O_WORKDIR
+if [ -z $WORKDIR ] ; then
+    WORKDIR=.
+fi
+echo "Running $WORKDIR/fabtget $1 -a $WORKDIR/$FILE."
+time -p $WORKDIR/fabtget $1 -a $WORKDIR/$FILE
 
