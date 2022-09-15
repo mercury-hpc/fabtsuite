@@ -18,7 +18,7 @@
 # each client & server instance what the directory is called using an
 # environment variable or command-line parameter.
 #
-# MN: Currently, fabtrun performs runs every test step in two test
+# MN: Currently, fabtrun runs every test step in two test
 # phases (one phase for get, one phase for put).  Then it produces
 # a report.  In one flexible approach to multi-node testing, each
 # client-mode/server-mode instance will run only a single step; then the

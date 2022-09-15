@@ -2,7 +2,7 @@
 ##
 ## Usage: qsub wait.qsub
 ## Author: Hyokyung Lee (hyoklee@hdfgroup.org)
-## Last Update: 2022-09-13
+## Last Update: 2022-09-14
 ##
 #PBS -l select=2:system=polaris
 #PBS -l place=scatter
@@ -30,7 +30,7 @@ for i in `cat $WORKDIR/nodes.txt`; do
     if [[ "$j" -gt 0 ]]; then
 	mpiexec -envall -host $i -n 1 -ppn 1 $WORKDIR/tput.sh -w
     else
-	mpiexec -envall -host $i -n 1 -ppn 1 nohup $WORKDIR/tget.sh -w > $WORKDIR/fabtget.out 2> $WORKDIR/fabtget.err < /dev/null &
+	mpiexec -envall -host $i -n 1 -ppn 1 nohup $WORKDIR/tget.sh > $WORKDIR/fabtget.out 2> $WORKDIR/fabtget.err < /dev/null &
     fi
     ((j++))
 done    
