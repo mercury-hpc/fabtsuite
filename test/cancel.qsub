@@ -8,7 +8,7 @@
 #PBS -l place=scatter
 #PBS -l walltime=10:00
 #PBS -q debug
-#PBS -A radix-io
+#PBS -A CSC250STDM12
 
 # Set the libfabric library location.
 PREFIX=/lus/grand/projects/radix-io

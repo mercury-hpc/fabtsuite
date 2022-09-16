@@ -15,7 +15,7 @@
 
   add_test (
       NAME multi-thread
-      COMMAND qsub -W block=true test.qsub 
+      COMMAND qsub -W block=true thread.qsub 
   )
 
   add_test (
