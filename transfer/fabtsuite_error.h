@@ -1,3 +1,8 @@
+/* fabtsuite_error.h
+ *
+ * Error-handling functions used throughout the code
+ */
+
 #ifndef fabtsuite_error_H
 #define fabtsuite_error_H
 
