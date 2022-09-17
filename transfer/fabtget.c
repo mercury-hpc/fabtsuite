@@ -25,6 +25,8 @@
 
 #include "hlog.h"
 
+#include "fabtsuite_error.h"
+
 #define arraycount(a) (sizeof(a) / sizeof(a[0]))
 
 #ifndef transfer_unused
@@ -600,53 +602,6 @@ static uint64_t _Atomic next_key_pool = 512;
 
 static char txbuf[] = "If this message was received in error then please "
                       "print it out and shred it.";
-
-#define bailout_for_ofi_ret(ret, ...)                                          \
-    bailout_for_ofi_ret_impl(ret, __func__, __LINE__, __VA_ARGS__)
-
-#define warn_about_ofi_ret(ret, ...)                                           \
-    warn_about_ofi_ret_impl(ret, __func__, __LINE__, __VA_ARGS__)
-
-static void
-warnv_about_ofi_ret_impl(int ret, const char *fn, int lineno, const char *fmt,
-                         va_list ap)
-{
-    fprintf(stderr, "%s.%d: ", fn, lineno);
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, ": %s\n", fi_strerror(-ret));
-}
-
-static void
-warn_about_ofi_ret_impl(int ret, const char *fn, int lineno, const char *fmt,
-                        ...)
-{
-    va_list ap;
-
-    va_start(ap, fmt);
-    warnv_about_ofi_ret_impl(ret, fn, lineno, fmt, ap);
-    va_end(ap);
-}
-
-static void
-bailout_for_ofi_ret_impl(int ret, const char *fn, int lineno, const char *fmt,
-                         ...)
-{
-    va_list ap;
-
-    va_start(ap, fmt);
-    warnv_about_ofi_ret_impl(ret, fn, lineno, fmt, ap);
-    va_end(ap);
-
-    exit(EXIT_FAILURE);
-}
-
-#if 0
-static int
-maxsize(size_t l, size_t r)
-{
-    return (l > r) ? l : r;
-}
-#endif
 
 static int
 minsize(size_t l, size_t r)
@@ -1755,6 +1710,12 @@ rcvr_cq_process(rcvr_t *r)
         }
     } else if (ncompleted < 0) {
         bailout_for_ofi_ret(ncompleted, "fi_cq_read");
+        /* exit() is called in the above function, but the compiler doesn't
+         * introspect at that level, producing a warning about cmpl.xfc
+         * not being initialized. Adding an additional exit call suppresses
+         * this while we refactor the problem out.
+         */
+        exit(EXIT_FAILURE);
     } else if (ncompleted != 1) {
         errx(EXIT_FAILURE, "%s: expected 1 completion, read %zd", __func__,
              ncompleted);
@@ -2334,6 +2295,12 @@ xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
         }
     } else if (ncompleted < 0) {
         bailout_for_ofi_ret(ncompleted, "fi_cq_read");
+        /* exit() is called in the above function, but the compiler doesn't
+         * introspect at that level, producing a warning about cmpl.xfc
+         * not being initialized. Adding an additional exit call suppresses
+         * this while we refactor the problem out.
+         */
+        exit(EXIT_FAILURE);
     } else if (ncompleted != 1) {
         errx(EXIT_FAILURE, "%s: expected 1 completion, read %zd", __func__,
              ncompleted);
