@@ -2,15 +2,17 @@
 
 ## Synopsis
 
-`fabtget [-a `*`address-file`*`] [-c] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w]`
+`fabtget [-a `*`address-file`*`] [-c] [-h] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w]`
 
-`fabtput [-c] [-g] [-k `*`k`*`] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w] `*`remote address`*
+`fabtput [-c] [-g] [-h] [-k `*`k`*`] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w] `*`remote address`*
 
 ## common options
 
 * `-c`: Expect **c**ancellation by a signal.  Use exit code 0 (success)
   if the program is cancelled by a signal (SIGHUP, -INT, -QUIT, -TERM).
   Use exit code 1 (failure), otherwise.
+
+* `-h`: print this help message
 
 * `-n `*`n`*: Tell the peer to expect that between this process and the
   other `fabtput` processes will establish *n* transmit sessions with the
