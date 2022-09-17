@@ -4448,29 +4448,33 @@ usage(personality_t personality, const char *progname)
     fprintf(stderr, "\n");
 
     if (personality == put) {
-        fprintf(stderr, "    %s %s [-g] [-h] [-k <k>] %s <remote_address>\n", progname,
-                common1, common2);
+        fprintf(stderr, "    %s %s [-g] [-h] [-k <k>] %s <remote_address>\n",
+                progname, common1, common2);
     } else {
-        fprintf(stderr, "    %s [-a <address-file>] [-h] %s %s\n", progname, common1,
-                common2);
+        fprintf(stderr, "    %s [-a <address-file>] [-h] %s %s\n", progname,
+                common1, common2);
     }
     fprintf(stderr, "\n");
 
     if (personality == get) {
         fprintf(stderr, "    -a <address-file>\n");
-        fprintf(stderr, "        dump address to file <address-file> (otherwise goes to stdout)\n");
+        fprintf(stderr, "        dump address to file <address-file> "
+                        "(otherwise goes to stdout)\n");
         fprintf(stderr, "\n");
     }
 
     fprintf(stderr, "    -c\n");
-    fprintf(stderr, "        Expect cancellation by a signal. Use exit code 0 (success) if the\n");
-    fprintf(stderr, "        program is cancelled by a signal (SIGHUP, -INT, -QUIT, -TERM). Use\n");
+    fprintf(stderr, "        Expect cancellation by a signal. Use exit code 0 "
+                    "(success) if the\n");
+    fprintf(stderr, "        program is cancelled by a signal (SIGHUP, -INT, "
+                    "-QUIT, -TERM). Use\n");
     fprintf(stderr, "        exit code 1 (failure), otherwise.\n");
     fprintf(stderr, "\n");
 
     if (personality == put) {
         fprintf(stderr, "    -g\n");
-        fprintf(stderr, "        RDMA-write only from contiguous buffers (default is scatter-gather RDMA)\n");
+        fprintf(stderr, "        RDMA-write only from contiguous buffers "
+                        "(default is scatter-gather RDMA)\n");
         fprintf(stderr, "\n");
     }
 
@@ -4480,21 +4484,24 @@ usage(personality_t personality, const char *progname)
 
     if (personality == put) {
         fprintf(stderr, "    -k <k>\n");
-        fprintf(stderr, "        Start only k transmit sessions. Use this option with -n n. k may\n");
+        fprintf(stderr, "        Start only k transmit sessions. Use this "
+                        "option with -n n. k may\n");
         fprintf(stderr, "        not exceed n.\n");
         fprintf(stderr, "\n");
     }
 
     fprintf(stderr, "    -n\n");
-    fprintf(stderr, "        Tell the peer to expect that between this process and the other fabtput\n");
-    fprintf(stderr, "        processes will establish n transmit sessions with the peer. Unless a\n");
-    fprintf(stderr, "        -k k argument (fabtput only) says otherwise, the new fabtput process\n");
+    fprintf(stderr, "        Tell the peer to expect that between this process "
+                    "and the other fabtput\n");
+    fprintf(stderr, "        processes will establish n transmit sessions with "
+                    "the peer. Unless a\n");
+    fprintf(stderr, "        -k k argument (fabtput only) says otherwise, the "
+                    "new fabtput process\n");
     fprintf(stderr, "        will start all n sessions.\n");
     fprintf(stderr, "\n");
 
     fprintf(stderr, "    -p '<i> - <j>'\n");
-    fprintf(stderr,
-            "        pin worker threads to processors i through j\n");
+    fprintf(stderr, "        pin worker threads to processors i through j\n");
     fprintf(stderr, "\n");
 
     fprintf(stderr, "    -r\n");
@@ -4503,15 +4510,15 @@ usage(personality_t personality, const char *progname)
     fprintf(stderr, "\n");
 
     fprintf(stderr, "    -w\n");
-    fprintf(
-        stderr,
-        "        wait for I/O using epoll_pwait(2) instead of polling in a busy loop\n");
+    fprintf(stderr, "        wait for I/O using epoll_pwait(2) instead of "
+                    "polling in a busy loop\n");
     fprintf(stderr, "        with fi_poll(3)\n");
     fprintf(stderr, "\n");
 
     if (personality == put) {
         fprintf(stderr, "    <remote_address>\n");
-        fprintf(stderr, "        tells the host where the peer fabtget process runs\n");
+        fprintf(stderr,
+                "        tells the host where the peer fabtget process runs\n");
         fprintf(stderr, "\n");
     }
 
