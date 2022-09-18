@@ -187,12 +187,6 @@ static uint64_t _Atomic next_key_pool = 512;
 static char txbuf[] = "If this message was received in error then please "
                       "print it out and shred it.";
 
-static int
-minsize(size_t l, size_t r)
-{
-    return (l < r) ? l : r;
-}
-
 static bufhdr_t *
 buflist_get(buflist_t *bl)
 {

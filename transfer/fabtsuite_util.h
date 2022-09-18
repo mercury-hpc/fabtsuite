@@ -19,6 +19,7 @@
 extern "C" {
 #endif
 
+int minsize(size_t l, size_t r);
 bool size_is_power_of_2(size_t size);
 
 #ifdef __cplusplus
