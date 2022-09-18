@@ -6,6 +6,7 @@
 #ifndef fabtsuite_util_H
 #define fabtsuite_util_H
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdlib.h>
 
@@ -19,6 +20,8 @@
 extern "C" {
 #endif
 
+char *completion_flags_to_string(const uint64_t flags, char *const buf,
+                                 const size_t bufsize);
 int minsize(size_t l, size_t r);
 bool size_is_power_of_2(size_t size);
 
