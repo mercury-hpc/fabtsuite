@@ -3599,6 +3599,11 @@ usage(personality_t personality, const char *progname)
             "        deregister/(r)eregister each RDMA buffer before reuse\n");
     fprintf(stderr, "\n");
 
+    fprintf(stderr, "    -v\n");
+    fprintf(stderr,
+            "        verbose mode (dumps extra info to stderr)\n");
+    fprintf(stderr, "\n");
+
     fprintf(stderr, "    -w\n");
     fprintf(stderr, "        wait for I/O using epoll_pwait(2) instead of "
                     "polling in a busy loop\n");
