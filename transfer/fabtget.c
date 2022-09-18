@@ -25,6 +25,7 @@
 
 #include "hlog.h"
 
+#include "fabtsuite_buffer.h"
 #include "fabtsuite_error.h"
 #include "fabtsuite_fifo.h"
 #include "fabtsuite_types.h"
@@ -187,25 +188,6 @@ static uint64_t _Atomic next_key_pool = 512;
 static char txbuf[] = "If this message was received in error then please "
                       "print it out and shred it.";
 
-static bufhdr_t *
-buflist_get(buflist_t *bl)
-{
-    if (bl->nfull == 0)
-        return NULL;
-
-    return bl->buf[--bl->nfull];
-}
-
-static bool
-buflist_put(buflist_t *bl, bufhdr_t *h)
-{
-    if (bl->nfull == bl->nallocated)
-        return false;
-
-    bl->buf[bl->nfull++] = h;
-    return true;
-}
-
 static bool
 session_init(session_t *s, cxn_t *c, terminal_t *t)
 {
@@ -251,77 +233,6 @@ seqsource_unget(seqsource_t *s, uint64_t got)
 
     s->next_key--;
     return true;
-}
-
-static bufhdr_t *
-buf_alloc(size_t paylen)
-{
-    bufhdr_t *h;
-
-    if ((h = calloc(1, offsetof(bytebuf_t, payload[0]) + paylen)) == NULL)
-        return NULL;
-
-    h->nallocated = paylen;
-
-    return h;
-}
-
-static void
-buf_free(bufhdr_t *h)
-{
-    free(h);
-}
-
-static bytebuf_t *
-bytebuf_alloc(size_t paylen)
-{
-    return (bytebuf_t *) buf_alloc(paylen);
-}
-
-static fragment_t *
-fragment_alloc(void)
-{
-    bufhdr_t *h;
-    fragment_t *f;
-
-    if ((h = buf_alloc(sizeof(*f) - sizeof(bufhdr_t))) == NULL)
-        return NULL;
-
-    f = (fragment_t *) h;
-    h->xfc.type = xft_fragment;
-
-    return f;
-}
-
-static progbuf_t *
-progbuf_alloc(void)
-{
-    bufhdr_t *h;
-    progbuf_t *pb;
-
-    if ((h = buf_alloc(sizeof(*pb) - sizeof(bufhdr_t))) == NULL)
-        return NULL;
-
-    pb = (progbuf_t *) h;
-    h->xfc.type = xft_progress;
-
-    return pb;
-}
-
-static vecbuf_t *
-vecbuf_alloc(void)
-{
-    bufhdr_t *h;
-    vecbuf_t *vb;
-
-    if ((h = buf_alloc(sizeof(*vb) - sizeof(bufhdr_t))) == NULL)
-        return NULL;
-
-    vb = (vecbuf_t *) h;
-    vb->msg.pad = 0;
-    h->xfc.type = xft_vector;
-
-    return vb;
 }
 
 static int
@@ -377,12 +288,6 @@ buf_mr_reg(struct fid_domain *dom, struct fid_ep *ep, uint64_t access,
     }
 
     return 0;
-}
-
-static void
-vecbuf_free(vecbuf_t *vb)
-{
-    buf_free(&vb->hdr);
 }
 
 static bool
@@ -680,20 +585,6 @@ rxctl_post(cxn_t *c, rxctl_t *ctl, bufhdr_t *h)
     }
 
     (void) fifo_put(ctl->posted, h);
-}
-
-static buflist_t *
-buflist_create(size_t n)
-{
-    buflist_t *bl = malloc(offsetof(buflist_t, buf) + sizeof(bl->buf[0]) * n);
-
-    if (bl == NULL)
-        return NULL;
-
-    bl->nallocated = n;
-    bl->nfull = 0;
-
-    return bl;
 }
 
 static void
@@ -1524,35 +1415,6 @@ write_fully(const write_fully_params_t p)
 
     *p.nriovs_out = j;
     return len;
-}
-
-static bool
-vecbuf_is_wellformed(vecbuf_t *vb)
-{
-    size_t len = vb->hdr.nused;
-    static const size_t least_vector_msglen = offsetof(vector_msg_t, iov[0]);
-
-    const size_t niovs_space =
-        (len - least_vector_msglen) / sizeof(vb->msg.iov[0]);
-
-    if (len < least_vector_msglen) {
-        hlog_fast(err, "%s: expected >= %zu bytes, received %zu", __func__,
-                  least_vector_msglen, len);
-    } else if ((len - least_vector_msglen) % sizeof(vb->msg.iov[0]) != 0) {
-        hlog_fast(err,
-                  "%s: %zu-byte vector message did not end on vector boundary, "
-                  "disconnecting...",
-                  __func__, len);
-    } else if (niovs_space < vb->msg.niovs) {
-        hlog_fast(err, "%s: peer sent truncated vectors, disconnecting...",
-                  __func__);
-    } else if (vb->msg.niovs > arraycount(vb->msg.iov)) {
-        hlog_fast(err, "%s: peer sent too many vectors, disconnecting...",
-                  __func__);
-    } else
-        return true;
-
-    return false;
 }
 
 static bool

@@ -14,12 +14,32 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_rma.h>
 
-/* Moved to other files */
+/* Typedefs and forward declarations for types in other files */
 
+/* fabtsuite_fifo.h */
 struct fifo;
 typedef struct fifo fifo_t;
 
-/* END moved to other files */
+/* fabtsuite_buffer.h */
+struct bufhdr;
+typedef struct bufhdr bufhdr_t;
+
+struct buflist;
+typedef struct buflist buflist_t;
+
+struct bytebuf;
+typedef struct bytebuf bytebuf_t;
+
+struct fragment;
+typedef struct fragment fragment_t;
+
+struct progbuf;
+typedef struct progbuf progbuf_t;
+
+struct vecbuf;
+typedef struct vecbuf vecbuf_t;
+
+/* END typedefs and forward declarations from other files */
 
 
 /*
@@ -85,45 +105,6 @@ typedef struct completion {
     size_t len;
     xfer_context_t *xfc;
 } completion_t;
-
-typedef struct bufhdr {
-    xfer_context_t xfc;
-    uint64_t raddr;
-    size_t nused;
-    size_t nallocated;
-    struct fid_mr *mr;
-    void *desc;
-    uint64_t tag;
-    struct fid_ep *ep;
-    max_align_t pad;
-} bufhdr_t;
-
-typedef struct fragment {
-    bufhdr_t hdr;
-    bufhdr_t *parent;
-} fragment_t;
-
-typedef struct bytebuf {
-    bufhdr_t hdr;
-    char payload[];
-} bytebuf_t;
-
-typedef struct progbuf {
-    bufhdr_t hdr;
-    progress_msg_t msg;
-} progbuf_t;
-
-typedef struct vecbuf {
-    bufhdr_t hdr;
-    vector_msg_t msg;
-} vecbuf_t;
-
-typedef struct buflist {
-    uint64_t access;
-    size_t nfull;
-    size_t nallocated;
-    bufhdr_t *buf[];
-} buflist_t;
 
 /* Communication terminals: sources and sinks */
 
