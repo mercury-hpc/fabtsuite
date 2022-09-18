@@ -8,6 +8,20 @@
 #ifndef fabtsuite_types_H
 #define fabtsuite_types_H
 
+#include <stdatomic.h>
+#include <inttypes.h>
+
+#include <rdma/fabric.h>
+#include <rdma/fi_rma.h>
+
+/* Moved to other files */
+
+struct fifo;
+typedef struct fifo fifo_t;
+
+/* END moved to other files */
+
+
 /*
  * Message definitions
  */
@@ -103,16 +117,6 @@ typedef struct vecbuf {
     bufhdr_t hdr;
     vector_msg_t msg;
 } vecbuf_t;
-
-typedef struct fifo {
-    uint64_t insertions;
-    uint64_t removals;
-    size_t index_mask; // for some integer n > 0, 2^n - 1 == index_mask
-    uint64_t closed;   /* close position: no insertions or removals may
-                        * take place at or after this position.
-                        */
-    bufhdr_t *hdr[];
-} fifo_t;
 
 typedef struct buflist {
     uint64_t access;

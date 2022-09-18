@@ -11,7 +11,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -pedantic -Wextra -Werror")
 
 include_directories(${LIBFABRIC_INCLUDE_DIRS} ../hlog)
 
-add_executable(fabtget fabtsuite_error.c fabtget.c)
+add_executable(fabtget fabtsuite_error.c fabtsuite_fifo.c fabtsuite_util.c fabtget.c)
 
 message(STATUS "LIBFABRIC_LIBDIR=${LIBFABRIC_LIBDIR}")
 target_link_directories(fabtget PUBLIC ../hlog ${LIBFABRIC_LIBDIR})
