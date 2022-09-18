@@ -8,8 +8,8 @@
 #ifndef fabtsuite_types_H
 #define fabtsuite_types_H
 
-#include <stdatomic.h>
 #include <inttypes.h>
+#include <stdatomic.h>
 
 #include <rdma/fabric.h>
 #include <rdma/fi_rma.h>
@@ -40,7 +40,6 @@ struct vecbuf;
 typedef struct vecbuf vecbuf_t;
 
 /* END typedefs and forward declarations from other files */
-
 
 /*
  * Message definitions

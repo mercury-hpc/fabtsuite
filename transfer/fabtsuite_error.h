@@ -18,9 +18,15 @@
 extern "C" {
 #endif
 
-void warnv_about_ofi_ret_impl(int ret, const char *fn, int lineno, const char *fmt, va_list ap);
-void warn_about_ofi_ret_impl(int ret, const char *fn, int lineno, const char *fmt, ...);
-void bailout_for_ofi_ret_impl(int ret, const char *fn, int lineno, const char *fmt,  ...);
+void
+warnv_about_ofi_ret_impl(int ret, const char *fn, int lineno, const char *fmt,
+                         va_list ap);
+void
+warn_about_ofi_ret_impl(int ret, const char *fn, int lineno, const char *fmt,
+                        ...);
+void
+bailout_for_ofi_ret_impl(int ret, const char *fn, int lineno, const char *fmt,
+                         ...);
 
 #ifdef __cplusplus
 }

@@ -61,22 +61,33 @@ extern "C" {
  *       here.
  */
 
-bufhdr_t *buflist_get(buflist_t *bl);
-bool buflist_put(buflist_t *bl, bufhdr_t *h);
-buflist_t *buflist_create(size_t n);
+bufhdr_t *
+buflist_get(buflist_t *bl);
+bool
+buflist_put(buflist_t *bl, bufhdr_t *h);
+buflist_t *
+buflist_create(size_t n);
 
-bufhdr_t *buf_alloc(size_t paylen);
-void buf_free(bufhdr_t *h);
+bufhdr_t *
+buf_alloc(size_t paylen);
+void
+buf_free(bufhdr_t *h);
 
-bytebuf_t *bytebuf_alloc(size_t paylen);
+bytebuf_t *
+bytebuf_alloc(size_t paylen);
 
-fragment_t *fragment_alloc(void);
+fragment_t *
+fragment_alloc(void);
 
-progbuf_t *progbuf_alloc(void);
+progbuf_t *
+progbuf_alloc(void);
 
-vecbuf_t *vecbuf_alloc(void);
-void vecbuf_free(vecbuf_t *vb);
-bool vecbuf_is_wellformed(vecbuf_t *vb);
+vecbuf_t *
+vecbuf_alloc(void);
+void
+vecbuf_free(vecbuf_t *vb);
+bool
+vecbuf_is_wellformed(vecbuf_t *vb);
 
 #ifdef __cplusplus
 }

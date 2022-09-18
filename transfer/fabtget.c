@@ -597,7 +597,7 @@ txctl_complete(txctl_t *tc, const completion_t *cmpl)
 
     if ((h = fifo_get(tc->posted)) == NULL) {
         fprintf(stderr, "%s: message Tx completed, but no Tx was posted",
-                  __func__);
+                __func__);
         return -1;
     }
 
@@ -837,16 +837,16 @@ rcvr_cq_process(rcvr_t *r)
 
         if (e.err != FI_ECANCELED || !cmpl.xfc->cancelled) {
             fprintf(stderr, "%s: read %zd errors, %s", __func__, nfailed,
-                      fi_strerror(e.err));
+                    fi_strerror(e.err));
             fprintf(stderr, "%s: context %p type %s", __func__,
-                      (void *) cmpl.xfc, xfc_type_to_string(cmpl.xfc->type));
+                    (void *) cmpl.xfc, xfc_type_to_string(cmpl.xfc->type));
             fprintf(stderr, "%s: completion flags %" PRIx64 " symbolic %s",
-                      __func__, e.flags,
-                      completion_flags_to_string(e.flags, flagsbuf[0],
-                                                 sizeof(flagsbuf[0])));
+                    __func__, e.flags,
+                    completion_flags_to_string(e.flags, flagsbuf[0],
+                                               sizeof(flagsbuf[0])));
             fprintf(stderr, "%s: provider error %s", __func__,
-                      fi_cq_strerror(r->cxn.cq, e.prov_errno, e.err_data,
-                                     errbuf, sizeof(errbuf)));
+                    fi_cq_strerror(r->cxn.cq, e.prov_errno, e.err_data, errbuf,
+                                   sizeof(errbuf)));
             return -1;
         }
     } else if (ncompleted < 0) {
@@ -1373,16 +1373,16 @@ xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
 
         if (e.err != FI_ECANCELED || !cmpl.xfc->cancelled) {
             fprintf(stderr, "%s: read %zd errors, %s", __func__, nfailed,
-                      fi_strerror(e.err));
+                    fi_strerror(e.err));
             fprintf(stderr, "%s: context %p type %s", __func__,
-                      (void *) cmpl.xfc, xfc_type_to_string(cmpl.xfc->type));
+                    (void *) cmpl.xfc, xfc_type_to_string(cmpl.xfc->type));
             fprintf(stderr, "%s: completion flags %" PRIx64 " symbolic %s",
-                      __func__, e.flags,
-                      completion_flags_to_string(e.flags, flagsbuf[0],
-                                                 sizeof(flagsbuf[0])));
+                    __func__, e.flags,
+                    completion_flags_to_string(e.flags, flagsbuf[0],
+                                               sizeof(flagsbuf[0])));
             fprintf(stderr, "%s: provider error %s", __func__,
-                      fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data,
-                                     errbuf, sizeof(errbuf)));
+                    fi_cq_strerror(x->cxn.cq, e.prov_errno, e.err_data, errbuf,
+                                   sizeof(errbuf)));
             return -1;
         }
     } else if (ncompleted < 0) {
@@ -1426,7 +1426,7 @@ xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
              */
             if ((h = fifo_peek(x->wrposted)) == NULL) {
                 fprintf(stderr, "%s: no RDMA-write completions expected",
-                          __func__);
+                        __func__);
                 return -1;
             }
             /* XXX This can fail if `ready_for_terminal` ever fills
@@ -1436,7 +1436,7 @@ xmtr_cq_process(xmtr_t *x, fifo_t *ready_for_terminal, bool reregister)
              */
             if ((h->xfc.place & xfp_first) == 0) {
                 fprintf(stderr, "%s: expected `first` context at head",
-                          __func__);
+                        __func__);
                 return -1;
             }
             while ((h = fifo_peek(x->wrposted)) != NULL &&
@@ -1616,9 +1616,9 @@ xmtr_targets_write(fifo_t *ready_for_cxn, xmtr_t *x)
 
         if ((size_t) nwritten != total || niovs_out != 0) {
             fprintf(stderr,
-                      "%s: local I/O vectors were partially written, "
-                      "nwritten %zu total %zu niovs_out %zu",
-                      __func__, nwritten, total, niovs_out);
+                    "%s: local I/O vectors were partially written, "
+                    "nwritten %zu total %zu niovs_out %zu",
+                    __func__, nwritten, total, niovs_out);
             return loop_error;
         }
 
@@ -1769,14 +1769,14 @@ session_shutdown(session_t *s)
     }
 
     if ((rc = fi_close(&cxn->cq->fid)) < 0) {
-// TODO: Investigate this returning a negative error code. Normal?
-//        fprintf(stderr, "%s: could not fi_close CQ %p: %s", __func__,
-//                  (void *) &cxn->cq, fi_strerror(-rc));
+        // TODO: Investigate this returning a negative error code. Normal?
+        //        fprintf(stderr, "%s: could not fi_close CQ %p: %s", __func__,
+        //                  (void *) &cxn->cq, fi_strerror(-rc));
     }
 
     if ((rc = fi_close(&cxn->ep->fid)) < 0) {
         fprintf(stderr, "%s: could not fi_close endpoint %p: %s", __func__,
-                  (void *) &cxn->ep, fi_strerror(-rc));
+                (void *) &cxn->ep, fi_strerror(-rc));
     }
 }
 
@@ -2607,7 +2607,7 @@ workers_join_all(void)
             code = EXIT_FAILURE;
     }
 
-#if 0    /* Uncomment to dump worker stats */
+#if 0 /* Uncomment to dump worker stats */
     for (i = 0; i < nworkers_allocated; i++) {
         worker_t *w = &workers[i];
 
@@ -2916,8 +2916,9 @@ get_session_accept(get_state_t *gst)
         ncompleted = global_state.waitfd
                          ? fi_cq_sread(gst->listen_cq, &completion, 1, NULL, -1)
                          : fi_cq_read(gst->listen_cq, &completion, 1);
-//        if (ncompleted == -FI_EINTR)
-//            fprintf(stderr, "%s: fi_cq_{,s}read interrupted", __func__);
+        //        if (ncompleted == -FI_EINTR)
+        //            fprintf(stderr, "%s: fi_cq_{,s}read interrupted",
+        //            __func__);
     } while ((ncompleted == -FI_EAGAIN || ncompleted == -FI_EINTR) &&
              !global_state.cancelled);
 
@@ -3451,7 +3452,7 @@ count_info(const struct fi_info *first)
 
     for (info = first, count = 0; info != NULL; count++, info = info->next) {
         fprintf(stderr, "%s: info %d provider \"%s\"", __func__, count,
-                  info->fabric_attr->prov_name);
+                info->fabric_attr->prov_name);
     }
 
     return count;
@@ -3544,8 +3545,7 @@ usage(personality_t personality, const char *progname)
     fprintf(stderr, "\n");
 
     fprintf(stderr, "    -v\n");
-    fprintf(stderr,
-            "        verbose mode (dumps extra info to stderr)\n");
+    fprintf(stderr, "        verbose mode (dumps extra info to stderr)\n");
     fprintf(stderr, "\n");
 
     fprintf(stderr, "    -w\n");
@@ -3791,7 +3791,7 @@ main(int argc, char **argv)
 
     if (verbose) {
         fprintf(stderr, "%ld POSIX I/O vector items maximum",
-              sysconf(_SC_IOV_MAX));
+                sysconf(_SC_IOV_MAX));
     }
 
     if ((hints = fi_allocinfo()) == NULL)
@@ -3835,7 +3835,7 @@ main(int argc, char **argv)
 
     if (verbose) {
         fprintf(stderr, "global_state.info: %s",
-              fi_tostr(global_state.info, FI_TYPE_INFO));
+                fi_tostr(global_state.info, FI_TYPE_INFO));
     }
 
     if ((global_state.info->domain_attr->mr_mode & FI_MR_ENDPOINT) != 0)
@@ -3843,8 +3843,8 @@ main(int argc, char **argv)
 
     if (verbose && (global_state.info->mode & FI_CONTEXT) != 0) {
         fprintf(stderr,
-                  "contexts must embed fi_context; good thing %s does that.",
-                  progname);
+                "contexts must embed fi_context; good thing %s does that.",
+                progname);
     }
 
     if (sigemptyset(&blockset) == -1)
@@ -3920,19 +3920,20 @@ main(int argc, char **argv)
                 global_state.info->fabric_attr->prov_name,
                 global_state.info->domain_attr->mr_iov_limit);
 
-        fprintf(stderr,
-              "provider %s %s application-requested memory-registration keys",
-              global_state.info->fabric_attr->prov_name,
-              ((global_state.info->domain_attr->mr_mode & FI_MR_PROV_KEY) != 0)
-                  ? "does not support"
-                  : "supports");
+        fprintf(
+            stderr,
+            "provider %s %s application-requested memory-registration keys",
+            global_state.info->fabric_attr->prov_name,
+            ((global_state.info->domain_attr->mr_mode & FI_MR_PROV_KEY) != 0)
+                ? "does not support"
+                : "supports");
     }
 
     if ((global_state.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0) {
         fprintf(stderr,
-                  "provider %s RDMA uses virtual addresses instead of offsets, "
-                  "quitting.",
-                  global_state.info->fabric_attr->prov_name);
+                "provider %s RDMA uses virtual addresses instead of offsets, "
+                "quitting.",
+                global_state.info->fabric_attr->prov_name);
         exit(EXIT_FAILURE);
     }
 

@@ -127,18 +127,18 @@ vecbuf_is_wellformed(vecbuf_t *vb)
 
     if (len < least_vector_msglen) {
         fprintf(stderr, "%s: expected >= %zu bytes, received %zu", __func__,
-                  least_vector_msglen, len);
+                least_vector_msglen, len);
     } else if ((len - least_vector_msglen) % sizeof(vb->msg.iov[0]) != 0) {
         fprintf(stderr,
-                  "%s: %zu-byte vector message did not end on vector boundary, "
-                  "disconnecting...",
-                  __func__, len);
+                "%s: %zu-byte vector message did not end on vector boundary, "
+                "disconnecting...",
+                __func__, len);
     } else if (niovs_space < vb->msg.niovs) {
         fprintf(stderr, "%s: peer sent truncated vectors, disconnecting...",
-                  __func__);
+                __func__);
     } else if (vb->msg.niovs > arraycount(vb->msg.iov)) {
         fprintf(stderr, "%s: peer sent too many vectors, disconnecting...",
-                  __func__);
+                __func__);
     } else
         return true;
 
