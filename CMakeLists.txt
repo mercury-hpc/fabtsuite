@@ -7,6 +7,5 @@ set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeR
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/FindLIBFABRIC.cmake)
 
-add_subdirectory(hlog)
 add_subdirectory(transfer)
 add_subdirectory(scripts)
