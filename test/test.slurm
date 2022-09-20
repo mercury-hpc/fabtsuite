@@ -2,10 +2,10 @@
 ##
 ## Usage: sbatch test.slurm
 ## Author: Hyokyung Lee (hyoklee@hdfgroup.org)
-## Last Update: 2022-09-07
+## Last Update: 2022-09-19
 ##
 #SBATCH -A CSC332_crusher
-#SBATCH -J fabtsuite
+#SBATCH -J test
 #SBATCH -o %x-%j.out
 #SBATCH -t 00:00:20
 #SBATCH -N 2

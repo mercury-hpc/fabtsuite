@@ -1,11 +1,11 @@
 #!/bin/bash
 ##
-## Usage: sbatch fabt_c.slurm
+## Usage: sbatch cancel.slurm
 ## Author: Hyokyung Lee (hyoklee@hdfgroup.org)
 ## Last Update: 2022-09-14
 ##
 #SBATCH -A CSC332_crusher
-#SBATCH -J fabt_c
+#SBATCH -J cancel
 #SBATCH -o %x-%j.out
 #SBATCH -t 00:00:20
 #SBATCH -N 2

@@ -28,9 +28,9 @@ mpiexec -n 1 -ppn 1 cat $PBS_NODEFILE >& $WORKDIR/nodes.txt
 j=0
 for i in `cat $WORKDIR/nodes.txt`; do
     if [[ "$j" -gt 0 ]]; then
-	mpiexec -host $i -n 1 -ppn 1 $WORKDIR/tput.sh > $WORKDIR/vector_p_$j.out 2> $WORKDIR/vector_p_$j.err 
+	mpiexec -host $i -n 1 -ppn 1 $WORKDIR/tput.sh -g > $WORKDIR/vector_p_$j.out 2> $WORKDIR/vector_p_$j.err 
     else
-	mpiexec -host $i -n 1 -ppn 1 nohup $WORKDIR/tget.sh -g > $WORKDIR/vector_g.out 2> $WORKDIR/vector_g.err < /dev/null &
+	mpiexec -host $i -n 1 -ppn 1 nohup $WORKDIR/tget.sh > $WORKDIR/vector_g.out 2> $WORKDIR/vector_g.err < /dev/null &
     fi
     ((j++))
 done    
