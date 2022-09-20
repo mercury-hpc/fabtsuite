@@ -1,6 +1,6 @@
 #!/bin/sh
 ##
-## Usage: qsub test.qsub
+## Usage: qsub vector.qsub
 ## Author: Hyokyung Lee (hyoklee@hdfgroup.org)
 ## Last Update: 2022-09-19
 ##
@@ -10,10 +10,15 @@
 #PBS -q debug
 #PBS -A CSC250STDM12
 
+# Set the libfabric library location.
 PREFIX=/lus/grand/projects/radix-io
+export LD_LIBRARY_PATH=$PREFIX/lib:$LD_LIBRARY_PATH
+
+# Set the current working directory.
+WORKDIR=$PBS_O_WORKDIR
 
 # Get all node names first.
-mpiexec -n 1 -ppn 1 cat $PBS_NODEFILE >& $PREFIX/nodes.txt
+mpiexec -n 1 -ppn 1 cat $PBS_NODEFILE >& $WORKDIR/nodes.txt
 
 # Run 1 server and (select - 1) client(s).
 # The debug queue has only 2 nodes.
@@ -21,11 +26,12 @@ mpiexec -n 1 -ppn 1 cat $PBS_NODEFILE >& $PREFIX/nodes.txt
 # The first node in nodes.txt will be the server.
 # The rest will be clients.
 j=0
-for i in `cat $PREFIX/nodes.txt`; do
+for i in `cat $WORKDIR/nodes.txt`; do
     if [[ "$j" -gt 0 ]]; then
-	mpiexec -host $i -n 1 -ppn 1 $PREFIX/bin/fabtput.sh
+	mpiexec -host $i -n 1 -ppn 1 $WORKDIR/tput.sh > $WORKDIR/vector_p_$j.out 2> $WORKDIR/vector_p_$j.err 
     else
-	mpiexec -host $i -n 1 -ppn 1 nohup $PREFIX/bin/fabtget.sh > fabtget.out 2> fabtget.err < /dev/null &
+	mpiexec -host $i -n 1 -ppn 1 nohup $WORKDIR/tget.sh -g > $WORKDIR/vector_g.out 2> $WORKDIR/vector_g.err < /dev/null &
     fi
     ((j++))
 done    
+echo $?

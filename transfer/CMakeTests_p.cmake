@@ -10,7 +10,7 @@
 
   add_test (
       NAME cross-job-comm
-      COMMAND qsub -W block=true test.qsub 
+      COMMAND qsub -W block=true cross.qsub 
   )
 
   add_test (
@@ -20,7 +20,7 @@
 
   add_test (
       NAME vectored-IO
-      COMMAND qsub -W block=true test.qsub 
+      COMMAND qsub -W block=true vector.qsub 
   )
 
   add_test (
