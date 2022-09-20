@@ -27,3 +27,12 @@ and you have *write* permission on your current working directory.
     export PATH=/tmp/usr/local/bin:$PATH
     fabtrun
 
+## CTest on HPC Systems
+
+Set either `SLURM` or `PBS` TRUE in [CTestConfig.cmake](../CTestConfig.cmake)
+to run test on clusters.
+
+Then, repeat the steps in **Build** and run `make test` after `make`.
+
+
+
