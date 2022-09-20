@@ -10,17 +10,17 @@
 
   add_test (
       NAME cross-job-comm
-      COMMAND sbatch --wait test.slurm
+      COMMAND sbatch --wait cross.slurm
   )
 
   add_test (
       NAME multi-thread
-      COMMAND sbatch --wait test.slurm
+      COMMAND sbatch --wait thread.slurm
   )
 
   add_test (
       NAME vectored-IO
-      COMMAND sbatch --wait test.slurm
+      COMMAND sbatch --wait vector.slurm
   )
 
   add_test (
