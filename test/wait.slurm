@@ -7,8 +7,8 @@
 #SBATCH -A CSC332_crusher
 #SBATCH -J wait
 #SBATCH -o %x-%j.out
-#SBATCH -t 00:00:20
+#SBATCH -t 00:00:40
 #SBATCH -N 2
 srun -N1 -n1 ./tget.sh -w &
 srun -N1 -n1 ./tput.sh &
-sleep 20
+sleep 40
