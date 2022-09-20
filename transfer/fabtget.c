@@ -4434,6 +4434,9 @@ personality_to_name(personality_t p)
         return "unknown";
 }
 
+/* Note that there is a doc/usage.md file that mirrors this, so please keep
+ * that file in sync with this one.
+ */
 static void
 usage(personality_t personality, const char *progname)
 {
@@ -4445,42 +4448,60 @@ usage(personality_t personality, const char *progname)
     fprintf(stderr, "\n");
 
     if (personality == put) {
-        fprintf(stderr, "    %s %s [-g] [-k <k>] %s <address>\n", progname,
-                common1, common2);
+        fprintf(stderr, "    %s %s [-g] [-h] [-k <k>] %s <remote_address>\n",
+                progname, common1, common2);
     } else {
-        fprintf(stderr, "    %s [-a <address-file>] %s %s\n", progname, common1,
-                common2);
+        fprintf(stderr, "    %s [-a <address-file>] [-h] %s %s\n", progname,
+                common1, common2);
     }
     fprintf(stderr, "\n");
 
     if (personality == get) {
         fprintf(stderr, "    -a <address-file>\n");
-        fprintf(stderr, "        dump address to file <address-file>\n");
-        fprintf(stderr, "        (otherwise goes to stdout)\n");
+        fprintf(stderr, "        dump address to file <address-file> "
+                        "(otherwise goes to stdout)\n");
         fprintf(stderr, "\n");
     }
 
     fprintf(stderr, "    -c\n");
-    fprintf(stderr, "        send SIGINT to cancel after 3 seconds\n");
+    fprintf(stderr, "        Expect cancellation by a signal. Use exit code 0 "
+                    "(success) if the\n");
+    fprintf(stderr, "        program is cancelled by a signal (SIGHUP, -INT, "
+                    "-QUIT, -TERM). Use\n");
+    fprintf(stderr, "        exit code 1 (failure), otherwise.\n");
     fprintf(stderr, "\n");
 
     if (personality == put) {
         fprintf(stderr, "    -g\n");
-        fprintf(stderr, "        RDMA conti(g)uous bytes, no scatter-gather\n");
+        fprintf(stderr, "        RDMA-write only from contiguous buffers "
+                        "(default is scatter-gather RDMA)\n");
         fprintf(stderr, "\n");
+    }
 
+    fprintf(stderr, "    -h\n");
+    fprintf(stderr, "        print this help message\n");
+    fprintf(stderr, "\n");
+
+    if (personality == put) {
         fprintf(stderr, "    -k <k>\n");
-        fprintf(stderr, "        number of local sessions\n");
+        fprintf(stderr, "        Start only k transmit sessions. Use this "
+                        "option with -n n. k may\n");
+        fprintf(stderr, "        not exceed n.\n");
         fprintf(stderr, "\n");
     }
 
     fprintf(stderr, "    -n\n");
-    fprintf(stderr, "        total number of sessions\n");
+    fprintf(stderr, "        Tell the peer to expect that between this process "
+                    "and the other fabtput\n");
+    fprintf(stderr, "        processes will establish n transmit sessions with "
+                    "the peer. Unless a\n");
+    fprintf(stderr, "        -k k argument (fabtput only) says otherwise, the "
+                    "new fabtput process\n");
+    fprintf(stderr, "        will start all n sessions.\n");
     fprintf(stderr, "\n");
 
     fprintf(stderr, "    -p '<i> - <j>'\n");
-    fprintf(stderr,
-            "        set the first <i> and last <j> processors to use\n");
+    fprintf(stderr, "        pin worker threads to processors i through j\n");
     fprintf(stderr, "\n");
 
     fprintf(stderr, "    -r\n");
@@ -4489,22 +4510,19 @@ usage(personality_t personality, const char *progname)
     fprintf(stderr, "\n");
 
     fprintf(stderr, "    -w\n");
-    fprintf(
-        stderr,
-        "        wait for I/O using epoll_pwait(2) instead of fi_poll(3)\n");
+    fprintf(stderr, "        wait for I/O using epoll_pwait(2) instead of "
+                    "polling in a busy loop\n");
+    fprintf(stderr, "        with fi_poll(3)\n");
     fprintf(stderr, "\n");
 
     if (personality == put) {
-        fprintf(stderr, "    <address>\n");
-        fprintf(stderr, "        destination address\n");
+        fprintf(stderr, "    <remote_address>\n");
+        fprintf(stderr,
+                "        tells the host where the peer fabtget process runs\n");
         fprintf(stderr, "\n");
     }
 
     fprintf(stderr, "NOTES:\n");
-    fprintf(stderr, "\n");
-
-    fprintf(stderr, "    no parameters: register each RDMA buffer once, use "
-                    "scatter-gather RDMA\n");
     fprintf(stderr, "\n");
 
     fprintf(stderr, "    To run in 'cacheless' mode, set the "
@@ -4512,8 +4530,6 @@ usage(personality_t personality, const char *progname)
     fprintf(stderr,
             "    variable to 0 to disable the memory registration cache.\n");
     fprintf(stderr, "\n");
-
-    exit(EXIT_FAILURE);
 }
 
 /* Handler for SIGUSR1, used to wake a thread from epoll(2) so that
@@ -4643,7 +4659,7 @@ main(int argc, char **argv)
     }
 
     const char *optstring =
-        (global_state.personality == get) ? "a:cn:p:rw" : "cgk:n:p:rw";
+        (global_state.personality == get) ? "a:chn:p:rw" : "cghk:n:p:rw";
 
     while ((opt = getopt(argc, argv, optstring)) != -1) {
         switch (opt) {
@@ -4659,6 +4675,9 @@ main(int argc, char **argv)
             case 'g':
                 global_state.contiguous = true;
                 break;
+            case 'h':
+                usage(global_state.personality, progname);
+                exit(EXIT_SUCCESS);
             case 'k':
                 set.k = true;
                 global_state.local_sessions = parse_nsessions(optarg, 'k');
@@ -4688,6 +4707,7 @@ main(int argc, char **argv)
                 break;
             default:
                 usage(global_state.personality, progname);
+                exit(EXIT_FAILURE);
         }
     }
 
@@ -4697,14 +4717,18 @@ main(int argc, char **argv)
     global_state.nextcpu = (int) global_state.processors.first;
 
     if (global_state.personality == put) {
-        if (argc != 1)
+        if (argc != 1) {
             usage(global_state.personality, progname);
+            exit(EXIT_FAILURE);
+        }
         if (strlen(argv[0]) >= sizeof(global_state.peer_addr_buf))
             errx(EXIT_FAILURE, "destination address too long");
         strcpy(global_state.peer_addr_buf, argv[0]);
         global_state.peer_addr = global_state.peer_addr_buf;
-    } else if (argc != 0)
+    } else if (argc != 0) {
         usage(global_state.personality, progname);
+        exit(EXIT_FAILURE);
+    }
 
     if (!set.k && set.n) {
         global_state.local_sessions = global_state.total_sessions;
@@ -4714,6 +4738,7 @@ main(int argc, char **argv)
         if (global_state.total_sessions < global_state.local_sessions) {
             warnx("-k argument must not exceed -n argument");
             usage(global_state.personality, progname);
+            exit(EXIT_FAILURE);
         }
     }
 

@@ -46,6 +46,9 @@ timed_out=no
 timeout_default=600
 cancel_timeout_default=2
 
+# Set to anything else to emit extra information
+verbose=no
+
 bail()
 {
 	echo "$@" 1>&2
@@ -55,7 +58,9 @@ bail()
 child_handler()
 {
 	trap child_handler CHLD
-	echo "$prog ignored SIGCHLD." 1>&2
+    if [ ${verbose} != "no" ]; then
+	    echo "$prog ignored SIGCHLD." 1>&2
+    fi
 }
 
 alarm_handler() 

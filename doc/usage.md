@@ -2,15 +2,25 @@
 
 ## Synopsis
 
-`fabtget [-b `*`address`*`] [-c] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w]`
+`fabtget [-a `*`address-file`*`] [-c] [-h] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w]`
 
-`fabtput [-c] [-g] [-k `*`k`*`] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w] `*`remote address`*
+`fabtput [-c] [-g] [-h] [-k `*`k`*`] [-n `*`n`*`] [-p '`*`i`*` - `*`j`*`' ] [-r] [-w] `*`remote address`*
 
 ## common options
 
-* `-c`: expect **c**ancellation by a signal.  Use exit code 0 (success)
+* `-c`: Expect **c**ancellation by a signal.  Use exit code 0 (success)
   if the program is cancelled by a signal (SIGHUP, -INT, -QUIT, -TERM).
   Use exit code 1 (failure), otherwise.
+
+* `-h`: print this help message
+
+* `-n `*`n`*: Tell the peer to expect that between this process and the
+  other `fabtput` processes will establish *n* transmit sessions with the
+  peer.  Unless a `-k `*`k`* argument (`fabtput` only) says otherwise,
+  the new `fabtput` process will start all *n* sessions.
+
+* `-p '`*`i`*` - `*`j`*`'`: **p**in worker threads to processors
+  *i* through *j*
 
 * `-r`: deregister/**r**eregister each RDMA buffer before reuse
 
@@ -21,12 +31,7 @@
 
 ### Options
 
-* `-a `*`address_file`*: a file name for **a**ddress.  Wait for connections on
-  the address written in the file.
-  `fabtput` uses the address in the file to establish connection.
-
-* `-p '`*`i`*` - `*`j`*`'`: **p**in worker threads to processors
-  *i* through *j*.
+* `-a `*`address-file`*: dump address to file *address-file* (otherwise goes to `stdout`) 
 
 ## `fabtput`
 
@@ -41,8 +46,7 @@ runs.
 * `-k `*`k`*: start only *k* transmit sessions.  Use this option with
   `-n `*`n`*.  *k* may not exceed *n*.
 
-* `-n `*`n`*: tell the peer to expect that between this process and the
-  other `fabtput` processes will establish *n* transmit sessions with the
-  peer.  Unless a `-k `*`k`* argument says otherwise, the new `fabtput`
-  process will start all *n* sessions.
+## Notes
 
+To run in 'cacheless' mode, set the `FI_MR_CACHE_MAX_SIZE` environment
+variable to 0 to disable the memory registration cache.
