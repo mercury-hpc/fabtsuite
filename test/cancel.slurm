@@ -12,3 +12,13 @@
 srun -N1 -n1 ./tget.sh -c &
 srun -N1 -n1 ./tput.sh -c &
 sleep 20
+
+a=$(grep Result cancel-*.out | wc -l)
+if [ "$a" -eq "0" ]; then
+    exit 1
+fi    
+
+b=$(grep error cancel-*.out | wc -l)
+exit $b
+
+

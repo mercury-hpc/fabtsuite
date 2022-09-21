@@ -12,3 +12,10 @@
 srun -N1 -n1 ./tget.sh -w &
 srun -N1 -n1 ./tput.sh &
 sleep 40
+a=$(grep Result wait-*.out | wc -l)
+if [ "$a" -eq "0" ]; then
+    exit 1
+fi
+
+b=$(grep error wait-*.out | wc -l)
+exit $b

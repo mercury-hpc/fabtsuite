@@ -6,4 +6,6 @@ if [ -z $WORKDIR ] ; then
 fi
 echo "Running $WORKDIR/fabtget $@ -a $WORKDIR/$FILE."
 time -p $WORKDIR/fabtget $@ -a $WORKDIR/$FILE
-
+ret=$?
+echo $ret
+exit $ret

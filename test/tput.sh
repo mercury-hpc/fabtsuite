@@ -13,3 +13,6 @@ if test -f "$WORKDIR/$FILE"; then
     { time -p $WORKDIR/fabtput $@ `cat $WORKDIR/$FILE`; } &> $output
     echo "Result is written to $output."
 fi
+ret=$?
+echo $ret
+exit $ret
