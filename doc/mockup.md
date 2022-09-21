@@ -1,4 +1,4 @@
-Mockup `scripts/fabtrune` output and some implementation notes.
+Mockup `scripts/fabtrun` output and some implementation notes.
  
 ```
 fabtget parameter set          duration (s) duration/default (%)     result
@@ -34,7 +34,7 @@ key:
 11 tests, 7 succeeded, 4 failed
 ```
 
-Example Bourne shell script to print the fabtput results:
+Example Bourne shell script to print the `fabtput` results:
 
 ```
 printf "%-23s %16s %-24s %s\\n" "fabtput parameter set" "duration (s)" "duration/default (%)" "result"

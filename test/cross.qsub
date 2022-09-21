@@ -1,0 +1,37 @@
+#!/bin/sh
+##
+## Usage: qsub cross.qsub
+## Author: Hyokyung Lee (hyoklee@hdfgroup.org)
+## Last Update: 2022-09-19
+##
+#PBS -l select=3:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=10:00
+#PBS -q debug-scaling
+#PBS -A CSC250STDM12
+
+# Set the libfabric library location.
+PREFIX=/lus/grand/projects/radix-io
+export LD_LIBRARY_PATH=$PREFIX/lib:$LD_LIBRARY_PATH
+
+# Set the current working directory.
+WORKDIR=$PBS_O_WORKDIR
+
+# Get all node names first.
+mpiexec -n 1 -ppn 1 cat $PBS_NODEFILE >& $WORKDIR/nodes.txt
+
+# Run 1 server and (select - 1) client(s).
+# The debug queue has only 2 nodes.
+# Therefore, this script will run only 1 client.
+# The first node in nodes.txt will be the server.
+# The rest will be clients.
+j=0
+for i in `cat $WORKDIR/nodes.txt`; do
+    if [[ "$j" -gt 0 ]]; then
+	mpiexec -host $i -n 1 -ppn 1 $WORKDIR/tput.sh -n 4 -k 2 > $WORKDIR/cross_p_$j.out 2> $WORKDIR/cross_p_$j.err 
+    else
+	mpiexec -host $i -n 1 -ppn 1 nohup $WORKDIR/tget.sh -n 4 > $WORKDIR/cross_g.out 2> $WORKDIR/cross_g.err < /dev/null &
+    fi
+    ((j++))
+done    
+echo $?

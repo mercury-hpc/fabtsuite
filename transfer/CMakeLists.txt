@@ -23,3 +23,8 @@ install(CODE "execute_process(
     ln -sv fabtget fabtput
     \")")
 
+file(GLOB TEST_SCRIPTS
+  "../test/*"
+)
+file(COPY ${TEST_SCRIPTS} DESTINATION .)
+include(CMakeTests.cmake)

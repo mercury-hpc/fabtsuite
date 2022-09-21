@@ -1,3 +1,4 @@
+![logo](fabtsuite_logo.png) 
 # fabtsuite: a libfabric test suite
 [![check spelling](https://github.com/mercury-hpc/fabtsuite/actions/workflows/spell.yml/badge.svg)](https://github.com/mercury-hpc/fabtsuite/actions/workflows/spell.yml)
 [![cmake fabtsuite](https://github.com/mercury-hpc/fabtsuite/actions/workflows/cmake.yml/badge.svg)](https://github.com/mercury-hpc/fabtsuite/actions/workflows/cmake.yml)
