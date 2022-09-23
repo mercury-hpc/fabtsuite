@@ -3934,7 +3934,7 @@ get_session_accept(get_state_t *gst)
     hints->src_addr = NULL;
     hints->src_addrlen = 0;
 
-    rc = fi_getinfo(FI_VERSION(1, 13), NULL, NULL, 0, hints, &ep_info);
+    rc = fi_getinfo(FI_VERSION(1, 11), NULL, NULL, 0, hints, &ep_info);
 
     if ((rc = fi_endpoint(global_state.domain, ep_info, &r->cxn.ep, NULL)) < 0)
         bailout_for_ofi_ret(rc, "fi_endpoint");
@@ -4096,7 +4096,7 @@ put_state_open(void)
     hints->dest_addrlen = nbytes;
     hints->addr_format = FI_FORMAT_UNSPEC;
 
-    rc = fi_getinfo(FI_VERSION(1, 13), NULL, NULL, 0, hints, &addr_info);
+    rc = fi_getinfo(FI_VERSION(1, 11), NULL, NULL, 0, hints, &addr_info);
 
     if (rc < 0) {
         bailout_for_ofi_ret(rc, "fi_getinfo for peer_addr %s",
@@ -4739,7 +4739,7 @@ main(int argc, char **argv)
 
     global_state.info = NULL;
     rc =
-        fi_getinfo(FI_VERSION(1, 13), NULL, NULL, 0, hints, &global_state.info);
+        fi_getinfo(FI_VERSION(1, 11), NULL, NULL, 0, hints, &global_state.info);
 
     fi_freeinfo(hints);
 
@@ -4748,7 +4748,7 @@ main(int argc, char **argv)
             hlog_fast(err, "capabilities not available?");
             break;
         case FI_ENOSYS:
-            hlog_fast(err, "available libfabric version < 1.13?");
+            hlog_fast(err, "available libfabric version < 1.11?");
             break;
         default:
             break;
