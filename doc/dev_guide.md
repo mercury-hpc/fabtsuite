@@ -15,9 +15,6 @@ There are 6 abbreviations (a.) for testing features:
 
 All multi-node scripts start with `fabt` and have file extension like `.sh`.
 
-## Debugging with hlog
-
-  
 ## Single-Node Test
 
 [test/test.sh](../test/test.sh) is used to check if programs run correctly
