@@ -1,3 +1,10 @@
+/**
+ * Copyright (c) 2021-2022, UChicago Argonne, LLC and The HDF Group.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 #include <assert.h>
 #include <err.h>
 #include <inttypes.h> /* PRIu32 */
