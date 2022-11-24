@@ -1,3 +1,10 @@
+/**
+ * Copyright (c) 2021-2022, UChicago Argonne, LLC and The HDF Group.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 /* fabtsuite_types.h
  *
  * fabtsuite types. Currently a collection of most of the types used in
