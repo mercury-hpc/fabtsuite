@@ -21,7 +21,9 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_rma.h>
 
-/* Typedefs and forward declarations for types in other files */
+/* 
+ * Typedefs and forward declarations for types in other files
+ */
 
 /* fabtsuite_fifo.h */
 struct fifo;
@@ -45,8 +47,6 @@ typedef struct progbuf progbuf_t;
 
 struct vecbuf;
 typedef struct vecbuf vecbuf_t;
-
-/* END typedefs and forward declarations from other files */
 
 /*
  * Message definitions
@@ -411,5 +411,11 @@ typedef struct {
     char *peer_addr;
     char *address_filename;
 } state_t;
+
+/* 
+ * Global variables
+ */
+
+extern state_t global_state;
 
 #endif

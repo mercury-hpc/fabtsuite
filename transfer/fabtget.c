@@ -40,15 +40,15 @@ static const unsigned split_progress_interval = 2047;
 static const unsigned split_vector_interval = 15;
 static const unsigned rotate_ready_interval = 3;
 
-static state_t global_state = {.domain = NULL,
-                               .fabric = NULL,
-                               .info = NULL,
-                               .personality = NULL,
-                               .local_sessions = 1,
-                               .total_sessions = 1,
-                               .processors = {.first = 0, .last = INT_MAX},
-                               .cancelled = 0,
-                               .peer_addr = NULL};
+state_t global_state = {.domain = NULL,
+                        .fabric = NULL,
+                        .info = NULL,
+                        .personality = NULL,
+                        .local_sessions = 1,
+                        .total_sessions = 1,
+                        .processors = {.first = 0, .last = INT_MAX},
+                        .cancelled = 0,
+                        .peer_addr = NULL};
 
 static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
