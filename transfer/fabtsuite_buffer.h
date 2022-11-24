@@ -16,6 +16,8 @@
 #include <inttypes.h>
 #include <stdlib.h>
 
+#include <rdma/fi_domain.h>
+
 #include <sys/epoll.h>
 
 #include "fabtsuite_types.h"
@@ -63,11 +65,6 @@ struct vecbuf {
 extern "C" {
 #endif
 
-/* TODO: Move create_and_register functions over. Or, even better, split them
- *       into create and register functions and just move the create functions
- *       here.
- */
-
 bufhdr_t *
 buflist_get(buflist_t *bl);
 bool
@@ -88,6 +85,8 @@ fragment_alloc(void);
 
 progbuf_t *
 progbuf_alloc(void);
+bool
+progbuf_is_wellformed(progbuf_t *pb);
 
 vecbuf_t *
 vecbuf_alloc(void);
@@ -95,6 +94,24 @@ void
 vecbuf_free(vecbuf_t *vb);
 bool
 vecbuf_is_wellformed(vecbuf_t *vb);
+
+/* Buffer registration functions
+ *
+ * TODO: Poor separation of concerns here - should separate creation and 
+ *       registration.
+ */
+
+int
+buf_mr_bind(bufhdr_t *h, struct fid_ep *ep);
+int
+buf_mr_dereg(bufhdr_t *h);
+int
+buf_mr_reg(struct fid_domain *dom, struct fid_ep *ep, uint64_t access,
+           uint64_t key, bufhdr_t *h);
+bufhdr_t *
+progbuf_create_and_register(struct fid_ep *ep);
+bufhdr_t *
+vecbuf_create_and_register(struct fid_ep *ep);
 
 #ifdef __cplusplus
 }

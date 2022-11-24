@@ -105,61 +105,6 @@ session_init(session_t *s, cxn_t *c, terminal_t *t)
     return s;
 }
 
-static int
-buf_mr_bind(bufhdr_t *h, struct fid_ep *ep)
-{
-    int rc;
-
-    if (ep == NULL)
-        h->ep = NULL;
-    else if (global_state.mr_endpoint &&
-             (rc = fi_mr_bind(h->mr, &ep->fid, 0)) != 0)
-        return rc;
-    else if (global_state.mr_endpoint && (rc = fi_mr_enable(h->mr)) != 0)
-        return rc;
-    else
-        h->ep = ep;
-
-    h->desc = fi_mr_desc(h->mr);
-
-    return 0;
-}
-
-static int
-buf_mr_dereg(bufhdr_t *h)
-{
-    struct fid_mr *mr = h->mr;
-
-    if (mr == NULL)
-        return 0;
-
-    h->mr = NULL;
-    return fi_close(&mr->fid);
-}
-
-static int
-buf_mr_reg(struct fid_domain *dom, struct fid_ep *ep, uint64_t access,
-           uint64_t key, bufhdr_t *h)
-{
-    int rc;
-    bytebuf_t *b = (bytebuf_t *) h;
-
-    rc = fi_mr_reg(dom, &b->payload[0], h->nallocated, access, 0, key, 0,
-                   &h->mr, NULL);
-
-    if (rc != 0) {
-        h->mr = NULL;
-        return rc;
-    }
-
-    if ((rc = buf_mr_bind(h, ep)) != 0) {
-        (void) buf_mr_dereg(h);
-        return rc;
-    }
-
-    return 0;
-}
-
 static bool
 paybuflist_replenish(seqsource_t *keys, uint64_t access, buflist_t *bl)
 {
@@ -732,12 +677,6 @@ sink_trade(terminal_t *t, fifo_t *ready, fifo_t *completed)
 fail:
     fprintf(stderr, "unexpected received payload");
     return loop_error;
-}
-
-static bool
-progbuf_is_wellformed(progbuf_t *pb)
-{
-    return pb->hdr.nused == sizeof(pb->msg);
 }
 
 /* Process completion vector-message reception.  Return 0 if no
@@ -2635,21 +2574,6 @@ xmtr_memory_init(xmtr_t *x)
         bailout_for_ofi_ret(rc, "fi_mr_reg");
 }
 
-static bufhdr_t *
-progbuf_create_and_register(struct fid_ep *ep)
-{
-    progbuf_t *pb = progbuf_alloc();
-    int rc;
-
-    rc = buf_mr_reg(global_state.domain, ep, FI_SEND,
-                    seqsource_get(&global_state.keys), &pb->hdr);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "buf_mr_reg");
-
-    return &pb->hdr;
-}
-
 /* First stage of initialization, no endpoint (x->cxn.ep) necessary. */
 static void
 xmtr_init(xmtr_t *x, struct fid_av *av)
@@ -2790,21 +2714,6 @@ rcvr_ack_msg_init(rcvr_t *r, struct fid_ep *ep)
 
     if (rc != 0)
         bailout_for_ofi_ret(rc, "mr_regv_all");
-}
-
-static bufhdr_t *
-vecbuf_create_and_register(struct fid_ep *ep)
-{
-    vecbuf_t *vb = vecbuf_alloc();
-    int rc;
-
-    rc = buf_mr_reg(global_state.domain, ep, FI_SEND,
-                    seqsource_get(&global_state.keys), &vb->hdr);
-
-    if (rc != 0)
-        bailout_for_ofi_ret(rc, "buf_mr_reg");
-
-    return &vb->hdr;
 }
 
 static void
