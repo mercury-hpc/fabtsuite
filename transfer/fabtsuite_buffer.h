@@ -7,7 +7,7 @@
 
 /* fabtsuite_buffer.h
  *
- * Buffer routines
+ * buffer routines
  */
 
 #ifndef fabtsuite_buffer_H
