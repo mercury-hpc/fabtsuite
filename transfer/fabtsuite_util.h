@@ -10,6 +10,8 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
+#include "fabtsuite_types.h"
+
 #define arraycount(a) (sizeof(a) / sizeof(a[0]))
 
 #ifndef transfer_unused
@@ -32,6 +34,10 @@ uint8_t *
 hex_string_to_bytes(const char *inbuf, size_t *nbytesp);
 char *
 bytes_to_hex_string(const uint8_t *inbuf, size_t inbuflen);
+
+const char *
+xfc_type_to_string(xfc_type_t t);
+
 #ifdef __cplusplus
 }
 #endif

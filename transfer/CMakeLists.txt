@@ -28,7 +28,7 @@ install(CODE "execute_process(
     COMMAND bash -c \"set -e
     cd $DESTDIR/${CMAKE_INSTALL_PREFIX}/bin/
     echo -n .. Installing: `pwd`
-    ln -sv fabtget fabtput
+    ln -fsv fabtget fabtput
     \")")
 
 file(GLOB TEST_SCRIPTS

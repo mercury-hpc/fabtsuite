@@ -6,6 +6,7 @@
 
 #include <rdma/fabric.h>
 
+#include "fabtsuite_types.h"
 #include "fabtsuite_util.h"
 
 char *
@@ -150,4 +151,23 @@ bytes_to_hex_string(const uint8_t *inbuf, size_t inbuflen)
     return outbuf;
 }
 
-
+const char *
+xfc_type_to_string(xfc_type_t t)
+{
+    switch (t) {
+        case xft_ack:
+            return "ack";
+        case xft_fragment:
+            return "fragment";
+        case xft_initial:
+            return "initial";
+        case xft_progress:
+            return "progress";
+        case xft_rdma_write:
+            return "rdma_write";
+        case xft_vector:
+            return "vector";
+        default:
+            return "<unknown>";
+    }
+}

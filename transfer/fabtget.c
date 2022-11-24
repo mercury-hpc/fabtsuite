@@ -77,27 +77,6 @@ static const struct {
 static int
 get(void);
 
-static const char *
-xfc_type_to_string(xfc_type_t t)
-{
-    switch (t) {
-        case xft_ack:
-            return "ack";
-        case xft_fragment:
-            return "fragment";
-        case xft_initial:
-            return "initial";
-        case xft_progress:
-            return "progress";
-        case xft_rdma_write:
-            return "rdma_write";
-        case xft_vector:
-            return "vector";
-        default:
-            return "<unknown>";
-    }
-}
-
 static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
 static const uint64_t desired_tagged_rx_flags = FI_RECV | FI_TAGGED;
 static const uint64_t desired_tagged_tx_flags = FI_SEND | FI_TAGGED;
