@@ -12,6 +12,7 @@
 #define fabtsuite_rxctl_H
 
 #include <inttypes.h>
+#include <stdbool.h>
 #include <stdlib.h>
 
 #include <rdma/fi_domain.h>
