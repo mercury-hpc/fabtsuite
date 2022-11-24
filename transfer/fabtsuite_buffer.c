@@ -11,9 +11,11 @@
 
 #include <rdma/fi_domain.h>
 
+#include "fabtsuite_types.h"
+
 #include "fabtsuite_buffer.h"
 #include "fabtsuite_error.h"
-#include "fabtsuite_types.h"
+#include "fabtsuite_seqsource.h"
 #include "fabtsuite_util.h"
 
 bufhdr_t *

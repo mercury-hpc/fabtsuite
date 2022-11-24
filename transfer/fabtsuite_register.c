@@ -6,14 +6,17 @@
  */
 
 #include <inttypes.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include <rdma/fi_domain.h>
 #include <rdma/fi_rma.h>
 
-#include "fabtsuite_register.h"
 #include "fabtsuite_types.h"
+
+#include "fabtsuite_register.h"
+#include "fabtsuite_seqsource.h"
 #include "fabtsuite_util.h"
 
 /* Register the `niovs`-segment I/O vector `iov` using up to `niovs`

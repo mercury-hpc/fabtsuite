@@ -30,17 +30,17 @@
 #include <rdma/fi_rma.h>    /* struct fi_msg_rma */
 #include <rdma/fi_tagged.h> /* struct fi_msg_tagged */
 
+#include "fabtsuite_types.h"
+
 #include "fabtsuite_buffer.h"
 #include "fabtsuite_error.h"
 #include "fabtsuite_fifo.h"
 #include "fabtsuite_register.h"
+#include "fabtsuite_rxctl.h"
 #include "fabtsuite_seqsource.h"
-#include "fabtsuite_types.h"
 #include "fabtsuite_util.h"
 
-static const unsigned split_progress_interval = 2047;
-static const unsigned split_vector_interval = 15;
-static const unsigned rotate_ready_interval = 3;
+/* Extern globals */
 
 state_t global_state = {.domain = NULL,
                         .fabric = NULL,
@@ -51,6 +51,16 @@ state_t global_state = {.domain = NULL,
                         .processors = {.first = 0, .last = INT_MAX},
                         .cancelled = 0,
                         .peer_addr = NULL};
+
+const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
+const uint64_t desired_tagged_rx_flags = FI_RECV | FI_TAGGED;
+const uint64_t desired_tagged_tx_flags = FI_SEND | FI_TAGGED;
+
+/* Local globals */
+
+static const unsigned split_progress_interval = 2047;
+static const unsigned split_vector_interval = 15;
+static const unsigned rotate_ready_interval = 3;
 
 static pthread_mutex_t workers_mtx = PTHREAD_MUTEX_INITIALIZER;
 static worker_t workers[WORKERS_MAX];
@@ -78,10 +88,6 @@ static const struct {
 
 static int
 get(void);
-
-static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
-static const uint64_t desired_tagged_rx_flags = FI_RECV | FI_TAGGED;
-static const uint64_t desired_tagged_tx_flags = FI_SEND | FI_TAGGED;
 
 static char txbuf[] = "If this message was received in error then please "
                       "print it out and shred it.";
@@ -228,114 +234,6 @@ fibonacci_iov_setup(void *_buf, size_t len, struct iovec *iov, size_t niovs)
 }
 
 static inline bool
-rxctl_idle(rxctl_t *ctl)
-{
-    return fifo_empty(ctl->posted);
-}
-
-static inline bool
-rxctl_ready(rxctl_t *ctl)
-{
-    return !fifo_full(ctl->posted);
-}
-
-static bufhdr_t *
-rxctl_complete(rxctl_t *rc, const completion_t *cmpl)
-{
-    bufhdr_t *h, *head;
-
-    head = fifo_peek(rc->posted);
-
-    if (cmpl == NULL) {
-        goto out;
-    } else if (head == NULL) {
-        errx(EXIT_FAILURE, "%s: received a completion, but no Rx was posted",
-             __func__);
-    }
-
-    cmpl->xfc->owner = xfo_program;
-
-    if (cmpl->xfc->cancelled) {
-        ; /* do nothing; leave cancelled flag set, it's needed by
-           * higher-level processing---e.g., in xmtr_vector_rx_process
-           */
-    } else if ((cmpl->flags & desired_tagged_rx_flags) !=
-               desired_tagged_rx_flags) {
-        char difference[128];
-
-        errx(EXIT_FAILURE,
-             "%s: expected flags %" PRIu64
-             " differs from received flags %" PRIu64 " at %s",
-             __func__, desired_tagged_rx_flags,
-             cmpl->flags & desired_tagged_rx_flags,
-             completion_flags_to_string(
-                 desired_tagged_rx_flags ^
-                     (cmpl->flags & desired_tagged_rx_flags),
-                 difference, sizeof(difference)));
-    }
-
-    h = (bufhdr_t *) ((char *) cmpl->xfc - offsetof(bufhdr_t, xfc));
-    h->nused = cmpl->len;
-
-out:
-    if (head == NULL || head->xfc.owner != xfo_program)
-        return NULL;
-
-    return fifo_get(rc->posted);
-}
-
-static void
-rxctl_post(cxn_t *c, rxctl_t *ctl, bufhdr_t *h)
-{
-    int rc;
-
-    h->xfc.cancelled = 0;
-    h->xfc.owner = xfo_nic;
-
-    const uint64_t tag = seqsource_get(&ctl->tags);
-
-    rc = fi_trecvmsg(
-        c->ep,
-        &(struct fi_msg_tagged){
-            .msg_iov =
-                &(struct iovec){.iov_base = &((bytebuf_t *) h)->payload[0],
-                                .iov_len = h->nallocated},
-            .desc = &h->desc,
-            .iov_count = 1,
-            .addr = c->peer_addr,
-            .tag = tag & ~ctl->ignore,
-            .ignore = 0,
-            .context = &h->xfc.ctx,
-            .data = 0},
-        FI_COMPLETION);
-
-    if (rc < 0) {
-        seqsource_unget(&ctl->tags, tag);
-        bailout_for_ofi_ret(rc, "fi_trecvmsg");
-    }
-
-    (void) fifo_put(ctl->posted, h);
-}
-
-static void
-rxctl_init(rxctl_t *ctl, size_t len)
-{
-    assert(size_is_power_of_2(len));
-
-    seqsource_init(&ctl->tags);
-    ctl->ignore = ~(uint64_t) (len - 1);
-
-    if ((ctl->posted = fifo_create(len)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create posted messages FIFO",
-             __func__);
-    }
-    if ((ctl->rcvd = fifo_create(len)) == NULL) {
-        errx(EXIT_FAILURE, "%s: could not create received messages FIFO",
-             __func__);
-    }
-}
-
-static inline bool
 txctl_idle(txctl_t *ctl)
 {
     return fifo_empty(ctl->posted);
@@ -390,12 +288,6 @@ txctl_init(txctl_t *ctl, size_t len, size_t nbufs,
         if (!buflist_put(ctl->pool, h))
             errx(EXIT_FAILURE, "%s: vector buffer pool full", __func__);
     }
-}
-
-static void
-rxctl_cancel(struct fid_ep *ep, rxctl_t *ctl)
-{
-    fifo_cancel(ep, ctl->posted);
 }
 
 static void

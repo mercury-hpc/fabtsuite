@@ -21,15 +21,13 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_rma.h>
 
-#include "fabtsuite_seqsource.h"
+/* If you include any fabtsuite headers here, you are probably doing something
+ * wrong and will create circular dependencies.
+ */
 
 /* 
  * Typedefs and forward declarations for types in other files
  */
-
-/* fabtsuite_fifo.h */
-struct fifo;
-typedef struct fifo fifo_t;
 
 /* fabtsuite_buffer.h */
 struct bufhdr;
@@ -49,6 +47,23 @@ typedef struct progbuf progbuf_t;
 
 struct vecbuf;
 typedef struct vecbuf vecbuf_t;
+
+/* fabtsuite_fifo.h */
+struct fifo;
+typedef struct fifo fifo_t;
+
+/* fabtsuite_seqsource.h */
+typedef struct seqsource {
+    uint64_t next_key;
+} seqsource_t;
+
+/* fabtsuite_rxctl.h */
+typedef struct rxctl {
+    fifo_t *posted; // buffers posted for vector messages
+    fifo_t *rcvd;   // buffers holding received vector messages
+    seqsource_t tags;
+    uint64_t ignore;
+} rxctl_t;
 
 /*
  * Message definitions
@@ -196,13 +211,6 @@ struct cxn {
     eof_state_t eof;
     seqsource_t keys;
 };
-
-typedef struct {
-    fifo_t *posted; // buffers posted for vector messages
-    fifo_t *rcvd;   // buffers holding received vector messages
-    seqsource_t tags;
-    uint64_t ignore;
-} rxctl_t;
 
 typedef struct {
     fifo_t *ready;   // message buffers ready to transmit
@@ -410,10 +418,21 @@ typedef struct {
     char *address_filename;
 } state_t;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* 
  * Global variables
  */
 
 extern state_t global_state;
+extern const uint64_t desired_rx_flags;
+extern const uint64_t desired_tagged_rx_flags;
+extern const uint64_t desired_tagged_tx_flags;
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

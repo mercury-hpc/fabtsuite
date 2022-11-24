@@ -16,10 +16,11 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_endpoint.h>
 
+#include "fabtsuite_types.h"
+
 #include "fabtsuite_buffer.h"
 #include "fabtsuite_error.h"
 #include "fabtsuite_fifo.h"
-#include "fabtsuite_types.h"
 #include "fabtsuite_util.h"
 
 fifo_t *

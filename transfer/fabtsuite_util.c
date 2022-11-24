@@ -14,6 +14,7 @@
 #include <rdma/fabric.h>
 
 #include "fabtsuite_types.h"
+
 #include "fabtsuite_util.h"
 
 char *

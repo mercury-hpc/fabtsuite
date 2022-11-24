@@ -15,9 +15,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 
-typedef struct seqsource {
-    uint64_t next_key;
-} seqsource_t;
+#include "fabtsuite_types.h"
 
 #ifdef __cplusplus
 extern "C" {

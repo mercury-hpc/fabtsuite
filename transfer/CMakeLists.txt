@@ -14,6 +14,7 @@ set (FABTSUITE_COMMON_SOURCES
     fabtsuite_error.c
     fabtsuite_fifo.c
     fabtsuite_register.c
+    fabtsuite_rxctl.c
     fabtsuite_seqsource.c
     fabtsuite_util.c
 )

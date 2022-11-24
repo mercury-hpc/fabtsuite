@@ -18,6 +18,7 @@
 
 #include <sys/epoll.h>
 
+#include "fabtsuite_buffer.h"
 #include "fabtsuite_types.h"
 
 struct fifo {
