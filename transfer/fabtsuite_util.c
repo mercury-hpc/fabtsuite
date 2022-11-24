@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <rdma/fabric.h>
 
@@ -74,3 +75,79 @@ size_is_power_of_2(size_t size)
 {
     return ((size - 1) & size) == 0;
 }
+
+uint8_t *
+hex_string_to_bytes(const char *inbuf, size_t *nbytesp)
+{
+    uint8_t *outbuf;
+    const char *p;
+    size_t i, inbuflen = strlen(inbuf), nbytes;
+    int nconverted;
+
+    if (inbuflen == 0) {
+        if (nbytesp != NULL)
+            *nbytesp = 0;
+        /* Avoid returning NULL here, NULL is reserved to indicate an error. */
+        return malloc(1);
+    }
+
+    if ((inbuflen + 1) % 3 != 0)
+        return NULL;
+
+    nbytes = (inbuflen + 1) / 3;
+    if ((outbuf = malloc(nbytes)) == NULL)
+        return NULL;
+
+    if (sscanf(inbuf, "%02" SCNx8 "%n", &outbuf[0], &nconverted) != 1 ||
+        nconverted != 2)
+        goto fail;
+
+    for (p = &inbuf[nconverted], i = 1; i < nbytes; i++, p += nconverted) {
+        if (sscanf(p, ":%02" SCNx8 "%n", &outbuf[i], &nconverted) != 1 ||
+            nconverted != 3)
+            goto fail;
+    }
+
+    if (nbytesp != NULL)
+        *nbytesp = nbytes;
+
+    return outbuf;
+fail:
+    free(outbuf);
+    return NULL;
+}
+
+char *
+bytes_to_hex_string(const uint8_t *inbuf, size_t inbuflen)
+{
+    char *outbuf, *p;
+    const char *delim;
+    size_t i, nempty, outbuflen;
+    int nprinted;
+
+    if (inbuflen == 0)
+        return strdup("");
+
+    /* sizeof("ff") includes the terminating NUL, thus `outbuflen`
+     * accounts for the colon delimiters between hex octets and
+     * the NUL at the end of string.
+     */
+    outbuflen = inbuflen * sizeof("ff");
+
+    if ((outbuf = malloc(outbuflen)) == NULL)
+        return NULL;
+
+    for (p = outbuf, nempty = outbuflen, delim = "", i = 0; i < inbuflen;
+         i++, delim = ":", p += nprinted, nempty -= (size_t) nprinted) {
+
+        nprinted = snprintf(p, nempty, "%s%02" PRIx8, delim, inbuf[i]);
+
+        if (nprinted < 0 || (size_t) nprinted >= nempty) {
+            free(outbuf);
+            return NULL;
+        }
+    }
+    return outbuf;
+}
+
+

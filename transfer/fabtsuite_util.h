@@ -28,6 +28,10 @@ minsize(size_t l, size_t r);
 bool
 size_is_power_of_2(size_t size);
 
+uint8_t *
+hex_string_to_bytes(const char *inbuf, size_t *nbytesp);
+char *
+bytes_to_hex_string(const uint8_t *inbuf, size_t inbuflen);
 #ifdef __cplusplus
 }
 #endif
