@@ -33,6 +33,7 @@
 #include "fabtsuite_buffer.h"
 #include "fabtsuite_error.h"
 #include "fabtsuite_fifo.h"
+#include "fabtsuite_seqsource.h"
 #include "fabtsuite_types.h"
 #include "fabtsuite_util.h"
 
@@ -81,8 +82,6 @@ static const uint64_t desired_rx_flags = FI_RECV | FI_MSG;
 static const uint64_t desired_tagged_rx_flags = FI_RECV | FI_TAGGED;
 static const uint64_t desired_tagged_tx_flags = FI_SEND | FI_TAGGED;
 
-static uint64_t _Atomic next_key_pool = 512;
-
 static char txbuf[] = "If this message was received in error then please "
                       "print it out and shred it.";
 
@@ -104,33 +103,6 @@ session_init(session_t *s, cxn_t *c, terminal_t *t)
     }
 
     return s;
-}
-
-static void
-seqsource_init(seqsource_t *s)
-{
-    memset(s, 0, sizeof(*s));
-}
-
-static uint64_t
-seqsource_get(seqsource_t *s)
-{
-    if (s->next_key % 256 == 0) {
-        s->next_key = atomic_fetch_add_explicit(&next_key_pool, 256,
-                                                memory_order_relaxed);
-    }
-
-    return s->next_key++;
-}
-
-static bool
-seqsource_unget(seqsource_t *s, uint64_t got)
-{
-    if (got + 1 != s->next_key)
-        return false;
-
-    s->next_key--;
-    return true;
 }
 
 static int

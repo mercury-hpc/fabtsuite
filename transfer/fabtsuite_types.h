@@ -21,6 +21,8 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_rma.h>
 
+#include "fabtsuite_seqsource.h"
+
 /* 
  * Typedefs and forward declarations for types in other files
  */
@@ -142,10 +144,6 @@ typedef struct {
     size_t txbuflen;
     size_t entirelen;
 } source_t;
-
-typedef struct seqsource {
-    uint64_t next_key;
-} seqsource_t;
 
 /*
  * Communications state definitions

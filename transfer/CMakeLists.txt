@@ -13,6 +13,7 @@ set (FABTSUITE_COMMON_SOURCES
     fabtsuite_buffer.c
     fabtsuite_error.c
     fabtsuite_fifo.c
+    fabtsuite_seqsource.c
     fabtsuite_util.c
 )
 
