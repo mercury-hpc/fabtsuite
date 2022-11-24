@@ -427,9 +427,15 @@ extern "C" {
  */
 
 extern state_t global_state;
+
 extern const uint64_t desired_rx_flags;
 extern const uint64_t desired_tagged_rx_flags;
 extern const uint64_t desired_tagged_tx_flags;
+
+extern const unsigned split_progress_interval;
+extern const unsigned split_vector_interval;
+extern const unsigned rotate_ready_interval;
+
 
 #ifdef __cplusplus
 }
