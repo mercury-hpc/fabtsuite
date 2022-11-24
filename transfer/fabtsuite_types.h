@@ -15,6 +15,7 @@
 #ifndef fabtsuite_types_H
 #define fabtsuite_types_H
 
+#include <stdbool.h>
 #include <inttypes.h>
 #include <stdatomic.h>
 
