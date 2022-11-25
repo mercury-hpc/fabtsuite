@@ -13,11 +13,11 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_rma.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
-#include "fabtsuite_register.h"
-#include "fabtsuite_seqsource.h"
-#include "fabtsuite_util.h"
+#include "FSregister.h"
+#include "FSseqsource.h"
+#include "FSutil.h"
 
 /* Register the `niovs`-segment I/O vector `iov` using up to `niovs`
  * of the registrations, descriptors, and remote addresses in the

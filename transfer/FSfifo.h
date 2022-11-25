@@ -5,21 +5,21 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* fabtsuite_fifo.h
+/* FSfifo.h
  *
  * fifo data structure
  */
 
-#ifndef fabtsuite_fifo_H
-#define fabtsuite_fifo_H
+#ifndef FSfifo_H
+#define FSfifo_H
 
 #include <stdbool.h>
 #include <stdlib.h>
 
 #include <sys/epoll.h>
 
-#include "fabtsuite_buffer.h"
-#include "fabtsuite_types.h"
+#include "FSbuffer.h"
+#include "FStypes.h"
 
 struct fifo {
     uint64_t insertions;

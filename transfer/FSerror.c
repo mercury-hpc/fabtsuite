@@ -11,7 +11,7 @@
 
 #include <rdma/fi_errno.h>
 
-#include "fabtsuite_error.h"
+#include "FSerror.h"
 
 void
 warnv_about_ofi_ret_impl(int ret, const char *fn, int lineno, const char *fmt,

@@ -10,15 +10,15 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_POSIX_C_SOURCE=200809L")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -pedantic -Wextra -Werror")
 
 set (FABTSUITE_COMMON_SOURCES
-    fabtsuite_buffer.c
-    fabtsuite_cxn.c
-    fabtsuite_error.c
-    fabtsuite_fifo.c
-    fabtsuite_register.c
-    fabtsuite_rxctl.c
-    fabtsuite_seqsource.c
-    fabtsuite_txctl.c
-    fabtsuite_util.c
+    FSbuffer.c
+    FScxn.c
+    FSerror.c
+    FSfifo.c
+    FSregister.c
+    FSrxctl.c
+    FSseqsource.c
+    FStxctl.c
+    FSutil.c
 )
 
 add_executable(fabtget ${FABTSUITE_COMMON_SOURCES} fabtget.c)

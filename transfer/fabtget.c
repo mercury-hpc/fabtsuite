@@ -30,17 +30,17 @@
 #include <rdma/fi_rma.h>    /* struct fi_msg_rma */
 #include <rdma/fi_tagged.h> /* struct fi_msg_tagged */
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
-#include "fabtsuite_buffer.h"
-#include "fabtsuite_cxn.h"
-#include "fabtsuite_error.h"
-#include "fabtsuite_fifo.h"
-#include "fabtsuite_register.h"
-#include "fabtsuite_rxctl.h"
-#include "fabtsuite_seqsource.h"
-#include "fabtsuite_txctl.h"
-#include "fabtsuite_util.h"
+#include "FSbuffer.h"
+#include "FScxn.h"
+#include "FSerror.h"
+#include "FSfifo.h"
+#include "FSregister.h"
+#include "FSrxctl.h"
+#include "FSseqsource.h"
+#include "FStxctl.h"
+#include "FSutil.h"
 
 /* Extern globals */
 

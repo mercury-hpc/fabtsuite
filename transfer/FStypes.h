@@ -5,15 +5,15 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* fabtsuite_types.h
+/* FStypes.h
  *
  * fabtsuite types. Currently a collection of most of the types used in
  * the code. These will be disentangled later, when the API calls have been
  * moved to different files.
  */
 
-#ifndef fabtsuite_types_H
-#define fabtsuite_types_H
+#ifndef FStypes_H
+#define FStypes_H
 
 #include <stdbool.h>
 #include <inttypes.h>
@@ -30,7 +30,7 @@
  * Typedefs and forward declarations for types in other files
  */
 
-/* fabtsuite_buffer.h */
+/* FSbuffer.h */
 struct bufhdr;
 typedef struct bufhdr bufhdr_t;
 
@@ -49,16 +49,16 @@ typedef struct progbuf progbuf_t;
 struct vecbuf;
 typedef struct vecbuf vecbuf_t;
 
-/* fabtsuite_fifo.h */
+/* FSfifo.h */
 struct fifo;
 typedef struct fifo fifo_t;
 
-/* fabtsuite_seqsource.h */
+/* FSseqsource.h */
 typedef struct seqsource {
     uint64_t next_key;
 } seqsource_t;
 
-/* fabtsuite_rxctl.h */
+/* FSrxctl.h */
 typedef struct rxctl {
     fifo_t *posted; // buffers posted for vector messages
     fifo_t *rcvd;   // buffers holding received vector messages

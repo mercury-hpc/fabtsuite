@@ -14,14 +14,14 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_tagged.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
-#include "fabtsuite_buffer.h"
-#include "fabtsuite_error.h"
-#include "fabtsuite_fifo.h"
-#include "fabtsuite_rxctl.h"
-#include "fabtsuite_seqsource.h"
-#include "fabtsuite_util.h"
+#include "FSbuffer.h"
+#include "FSerror.h"
+#include "FSfifo.h"
+#include "FSrxctl.h"
+#include "FSseqsource.h"
+#include "FSutil.h"
 
 bool
 rxctl_idle(rxctl_t *ctl)

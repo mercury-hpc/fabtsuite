@@ -13,9 +13,9 @@
 
 #include <rdma/fabric.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
-#include "fabtsuite_util.h"
+#include "FSutil.h"
 
 char *
 completion_flags_to_string(const uint64_t flags, char *const buf,

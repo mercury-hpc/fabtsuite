@@ -16,12 +16,12 @@
 #include <rdma/fabric.h>
 #include <rdma/fi_endpoint.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
-#include "fabtsuite_buffer.h"
-#include "fabtsuite_error.h"
-#include "fabtsuite_fifo.h"
-#include "fabtsuite_util.h"
+#include "FSbuffer.h"
+#include "FSerror.h"
+#include "FSfifo.h"
+#include "FSutil.h"
 
 fifo_t *
 fifo_create(size_t size)

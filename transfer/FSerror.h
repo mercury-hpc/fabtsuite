@@ -5,13 +5,13 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* fabtsuite_error.h
+/* FSerror.h
  *
  * Error-handling functions used throughout the code
  */
 
-#ifndef fabtsuite_error_H
-#define fabtsuite_error_H
+#ifndef FSerror_H
+#define FSerror_H
 
 #include <stdarg.h>
 

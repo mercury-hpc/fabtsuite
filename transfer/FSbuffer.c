@@ -11,12 +11,12 @@
 
 #include <rdma/fi_domain.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
-#include "fabtsuite_buffer.h"
-#include "fabtsuite_error.h"
-#include "fabtsuite_seqsource.h"
-#include "fabtsuite_util.h"
+#include "FSbuffer.h"
+#include "FSerror.h"
+#include "FSseqsource.h"
+#include "FSutil.h"
 
 bufhdr_t *
 buflist_get(buflist_t *bl)

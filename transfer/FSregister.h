@@ -5,13 +5,13 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* fabtsuite_register.h
+/* FSregister.h
  *
  * Routines that register things with libfabric
  */
 
-#ifndef fabtsuite_register_H
-#define fabtsuite_register_H
+#ifndef FSregister_H
+#define FSregister_H
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -19,7 +19,7 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_rma.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
 #ifdef __cplusplus
 extern "C" {

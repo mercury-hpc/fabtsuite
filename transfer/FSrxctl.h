@@ -5,11 +5,11 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* fabtsuite_rxctl.h
+/* FSrxctl.h
  */
 
-#ifndef fabtsuite_rxctl_H
-#define fabtsuite_rxctl_H
+#ifndef FSrxctl_H
+#define FSrxctl_H
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -17,10 +17,10 @@
 
 #include <rdma/fi_domain.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
-#include "fabtsuite_buffer.h"
-#include "fabtsuite_fifo.h"
+#include "FSbuffer.h"
+#include "FSfifo.h"
 
 #ifdef __cplusplus
 extern "C" {

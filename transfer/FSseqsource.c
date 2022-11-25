@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "fabtsuite_seqsource.h"
+#include "FSseqsource.h"
 
 static uint64_t _Atomic next_key_pool = 512;
 

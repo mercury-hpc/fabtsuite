@@ -5,19 +5,19 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* fabtsuite_util.h
+/* FSutil.h
  *
  * Utility functions used throughout the code
  */
 
-#ifndef fabtsuite_util_H
-#define fabtsuite_util_H
+#ifndef FSutil_H
+#define FSutil_H
 
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdlib.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
 #define arraycount(a) (sizeof(a) / sizeof(a[0]))
 

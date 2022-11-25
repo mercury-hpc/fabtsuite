@@ -5,17 +5,17 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* fabtsuite_seqsource.h
+/* FSseqsource.h
  *
  */
 
-#ifndef fabtsuite_seqsource_H
-#define fabtsuite_seqsource_H
+#ifndef FSseqsource_H
+#define FSseqsource_H
 
 #include <inttypes.h>
 #include <stdbool.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
 #ifdef __cplusplus
 extern "C" {

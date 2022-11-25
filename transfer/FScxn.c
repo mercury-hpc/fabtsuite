@@ -10,9 +10,9 @@
 
 #include <rdma/fi_domain.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
-#include "fabtsuite_seqsource.h"
+#include "FSseqsource.h"
 
 void
 cxn_init(cxn_t *c, struct fid_av *av,

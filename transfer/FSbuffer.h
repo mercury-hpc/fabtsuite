@@ -5,13 +5,13 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* fabtsuite_buffer.h
+/* FSbuffer.h
  *
  * buffer routines
  */
 
-#ifndef fabtsuite_buffer_H
-#define fabtsuite_buffer_H
+#ifndef FSbuffer_H
+#define FSbuffer_H
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -20,7 +20,7 @@
 
 #include <sys/epoll.h>
 
-#include "fabtsuite_types.h"
+#include "FStypes.h"
 
 struct bufhdr {
     xfer_context_t xfc;
