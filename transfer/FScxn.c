@@ -33,3 +33,34 @@ cxn_init(cxn_t *c, struct fid_av *av,
     c->eof.local = c->eof.remote = false;
     seqsource_init(&c->keys);
 }
+
+loop_control_t
+cxn_loop(worker_t *w, session_t *s)
+{
+    cxn_t *cxn = s->cxn;
+    const loop_control_t ctl = cxn->loop(w, s);
+
+    switch (ctl) {
+        case loop_end:
+        case loop_error:
+            cxn->cancel(cxn);
+            cxn->ended = true;
+            cxn->end_reason = ctl;
+            break;
+        case loop_continue:
+            if (cxn->cancelled || cxn->ended) {
+                if (cxn->cancellation_complete(cxn)) {
+                    return cxn->cancelled ? loop_canceled : cxn->end_reason;
+                }
+            } else if (global_state.cancelled) {
+                cxn->cancel(cxn);
+                cxn->cancelled = true;
+            }
+            break;
+        default:
+            break;
+    }
+    return ctl;
+}
+
+

@@ -7,7 +7,7 @@
 
 /* FSbuffer.h
  *
- * buffer routines
+ * Buffer routines
  */
 
 #ifndef FSbuffer_H

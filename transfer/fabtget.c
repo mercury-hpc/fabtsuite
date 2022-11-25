@@ -39,6 +39,7 @@
 #include "FSregister.h"
 #include "FSrxctl.h"
 #include "FSseqsource.h"
+#include "FSsession.h"
 #include "FStxctl.h"
 #include "FSutil.h"
 
@@ -93,26 +94,6 @@ get(void);
 
 static char txbuf[] = "If this message was received in error then please "
                       "print it out and shred it.";
-
-static bool
-session_init(session_t *s, cxn_t *c, terminal_t *t)
-{
-    memset(s, 0, sizeof(*s));
-
-    s->waitable = false;
-    s->cxn = c;
-    s->terminal = t;
-
-    if ((s->ready_for_cxn = fifo_create(64)) == NULL)
-        return NULL;
-
-    if ((s->ready_for_terminal = fifo_create(64)) == NULL) {
-        fifo_destroy(s->ready_for_cxn);
-        return NULL;
-    }
-
-    return s;
-}
 
 static bool
 paybuflist_replenish(seqsource_t *keys, uint64_t access, buflist_t *bl)
@@ -1316,95 +1297,6 @@ xmtr_loop(worker_t *w, session_t *s)
         return loop_end;
 
     return loop_continue;
-}
-
-static void
-session_shutdown(session_t *s)
-{
-    bufhdr_t *h;
-    cxn_t *cxn = s->cxn;
-    int rc;
-
-    if (cxn->shutdown != NULL)
-        cxn->shutdown(cxn);
-
-    assert(cxn->parent == s);
-    cxn->parent = NULL;
-    s->cxn = NULL;
-
-    while ((h = fifo_alt_get(s->ready_for_cxn)) != NULL ||
-           (h = fifo_alt_get(s->ready_for_terminal)) != NULL) {
-        buf_mr_dereg(h);
-        buf_free(h);
-    }
-
-    if ((rc = fi_close(&cxn->cq->fid)) < 0) {
-        // TODO: Investigate this returning a negative error code. Normal?
-        //        fprintf(stderr, "%s: could not fi_close CQ %p: %s", __func__,
-        //                  (void *) &cxn->cq, fi_strerror(-rc));
-    }
-
-    if ((rc = fi_close(&cxn->ep->fid)) < 0) {
-        fprintf(stderr, "%s: could not fi_close endpoint %p: %s", __func__,
-                (void *) &cxn->ep, fi_strerror(-rc));
-    }
-}
-
-static loop_control_t
-cxn_loop(worker_t *w, session_t *s)
-{
-    cxn_t *cxn = s->cxn;
-    const loop_control_t ctl = cxn->loop(w, s);
-
-    switch (ctl) {
-        case loop_end:
-        case loop_error:
-            cxn->cancel(cxn);
-            cxn->ended = true;
-            cxn->end_reason = ctl;
-            break;
-        case loop_continue:
-            if (cxn->cancelled || cxn->ended) {
-                if (cxn->cancellation_complete(cxn)) {
-                    return cxn->cancelled ? loop_canceled : cxn->end_reason;
-                }
-            } else if (global_state.cancelled) {
-                cxn->cancel(cxn);
-                cxn->cancelled = true;
-            }
-            break;
-        default:
-            break;
-    }
-    return ctl;
-}
-
-static loop_control_t
-session_loop(worker_t *w, session_t *s)
-{
-    terminal_t *t = s->terminal;
-
-    if (t->trade(t, s->ready_for_terminal, s->ready_for_cxn) == loop_error)
-        return loop_error;
-
-    return cxn_loop(w, s);
-}
-
-static void
-sessions_swap(session_t *r, session_t *s)
-{
-    session_t tmp;
-
-    if (r == s)
-        return;
-
-    tmp = *r;
-    *r = *s;
-    if (r->cxn != NULL)
-        r->cxn->parent = r;
-    *s = tmp;
-    if (s->cxn != NULL)
-        s->cxn->parent = s;
 }
 
 static void

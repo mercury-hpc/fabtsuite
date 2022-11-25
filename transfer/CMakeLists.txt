@@ -17,6 +17,7 @@ set (FABTSUITE_COMMON_SOURCES
     FSregister.c
     FSrxctl.c
     FSseqsource.c
+    FSsession.c
     FStxctl.c
     FSutil.c
 )

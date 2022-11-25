@@ -26,6 +26,8 @@ cxn_init(cxn_t *c, struct fid_av *av,
          loop_control_t (*loop)(worker_t *, session_t *),
          void (*cancel)(cxn_t *), bool (*cancellation_complete)(cxn_t *),
          void (*shutdown)(cxn_t *));
+loop_control_t
+cxn_loop(worker_t *w, session_t *s);
 
 #ifdef __cplusplus
 }
