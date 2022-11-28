@@ -87,5 +87,3 @@ mr_deregv_all(size_t niovs, size_t maxsegs, struct fid_mr **mrp)
     }
     return 0;
 }
-
-

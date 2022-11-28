@@ -62,5 +62,3 @@ cxn_loop(worker_t *w, session_t *s)
     }
     return ctl;
 }
-
-

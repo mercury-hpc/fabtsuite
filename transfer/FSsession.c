@@ -14,8 +14,8 @@
 
 #include "FStypes.h"
 
-#include "FScxn.h"
 #include "FSbuffer.h"
+#include "FScxn.h"
 #include "FSerror.h"
 #include "FSfifo.h"
 #include "FSregister.h"
@@ -101,5 +101,3 @@ sessions_swap(session_t *r, session_t *s)
     if (s->cxn != NULL)
         s->cxn->parent = s;
 }
-
-

@@ -15,9 +15,9 @@
 #ifndef FStypes_H
 #define FStypes_H
 
-#include <stdbool.h>
 #include <inttypes.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 
 #include <rdma/fabric.h>
 #include <rdma/fi_rma.h>
@@ -26,7 +26,7 @@
  * wrong and will create circular dependencies.
  */
 
-/* 
+/*
  * Typedefs and forward declarations for types in other files
  */
 
@@ -423,7 +423,7 @@ typedef struct {
 extern "C" {
 #endif
 
-/* 
+/*
  * Global variables
  */
 
@@ -436,7 +436,6 @@ extern const uint64_t desired_tagged_tx_flags;
 extern const unsigned split_progress_interval;
 extern const unsigned split_vector_interval;
 extern const unsigned rotate_ready_interval;
-
 
 #ifdef __cplusplus
 }

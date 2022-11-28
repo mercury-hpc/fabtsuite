@@ -32,7 +32,8 @@ bool
 txctl_put(txctl_t *ctl, bufhdr_t *h);
 void
 txctl_init(txctl_t *ctl, size_t len, size_t nbufs,
-           bufhdr_t *(*create_and_register)(struct fid_ep *), struct fid_ep *ep);
+           bufhdr_t *(*create_and_register)(struct fid_ep *),
+           struct fid_ep *ep);
 void
 txctl_cancel(struct fid_ep *ep, txctl_t *ctl);
 int

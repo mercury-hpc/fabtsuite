@@ -97,7 +97,7 @@ vecbuf_is_wellformed(vecbuf_t *vb);
 
 /* Buffer registration functions
  *
- * TODO: Poor separation of concerns here - should separate creation and 
+ * TODO: Poor separation of concerns here - should separate creation and
  *       registration.
  */
 

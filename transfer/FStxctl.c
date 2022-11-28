@@ -20,8 +20,8 @@
 #include "FSbuffer.h"
 #include "FSerror.h"
 #include "FSfifo.h"
-#include "FStxctl.h"
 #include "FSseqsource.h"
+#include "FStxctl.h"
 #include "FSutil.h"
 
 bool
