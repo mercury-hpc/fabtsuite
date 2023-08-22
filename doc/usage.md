@@ -24,6 +24,8 @@
 
 * `-r`: deregister/**r**eregister each RDMA buffer before reuse
 
+* `-v`: verbose mode (dumps extra info to stderr)
+
 * `-w`: **w**ait for I/O using `epoll_pwait(2)` instead of
   `fi_poll(3)`ing in a busy loop.
 

@@ -9,18 +9,32 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_GNU_SOURCE")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_POSIX_C_SOURCE=200809L")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -pedantic -Wextra -Werror")
 
-include_directories(${LIBFABRIC_INCLUDE_DIRS} ../hlog)
-add_executable(fabtget fabtget.c)
+set (FABTSUITE_COMMON_SOURCES
+    FSbuffer.c
+    FScxn.c
+    FSerror.c
+    FSfifo.c
+    FSregister.c
+    FSrxctl.c
+    FSseqsource.c
+    FSsession.c
+    FStxctl.c
+    FSutil.c
+)
+
+add_executable(fabtget ${FABTSUITE_COMMON_SOURCES} fabtget.c)
+
 message(STATUS "LIBFABRIC_LIBDIR=${LIBFABRIC_LIBDIR}")
-target_link_directories(fabtget PUBLIC ../hlog ${LIBFABRIC_LIBDIR})
+target_link_directories(fabtget PUBLIC ${LIBFABRIC_LIBDIR})
 message(STATUS "LIBFABRIC_LIBRARIES=${LIBFABRIC_LIBRARIES}")
-target_link_libraries(fabtget hlog ${LIBFABRIC_LIBRARIES})
+target_link_libraries(fabtget ${LIBFABRIC_LIBRARIES})
+
 install(TARGETS fabtget RUNTIME DESTINATION bin)
 install(CODE "execute_process(
     COMMAND bash -c \"set -e
     cd $DESTDIR/${CMAKE_INSTALL_PREFIX}/bin/
     echo -n .. Installing: `pwd`
-    ln -sv fabtget fabtput
+    ln -fsv fabtget fabtput
     \")")
 
 file(GLOB TEST_SCRIPTS
